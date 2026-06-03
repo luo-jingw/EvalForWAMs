@@ -1,0 +1,24 @@
+model:
+    model_id: "pixart"
+    model_type: 'pixart'  # ['sd','sdxl']
+remain_fp_regex: embed|norm_out|proj_out|adaln_single|caption_projection
+mixed_precision:  # the unmentioned layers are remained the main bitwidth (n_bits[i_bitwidth])
+  weight:
+    layer_name_regex: ['embed|norm_out|proj_out|adaln_single|caption_projection','','','blocks\.0|ff|blocks\.27']  # [FP, [n_bits]]
+  act:
+    layer_name_regex: ['embed|norm_out|proj_out|adaln_single|caption_projection','','','']
+viditq:
+  alpha: 0.99
+  layer_name_regex: attn|ff
+calib_data:
+  save_path: ./calib_data.pth
+weight:
+  n_bits: [2,4,8]
+  i_bitwidth: 1
+  group: 'tensor'
+  sym: False
+act:
+  n_bits: [2,4,8]
+  i_bitwidth: 2
+  group: 'tensor' 
+  sym: True

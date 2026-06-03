@@ -1,0 +1,45 @@
+# Large model weights
+models/
+*.safetensors
+*.pth
+*.bin
+*.ckpt
+*.pt
+
+# Eval / runtime outputs
+results/
+visualization/
+logs/
+train_out/
+pids.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+.ipynb_checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backups produced by our instrumentation
+*.bak
+
+# Datasets
+data/
+datasets/
+
+# Hidden sub-repo histories (kept on disk for upstream sync, not tracked)
+**/.git_orig/
+
+# RoboTwin large simulation assets (meshes, urdfs, objaverse models)
+RoboTwin/assets/
+
+# Misc upstream noise
+RoboTwin/=0.49.1

@@ -1,0 +1,262 @@
+===============================================================================
+LingBot-VA on RoboTwin: Success Rate Eval + Memory & Latency Monitoring Plan
+===============================================================================
+
+1 PROBLEM DEFINITION
+-------------------------------------------------------------------------------
+1.1 Current state
+- LingBot-VA inference server and RoboTwin client are wired through localhost
+  port. Server: lingbot-va/wan_va/wan_va_server.py. Client:
+  lingbot-va/evaluation/robotwin/eval_polict_client_openpi.py.
+- Server emits actions only. No memory probe. No latency probe.
+- RoboTwin client writes per-task success rate to ${save_root}/<task>/.
+- Conda envs: lingbot-jw (server) and RoboTwin-jw (client).
+- Model path placeholder already fixed to
+  /home/arash/EvalForWAMs/models/lingbot-va-posttrain-robotwin.
+
+1.2 Problem
+- No per-stage peak GPU memory record.
+- No per-stage inference latency record.
+- No unified runner for smoke / single-GPU / multi-GPU modes.
+- No script to merge SR with perf metrics into one summary.
+
+1.3 Goal
+- Add explicit perf probe inside server. Five stages: init, text_encoder,
+  vae_encode, transformer, action_head.
+- Per inference call: peak allocated memory and elapsed milliseconds per
+  stage, written as one JSONL line.
+- One launcher script with three modes: smoke, single, multi.
+- One aggregator script: reads perf JSONL + RoboTwin SR. Writes summary.csv
+  and summary.json.
+- Default output root: /home/arash/EvalForWAMs/results.
+- All modified files keep a .bak copy beside them.
+- Selected 15 tasks, test_num=25 per task, multi-GPU split: batch A
+  (task_list_id=7, 8 tasks) and batch B (task_list_id=8, 7 tasks).
+  Already encoded in launch_client_multigpus.sh.
+
+
+2 SYSTEM STRUCTURE
+-------------------------------------------------------------------------------
+2.1 Modules
+M1 perf_probe          Owns per-stage timing and memory probes.
+M2 instrumented_server Inserts probe calls around stages in wan_va_server.py.
+M3 perf_log            One JSONL file per server process. Probe owns writes.
+M4 robotwin_sr_reader  Reads RoboTwin SR output files.
+M5 aggregator          Merges perf_log and SR into summary files.
+M6 orchestrator        Single shell entry. Dispatches smoke / single / multi.
+
+2.2 State ownership
+- Per-stage timing and memory: owned by M1. Other modules read only.
+- Per-episode SR: owned by RoboTwin client (existing). M5 reads only.
+- Summary tables: owned by M5. Written once per eval run.
+- Process and GPU assignment: owned by M6.
+
+
+3 INTERFACE DESIGN
+-------------------------------------------------------------------------------
+3.1 M1 perf_probe (Python)
+File: lingbot-va/wan_va/utils/perf_probe.py
+
+  @dataclass
+  class StageRecord:
+      stage: str
+      elapsed_ms: float
+      peak_alloc_mb: float
+      peak_reserved_mb: float
+
+  @dataclass
+  class CallRecord:
+      call_id: int
+      task_name: str
+      timestamp: str
+      stages: list[StageRecord]
+      total_ms: float
+
+  class PerfProbe:
+      def __init__(self, log_path: str, task_name: str,
+                   device: int) -> None: ...
+      def begin_call(self) -> None: ...
+      def stage(self, name: str) -> "StageContext": ...
+      def end_call(self) -> CallRecord: ...
+      def close(self) -> None: ...
+
+  class StageContext:
+      def __enter__(self) -> "StageContext": ...
+      def __exit__(self, exc_type, exc, tb) -> None: ...
+
+Behavior
+- begin_call: reset_peak_memory_stats(device).
+- stage(name): on enter: torch.cuda.synchronize(); start CUDA Event;
+  reset_peak_memory_stats(device). On exit: end CUDA Event;
+  synchronize; read max_memory_allocated / max_memory_reserved;
+  append StageRecord.
+- end_call: aggregate StageRecord list; compute total_ms; write one JSONL
+  line to log_path; return CallRecord.
+
+3.2 M2 instrumented_server
+File: lingbot-va/wan_va/wan_va_server.py (modified, backup as .bak)
+
+Stages inserted
+- init: wraps model from_pretrained + to(device). One record at startup.
+- text_encoder: wraps text embedding compute path.
+- vae_encode: wraps image-to-latent VAE pass.
+- transformer: wraps video latent denoise loop (25 steps).
+- action_head: wraps action denoise loop (50 steps).
+CLI arg added
+- --perf_log_dir <path>. Default disables probe.
+
+3.3 M4 robotwin_sr_reader (Python helper inside M5)
+- Input: result root path.
+- Output: dict[task_name -> {success_count, total_count, success_rate}].
+- Source files: scans ${save_root}/<task>/eval_result/*.json or .txt as
+  RoboTwin writes them. Schema confirmed at Phase 2 start by reading one
+  real output.
+
+3.4 M5 aggregator (Python)
+File: lingbot-va/evaluation/robotwin/calc_perf_stat.py
+
+  def main(save_root: str, perf_log_dir: str, out_dir: str) -> None: ...
+
+Outputs
+- ${out_dir}/summary.csv columns: task_name, num_episodes, success_rate,
+  init_peak_mb, mean_total_ms, p50_total_ms, p95_total_ms,
+  mean_transformer_ms, mean_action_head_ms, peak_alloc_mb,
+  peak_reserved_mb.
+- ${out_dir}/summary.json with same data plus per-stage breakdown.
+
+3.5 M6 orchestrator (Bash)
+File: lingbot-va/evaluation/robotwin/run_eval.sh
+
+CLI
+  run_eval.sh --mode {smoke,single,multi}
+              [--task_name <name>]        # single, smoke
+              [--task_list_id <0..8>]     # multi
+              [--test_num <int>]          # default 25, smoke uses 1
+              [--save_root <path>]        # default /home/arash/EvalForWAMs/results
+              [--perf_log_dir <path>]     # default ${save_root}/perf
+              [--gpu_id <int>]            # default 0 for single, smoke
+Behavior
+- smoke: 1 GPU, 1 task (adjust_bottle), test_num=1. Starts 1 server, runs
+  1 client, waits, kills server.
+- single: 1 GPU, loops 15 tasks sequentially. One server reused across
+  tasks if server supports task switch; else restart per task.
+- multi: 8 GPUs. Starts 8 servers via launch_server_multigpus.sh. Runs
+  launch_client_multigpus.sh with task_list_id. Waits for all clients,
+  kills all servers.
+
+
+4 RUNTIME FLOW
+-------------------------------------------------------------------------------
+4.1 Server lifecycle (per process)
+- Read CLI. Open perf_probe if --perf_log_dir set.
+- probe.begin_call(); with probe.stage("init"): load text_encoder, VAE,
+  transformer, action_head. probe.end_call().
+- Open websocket. Loop: receive obs; probe.begin_call(); with
+  probe.stage("text_encoder"): ...; with probe.stage("vae_encode"): ...;
+  with probe.stage("transformer"): ...; with probe.stage("action_head"):
+  ...; probe.end_call(); send actions.
+
+4.2 Client lifecycle (per task)
+- Existing RoboTwin client behavior unchanged.
+- Writes SR to ${save_root}/<task>/.
+
+4.3 Aggregation flow
+- After all clients exit, M6 calls calc_perf_stat.py with save_root,
+  perf_log_dir, out_dir=${save_root}/summary.
+- M5 walks perf_log_dir for *.jsonl. Walks save_root for SR files.
+- Joins on task_name. Writes summary.csv and summary.json.
+
+4.4 Backup flow
+- Before any in-place edit on existing tracked files, the modifying step
+  creates <file>.bak if absent. No automated restore. Manual revert via cp.
+
+
+5 CODE MAPPING
+-------------------------------------------------------------------------------
+5.1 New files
+- lingbot-va/wan_va/utils/perf_probe.py
+- lingbot-va/evaluation/robotwin/calc_perf_stat.py
+- lingbot-va/evaluation/robotwin/run_eval.sh
+
+5.2 Modified files (with .bak)
+- lingbot-va/wan_va/wan_va_server.py
+    add: import perf_probe; CLI arg --perf_log_dir;
+    wrap 5 stages with probe.stage(...).
+- lingbot-va/evaluation/robotwin/launch_server.sh
+    add: forward --perf_log_dir to server command.
+- lingbot-va/evaluation/robotwin/launch_server_multigpus.sh
+    add: per-rank --perf_log_dir under unified directory.
+
+5.3 Already modified (no further change)
+- lingbot-va/wan_va/configs/va_robotwin_cfg.py  (model path fixed)
+- lingbot-va/evaluation/robotwin/launch_client.sh  (test_num=25)
+- lingbot-va/evaluation/robotwin/launch_client_multigpus.sh
+    (test_num default=25; task_groups index 7 and 8 added for selected 15)
+
+5.4 Default paths
+- save_root            /home/arash/EvalForWAMs/results
+- perf_log_dir         /home/arash/EvalForWAMs/results/perf
+- summary out_dir      /home/arash/EvalForWAMs/results/summary
+- backup suffix        .bak
+
+
+6 IMPLEMENTATION PHASES
+-------------------------------------------------------------------------------
+Phase 1: Probe module
+Target  Implement M1 perf_probe with CUDA Event timing and peak memory.
+Modify  none
+Add     lingbot-va/wan_va/utils/perf_probe.py
+        lingbot-va/wan_va/utils/__init__.py  (only if missing)
+Verify  python -c "from wan_va.utils.perf_probe import PerfProbe" succeeds
+        in lingbot-jw env.
+
+Phase 2: Server instrumentation
+Target  Insert probe around 5 stages. Add --perf_log_dir CLI arg.
+Modify  lingbot-va/wan_va/wan_va_server.py  (backup .bak first)
+Add     none
+Verify  Launch server with --perf_log_dir tmp/. Send one dummy request.
+        Confirm one JSONL line written with 5 stage records.
+
+Phase 3: Launch script wiring
+Target  Forward perf_log_dir from launch scripts to server.
+Modify  lingbot-va/evaluation/robotwin/launch_server.sh           (backup)
+        lingbot-va/evaluation/robotwin/launch_server_multigpus.sh (backup)
+Add     none
+Verify  bash launch_server.sh starts server and JSONL appears under
+        ${perf_log_dir}/.
+
+Phase 4: Smoke test mode
+Target  M6 orchestrator with --mode smoke.
+Add     lingbot-va/evaluation/robotwin/run_eval.sh
+Verify  bash run_eval.sh --mode smoke produces
+        results/perf/adjust_bottle_*.jsonl with at least 1 line and
+        results/adjust_bottle/ SR output.
+
+Phase 5: Aggregator
+Target  M5 reads perf JSONL and RoboTwin SR. Writes summary.csv and
+        summary.json.
+Add     lingbot-va/evaluation/robotwin/calc_perf_stat.py
+Verify  Run on smoke output. summary.csv has 1 row for adjust_bottle with
+        non-null SR and non-null mean_total_ms.
+
+Phase 6: Single-GPU full eval
+Target  run_eval.sh --mode single loops the 15 selected tasks on one GPU.
+        test_num=25 per task. Total 375 episodes.
+Modify  run_eval.sh
+Verify  results/summary/summary.csv has 15 rows after run.
+
+Phase 7: Multi-GPU full eval
+Target  run_eval.sh --mode multi starts 8 servers, then runs batch A
+        (task_list_id=7), then batch B (task_list_id=8). Aggregator runs
+        after each batch.
+Modify  run_eval.sh
+Verify  results/summary/summary.csv has 15 rows. peak_alloc_mb and
+        mean_total_ms columns populated for every task.
+
+
+7 ACCEPTANCE
+-------------------------------------------------------------------------------
+- summary.csv has 15 rows for the selected task list after Phase 7.
+- Every row has success_rate, mean_total_ms, peak_alloc_mb non-null.
+- All modified upstream files have a .bak sibling.
+- run_eval.sh supports smoke, single, multi without code change.
