@@ -1,9 +1,11 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import contextlib
 import os
 import sys
 import time
 from functools import partial
+from typing import Optional
 from PIL import Image
 from diffusers.video_processor import VideoProcessor
 from diffusers.utils import export_to_video
@@ -36,6 +38,7 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
+from utils.perf_probe import PerfProbe
 
 
 class VA_Server:
@@ -48,60 +51,89 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
-        self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
-                                            sigma_min=0.0,
-                                            extra_one_step=True)
-        self.action_scheduler = FlowMatchScheduler(
-            shift=self.job_config.action_snr_shift,
-            sigma_min=0.0,
-            extra_one_step=True)
-        self.scheduler.set_timesteps(1000, training=True)
-        self.action_scheduler.set_timesteps(1000, training=True)
+        perf_log_dir: Optional[str] = getattr(job_config, 'perf_log_dir', None)
+        perf_task_name: str = getattr(job_config, 'perf_task_name', 'unknown')
+        self.probe: Optional[PerfProbe] = None
+        if perf_log_dir:
+            log_path = os.path.join(
+                perf_log_dir,
+                f"{perf_task_name}_rank{job_config.local_rank}_{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
+            )
+            self.probe = PerfProbe(
+                log_path=log_path,
+                task_name=perf_task_name,
+                device=job_config.local_rank,
+            )
 
-        self.vae = load_vae(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'vae'),
-            torch_dtype=self.dtype,
-            torch_device='cpu' if self.enable_offload else self.device,
-        )
-        self.streaming_vae = WanVAEStreamingWrapper(self.vae)
+        init_stage_ctx = None
+        if self.probe is not None:
+            self.probe.begin_call()
+            init_stage_ctx = self.probe.stage('init')
+            init_stage_ctx.__enter__()
+        try:
+            self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
+                                                sigma_min=0.0,
+                                                extra_one_step=True)
+            self.action_scheduler = FlowMatchScheduler(
+                shift=self.job_config.action_snr_shift,
+                sigma_min=0.0,
+                extra_one_step=True)
+            self.scheduler.set_timesteps(1000, training=True)
+            self.action_scheduler.set_timesteps(1000, training=True)
 
-        self.tokenizer = load_tokenizer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'tokenizer'), )
-
-        self.text_encoder = load_text_encoder(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'text_encoder'),
-            torch_dtype=self.dtype,
-            torch_device='cpu' if self.enable_offload else self.device,
-        )
-
-        self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'transformer'),
-            torch_dtype=self.dtype,
-            torch_device=self.device,
-            attn_mode="torch"
-        )
-        shard_fn = shard_model
-        self.transformer = _configure_model(model=self.transformer,
-                                            shard_fn=shard_fn,
-                                            param_dtype=self.dtype,
-                                            device=self.device,
-                                            eval_mode=True,
-                                            )
-
-        self.env_type = job_config.env_type
-        self.streaming_vae_half = None
-        if self.env_type == 'robotwin_tshape':
-            vae_half = load_vae(
+            self.vae = load_vae(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'vae'),
                 torch_dtype=self.dtype,
                 torch_device='cpu' if self.enable_offload else self.device,
             )
-            self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+            self.streaming_vae = WanVAEStreamingWrapper(self.vae)
+
+            self.tokenizer = load_tokenizer(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'tokenizer'), )
+
+            self.text_encoder = load_text_encoder(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'text_encoder'),
+                torch_dtype=self.dtype,
+                torch_device='cpu' if self.enable_offload else self.device,
+            )
+
+            self.transformer = load_transformer(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'transformer'),
+                torch_dtype=self.dtype,
+                torch_device=self.device,
+                attn_mode="torch"
+            )
+            shard_fn = shard_model
+            self.transformer = _configure_model(model=self.transformer,
+                                                shard_fn=shard_fn,
+                                                param_dtype=self.dtype,
+                                                device=self.device,
+                                                eval_mode=True,
+                                                )
+
+            self.env_type = job_config.env_type
+            self.streaming_vae_half = None
+            if self.env_type == 'robotwin_tshape':
+                vae_half = load_vae(
+                    os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                                 'vae'),
+                    torch_dtype=self.dtype,
+                    torch_device='cpu' if self.enable_offload else self.device,
+                )
+                self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+        finally:
+            if init_stage_ctx is not None:
+                init_stage_ctx.__exit__(None, None, None)
+                self.probe.end_call()
+
+    def _stage(self, name: str):
+        if self.probe is None:
+            return contextlib.nullcontext()
+        return self.probe.stage(name)
 
     def _get_t5_prompt_embeds(
         self,
@@ -328,51 +360,52 @@ class VA_Server:
             images = [images]
         if len(images) < 1:
             return None
-        videos = []
-        for k_i, k in enumerate(self.job_config.obs_cam_keys):
-            if self.env_type == 'robotwin_tshape':
-                if k_i == 0:  # camera high
-                    height_i, width_i = self.height, self.width
+        with self._stage('vae_encode'):
+            videos = []
+            for k_i, k in enumerate(self.job_config.obs_cam_keys):
+                if self.env_type == 'robotwin_tshape':
+                    if k_i == 0:  # camera high
+                        height_i, width_i = self.height, self.width
+                    else:
+                        height_i, width_i = self.height // 2, self.width // 2
                 else:
-                    height_i, width_i = self.height // 2, self.width // 2
+                    height_i, width_i = self.height, self.width
+
+                history_video_k = torch.from_numpy(
+                    np.stack([each[k]
+                              for each in images])).float().permute(3, 0, 1, 2)
+                history_video_k = F.interpolate(history_video_k,
+                                                size=(height_i, width_i),
+                                                mode='bilinear',
+                                                align_corners=False).unsqueeze(0)
+                videos.append(history_video_k)
+
+            if self.env_type == 'robotwin_tshape':
+                videos_high = videos[0] / 255.0 * 2.0 - 1.0
+                videos_left_and_right = torch.cat(videos[1:],
+                                                  dim=0) / 255.0 * 2.0 - 1.0
+                vae_device = next(self.streaming_vae.vae.parameters()).device
+                enc_out_high = self.streaming_vae.encode_chunk(
+                    videos_high.to(vae_device).to(self.dtype))
+                enc_out_left_and_right = self.streaming_vae_half.encode_chunk(
+                    videos_left_and_right.to(vae_device).to(self.dtype))
+                enc_out = torch.cat([
+                    torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1),
+                    enc_out_high
+                ],
+                                    dim=-2)
             else:
-                height_i, width_i = self.height, self.width
+                videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
+                vae_device = next(self.streaming_vae.vae.parameters()).device
+                videos_chunk = videos.to(vae_device).to(self.dtype)
+                enc_out = self.streaming_vae.encode_chunk(videos_chunk)
 
-            history_video_k = torch.from_numpy(
-                np.stack([each[k]
-                          for each in images])).float().permute(3, 0, 1, 2)
-            history_video_k = F.interpolate(history_video_k,
-                                            size=(height_i, width_i),
-                                            mode='bilinear',
-                                            align_corners=False).unsqueeze(0)
-            videos.append(history_video_k)
-
-        if self.env_type == 'robotwin_tshape':
-            videos_high = videos[0] / 255.0 * 2.0 - 1.0
-            videos_left_and_right = torch.cat(videos[1:],
-                                              dim=0) / 255.0 * 2.0 - 1.0
-            vae_device = next(self.streaming_vae.vae.parameters()).device
-            enc_out_high = self.streaming_vae.encode_chunk(
-                videos_high.to(vae_device).to(self.dtype))
-            enc_out_left_and_right = self.streaming_vae_half.encode_chunk(
-                videos_left_and_right.to(vae_device).to(self.dtype))
-            enc_out = torch.cat([
-                torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1),
-                enc_out_high
-            ],
-                                dim=-2)
-        else:
-            videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
-            vae_device = next(self.streaming_vae.vae.parameters()).device
-            videos_chunk = videos.to(vae_device).to(self.dtype)
-            enc_out = self.streaming_vae.encode_chunk(videos_chunk)
-
-        mu, logvar = torch.chunk(enc_out, 2, dim=1)
-        latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
-        latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
-        mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
-        video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
-        return video_latent.to(self.device)
+            mu, logvar = torch.chunk(enc_out, 2, dim=1)
+            latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
+            latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
+            mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
+            video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+            return video_latent.to(self.device)
 
     def _reset(self, prompt=None):
         logger.info('Reset.')
@@ -423,17 +456,18 @@ class VA_Server:
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
-            self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=None,
-                do_classifier_free_guidance=self.job_config.guidance_scale > 1,
-                num_videos_per_prompt=1,
-                prompt_embeds=None,
-                negative_prompt_embeds=None,
-                max_sequence_length=512,
-                device=self.device,
-                dtype=self.dtype,
-            )
+            with self._stage('text_encoder'):
+                self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
+                    prompt=prompt,
+                    negative_prompt=None,
+                    do_classifier_free_guidance=self.job_config.guidance_scale > 1,
+                    num_videos_per_prompt=1,
+                    prompt_embeds=None,
+                    negative_prompt_embeds=None,
+                    max_sequence_length=512,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
@@ -486,79 +520,81 @@ class VA_Server:
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
-            for i, t in enumerate(tqdm(timesteps)):
-                last_step = i == len(timesteps) - 1
-                latent_cond = init_latent[:, :, 0:1].to(
-                    self.dtype) if frame_st_id == 0 else None
-                input_dict = self._prepare_latent_input(
-                    latents,
-                    None,
-                    t,
-                    t,
-                    latent_cond,
-                    None,
-                    frame_st_id=frame_st_id)
+            with self._stage('transformer'):
+                for i, t in enumerate(tqdm(timesteps)):
+                    last_step = i == len(timesteps) - 1
+                    latent_cond = init_latent[:, :, 0:1].to(
+                        self.dtype) if frame_st_id == 0 else None
+                    input_dict = self._prepare_latent_input(
+                        latents,
+                        None,
+                        t,
+                        t,
+                        latent_cond,
+                        None,
+                        frame_st_id=frame_st_id)
 
-                video_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=False)
+                    video_noise_pred = self.transformer(
+                        self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                        update_cache=1 if last_step else 0,
+                        cache_name=self.cache_name,
+                        action_mode=False)
 
-                if not last_step or video_step != -1:
-                    video_noise_pred = data_seq_to_patch(
-                        self.job_config.patch_size, video_noise_pred,
-                        frame_chunk_size, self.latent_height,
-                        self.latent_width, batch_size=2 if self.use_cfg else 1)
-                    if self.job_config.guidance_scale > 1:
-                        video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
-                    else:
-                        video_noise_pred = video_noise_pred[:1]
-                    latents = self.scheduler.step(video_noise_pred,
-                                                  t,
-                                                  latents,
-                                                  return_dict=False)
+                    if not last_step or video_step != -1:
+                        video_noise_pred = data_seq_to_patch(
+                            self.job_config.patch_size, video_noise_pred,
+                            frame_chunk_size, self.latent_height,
+                            self.latent_width, batch_size=2 if self.use_cfg else 1)
+                        if self.job_config.guidance_scale > 1:
+                            video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                        else:
+                            video_noise_pred = video_noise_pred[:1]
+                        latents = self.scheduler.step(video_noise_pred,
+                                                      t,
+                                                      latents,
+                                                      return_dict=False)
 
-                latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+                    latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
-            for i, t in enumerate(tqdm(action_timesteps)):
-                last_step = i == len(action_timesteps) - 1
-                action_cond = torch.zeros(
-                    [
-                        1, self.job_config.action_dim, 1,
-                        self.action_per_frame, 1
-                    ],
-                    device=self.device,
-                    dtype=self.dtype) if frame_st_id == 0 else None
+            with self._stage('action_head'):
+                for i, t in enumerate(tqdm(action_timesteps)):
+                    last_step = i == len(action_timesteps) - 1
+                    action_cond = torch.zeros(
+                        [
+                            1, self.job_config.action_dim, 1,
+                            self.action_per_frame, 1
+                        ],
+                        device=self.device,
+                        dtype=self.dtype) if frame_st_id == 0 else None
 
-                input_dict = self._prepare_latent_input(
-                    None,
-                    actions,
-                    t,
-                    t,
-                    None,
-                    action_cond,
-                    frame_st_id=frame_st_id)
-                action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=True)
+                    input_dict = self._prepare_latent_input(
+                        None,
+                        actions,
+                        t,
+                        t,
+                        None,
+                        action_cond,
+                        frame_st_id=frame_st_id)
+                    action_noise_pred = self.transformer(
+                        self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                        update_cache=1 if last_step else 0,
+                        cache_name=self.cache_name,
+                        action_mode=True)
 
-                if not last_step:
-                    action_noise_pred = rearrange(action_noise_pred,
-                                                  'b (f n) c -> b c f n 1',
-                                                  f=frame_chunk_size)
-                    if self.job_config.action_guidance_scale > 1:
-                        action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
-                    else:
-                        action_noise_pred = action_noise_pred[:1]
-                    actions = self.action_scheduler.step(action_noise_pred,
-                                                         t,
-                                                         actions,
-                                                         return_dict=False)
+                    if not last_step:
+                        action_noise_pred = rearrange(action_noise_pred,
+                                                      'b (f n) c -> b c f n 1',
+                                                      f=frame_chunk_size)
+                        if self.job_config.action_guidance_scale > 1:
+                            action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
+                        else:
+                            action_noise_pred = action_noise_pred[:1]
+                        actions = self.action_scheduler.step(action_noise_pred,
+                                                             t,
+                                                             actions,
+                                                             return_dict=False)
 
-                actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+                    actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
         actions[:, ~self.action_mask] *= 0
 
@@ -591,15 +627,17 @@ class VA_Server:
         with (
                 torch.no_grad(),
         ):
-            self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                             update_cache=2,
-                             cache_name=self.cache_name,
-                             action_mode=False)
+            with self._stage('transformer'):
+                self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                                 update_cache=2,
+                                 cache_name=self.cache_name,
+                                 action_mode=False)
 
-            self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                             update_cache=2,
-                             cache_name=self.cache_name,
-                             action_mode=True)
+            with self._stage('action_head'):
+                self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                                 update_cache=2,
+                                 cache_name=self.cache_name,
+                                 action_mode=True)
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
 
@@ -609,19 +647,26 @@ class VA_Server:
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
 
-        if reset:
-            logger.info(f"******************* Reset server ******************")
-            self._reset(prompt=prompt)
-            return dict()
-        elif compute_kv_cache:
-            logger.info(
-                f"################# Compute KV Cache #################")
-            self._compute_kv_cache(obs)
-            return dict()
-        else:
-            logger.info(f"################# Infer One Chunk #################")
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            return dict(action=action)
+        if self.probe is not None:
+            self.probe.begin_call()
+
+        try:
+            if reset:
+                logger.info(f"******************* Reset server ******************")
+                self._reset(prompt=prompt)
+                return dict()
+            elif compute_kv_cache:
+                logger.info(
+                    f"################# Compute KV Cache #################")
+                self._compute_kv_cache(obs)
+                return dict()
+            else:
+                logger.info(f"################# Infer One Chunk #################")
+                action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+                return dict(action=action)
+        finally:
+            if self.probe is not None:
+                self.probe.end_call()
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
@@ -674,12 +719,18 @@ class VA_Server:
         decoded_video = self.decode_one_video(pred_latent, 'np')[0]
         export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
 
-def run(args):    
-    
+def run(args):
+
     config = VA_CONFIGS[args.config_name]
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.perf_log_dir is not None:
+        config.perf_log_dir = args.perf_log_dir
+    if args.perf_task_name is not None:
+        config.perf_task_name = args.perf_task_name
+    if args.model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.model_path
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -720,6 +771,24 @@ def main():
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--perf_log_dir",
+        type=str,
+        default=None,
+        help='directory to write per-call perf JSONL log. Disabled if not set.'
+    )
+    parser.add_argument(
+        "--perf_task_name",
+        type=str,
+        default=None,
+        help='task name tag used in perf log filename and records.'
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help='override wan22_pretrained_model_name_or_path from config (e.g. quantized variant).'
     )
     args = parser.parse_args()
     run(args)
