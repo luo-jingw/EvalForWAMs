@@ -3,7 +3,9 @@
 # Modes:
 #   smoke  : 1 GPU, 1 task, test_num=1. Sanity check.
 #   single : 1 GPU, sequential loop over selected task list.
-#   multi  : 8 GPUs, one server per GPU, batched task groups.
+#   pool   : N GPUs, worker pool + shared queue. Each worker locks one GPU,
+#            pops next task, restarts server per task. Handles resume and
+#            VRAM checks. Preferred for full multi-GPU eval.
 set -euo pipefail
 
 LINGBOT_DIR="/home/arash/EvalForWAMs/lingbot-va"
@@ -21,13 +23,9 @@ SELECTED_TASKS=(
     lift_pot place_a2b_left pick_dual_bottles turn_switch
     place_empty_cup place_shoe place_bread_skillet
 )
-BATCH_A=(put_bottles_dustbin hanging_mug stack_bowls_two handover_block place_can_basket adjust_bottle beat_block_hammer click_bell)
-BATCH_B=(lift_pot place_a2b_left pick_dual_bottles turn_switch place_empty_cup place_shoe place_bread_skillet)
-
 # ---- CLI parsing ----
 MODE=""
 TASK_NAME=""
-TASK_LIST_ID=""
 TEST_NUM=""
 SAVE_ROOT=""
 PERF_LOG_DIR=""
@@ -40,10 +38,9 @@ MODEL_PATH=""
 
 print_usage() {
     cat <<EOF
-Usage: run_eval.sh --mode {smoke,single,multi,pool} [opts]
-  --mode <smoke|single|multi|pool>   required
+Usage: run_eval.sh --mode {smoke,single,pool} [opts]
+  --mode <smoke|single|pool>   required
   --task_name <name>            single, smoke. default adjust_bottle for smoke
-  --task_list_id <0|1>          multi: 0=batch A (8 tasks), 1=batch B (7 tasks)
   --test_num <int>              default 25, smoke uses 1
   --save_root <path>            default ${DEFAULT_SAVE_ROOT}
   --perf_log_dir <path>         default <save_root>/perf
@@ -63,7 +60,6 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --mode) MODE="$2"; shift 2 ;;
         --task_name) TASK_NAME="$2"; shift 2 ;;
-        --task_list_id) TASK_LIST_ID="$2"; shift 2 ;;
         --test_num) TEST_NUM="$2"; shift 2 ;;
         --save_root) SAVE_ROOT="$2"; shift 2 ;;
         --perf_log_dir) PERF_LOG_DIR="$2"; shift 2 ;;
@@ -273,65 +269,6 @@ run_single() {
     done
 }
 
-run_multi() {
-    local test_num="${TEST_NUM:-25}"
-    if [ -z "$TASK_LIST_ID" ]; then
-        echo "multi mode requires --task_list_id" >&2; exit 1
-    fi
-    local -a tasks
-    if [ "$TASK_LIST_ID" = "0" ]; then
-        tasks=("${BATCH_A[@]}")
-    elif [ "$TASK_LIST_ID" = "1" ]; then
-        tasks=("${BATCH_B[@]}")
-    else
-        echo "multi mode: --task_list_id must be 0 or 1" >&2; exit 1
-    fi
-
-    local log_dir="${SAVE_ROOT}/logs/multi_${TASK_LIST_ID}"
-    mkdir -p "$log_dir"
-
-    local start_port=29556
-    local start_master_port=29661
-    local i
-
-    # Launch one server per task. Wait for each GPU to free up before launch.
-    for i in "${!tasks[@]}"; do
-        local task="${tasks[$i]}"
-        local port=$((start_port + i))
-        local mport=$((start_master_port + i))
-        local server_log="${log_dir}/server_${i}_${task}.log"
-        echo "[multi] server ${i} task=${task} gpu=${i} port=${port}"
-        wait_for_gpu_memory "$i"
-        start_server "$i" "$port" "$mport" "$task" "$server_log"
-    done
-
-    # Wait for all servers to listen.
-    for i in "${!tasks[@]}"; do
-        wait_for_port $((start_port + i)) 900
-    done
-
-    # Launch clients concurrently.
-    local -a client_pids=()
-    for i in "${!tasks[@]}"; do
-        local task="${tasks[$i]}"
-        local port=$((start_port + i))
-        local client_log="${log_dir}/client_${i}_${task}.log"
-        local server_pidfile="${log_dir}/server_${i}_${task}.log.pid"
-        echo "[multi] client ${i} task=${task} port=${port} gpu=${i}"
-        (
-            start_client "$task" "$port" "$test_num" "$client_log" "$i"
-            kill_pid_file "$server_pidfile"
-        ) &
-        client_pids+=($!)
-    done
-
-    # Wait for clients. Servers are killed by cleanup_all trap on script exit.
-    local pid
-    for pid in "${client_pids[@]}"; do
-        wait "$pid" || true
-    done
-}
-
 # Returns 0 if the task still needs to run: no res.json, OR total_num < test_num.
 task_needs_run() {
     local task="$1"
@@ -437,7 +374,6 @@ run_pool() {
 case "$MODE" in
     smoke) run_smoke ;;
     single) run_single ;;
-    multi) run_multi ;;
     pool) run_pool ;;
     *) print_usage; exit 1 ;;
 esac

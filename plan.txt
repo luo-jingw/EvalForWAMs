@@ -19,20 +19,26 @@ LingBot-VA on RoboTwin: Success Rate Eval + Memory & Latency Monitoring Plan
 - No per-stage inference latency record.
 - No unified runner for smoke / single-GPU / multi-GPU modes.
 - No script to merge SR with perf metrics into one summary.
+- No live status dashboard during multi-task eval.
 
 1.3 Goal
 - Add explicit perf probe inside server. Five stages: init, text_encoder,
   vae_encode, transformer, action_head.
 - Per inference call: peak allocated memory and elapsed milliseconds per
   stage, written as one JSONL line.
-- One launcher script with three modes: smoke, single, multi.
+- One launcher script with three modes: smoke, single, pool.
+  pool replaces the original multi mode and uses worker-pool + queue.
 - One aggregator script: reads perf JSONL + RoboTwin SR. Writes summary.csv
   and summary.json.
-- Default output root: /home/arash/EvalForWAMs/results.
+- Default output root: /home/arash/EvalForWAMs/results/<variant_tag>
+  (variant_tag = bf16 for the baseline checkpoint).
+- Live status dashboard for watch(1).
 - All modified files keep a .bak copy beside them.
-- Selected 15 tasks, test_num=25 per task, multi-GPU split: batch A
-  (task_list_id=7, 8 tasks) and batch B (task_list_id=8, 7 tasks).
-  Already encoded in launch_client_multigpus.sh.
+- Selected 15 tasks, test_num=25 per task. Task list encoded as
+  SELECTED_TASKS in run_eval.sh.
+- Resume-aware: per-task res.json with total_num < test_num triggers re-run;
+  done tasks are skipped unless --rerun_all.
+- VRAM-aware: each worker waits until target GPU has >= MIN_FREE_MB free.
 
 
 2 SYSTEM STRUCTURE
@@ -43,13 +49,19 @@ M2 instrumented_server Inserts probe calls around stages in wan_va_server.py.
 M3 perf_log            One JSONL file per server process. Probe owns writes.
 M4 robotwin_sr_reader  Reads RoboTwin SR output files.
 M5 aggregator          Merges perf_log and SR into summary files.
-M6 orchestrator        Single shell entry. Dispatches smoke / single / multi.
+M6 orchestrator        Single shell entry. Dispatches smoke / single / pool.
+                       pool mode owns a shared queue file and a flock-based
+                       pop primitive; each worker locks one GPU.
+M7 monitor             Read-only dashboard for watch(1). Scans latest log
+                       dir under save_root/logs/ and the perf log dir.
 
 2.2 State ownership
 - Per-stage timing and memory: owned by M1. Other modules read only.
 - Per-episode SR: owned by RoboTwin client (existing). M5 reads only.
 - Summary tables: owned by M5. Written once per eval run.
 - Process and GPU assignment: owned by M6.
+- Shared task queue file: owned by M6 pool mode. flock serializes pop.
+- pidfile per server log: owned by M6 start_server / kill_pid_file.
 
 
 3 INTERFACE DESIGN
@@ -97,76 +109,135 @@ Behavior
 File: lingbot-va/wan_va/wan_va_server.py (modified, backup as .bak)
 
 Stages inserted
-- init: wraps model from_pretrained + to(device). One record at startup.
-- text_encoder: wraps text embedding compute path.
-- vae_encode: wraps image-to-latent VAE pass.
-- transformer: wraps video latent denoise loop (25 steps).
-- action_head: wraps action denoise loop (50 steps).
-CLI arg added
-- --perf_log_dir <path>. Default disables probe.
+- init: wraps full model load (vae, tokenizer, text_encoder, transformer,
+  optional vae_half). One record at startup with task_name=perf_task_name.
+- text_encoder: wraps encode_prompt path inside _reset.
+- vae_encode: wraps the body of _encode_obs (after empty-images early return).
+- transformer: wraps the video latent denoise loop in _infer; also wraps
+  the latent KV-cache forward in _compute_kv_cache.
+- action_head: wraps the action denoise loop in _infer; also wraps the
+  action KV-cache forward in _compute_kv_cache.
+Per-call composition (driven by obs flags handled in infer())
+- reset call             : stages = [text_encoder]
+- compute_kv_cache call  : stages = [vae_encode, transformer, action_head]
+                           vae_encode absent if obs has no images.
+- infer call             : stages = [vae_encode, transformer, action_head]
+                           same vae_encode-absent caveat.
+CLI args added
+- --perf_log_dir <path>     directory for perf JSONL. Disabled if absent.
+- --perf_task_name <name>   tag used in JSONL filename and records.
+- --model_path <dir>        overrides
+                            cfg.wan22_pretrained_model_name_or_path.
 
 3.3 M4 robotwin_sr_reader (Python helper inside M5)
-- Input: result root path.
-- Output: dict[task_name -> {success_count, total_count, success_rate}].
-- Source files: scans ${save_root}/<task>/eval_result/*.json or .txt as
-  RoboTwin writes them. Schema confirmed at Phase 2 start by reading one
-  real output.
+- Input: save_root path.
+- Output: dict[task_name -> {succ_num, total_num, succ_rate}].
+- Source files: scans ${save_root}/stseed-*/metrics/<task>/res.json.
+- Resolution rule: per task, keep the entry with largest total_num.
 
 3.4 M5 aggregator (Python)
 File: lingbot-va/evaluation/robotwin/calc_perf_stat.py
 
   def main(save_root: str, perf_log_dir: str, out_dir: str) -> None: ...
 
+Per-task perf record selection
+- Walks perf_log_dir for files matching
+  <task_name>_rank<N>_<YYYYMMDD_HHMMSS>.jsonl.
+- task_name comes from the filename, not from per-record fields.
+- For each task, only the file with the largest mtime is consumed;
+  older files (from interrupted prior runs) are skipped and the skip
+  list is printed. Files remain on disk.
+
 Outputs
 - ${out_dir}/summary.csv columns: task_name, num_episodes, success_rate,
   init_peak_mb, mean_total_ms, p50_total_ms, p95_total_ms,
   mean_transformer_ms, mean_action_head_ms, peak_alloc_mb,
   peak_reserved_mb.
-- ${out_dir}/summary.json with same data plus per-stage breakdown.
+- ${out_dir}/summary.json with same data plus per-stage breakdown
+  (per_stage_mean_ms, per_stage_peak_alloc_mb, per_stage_peak_reserved_mb).
 
 3.5 M6 orchestrator (Bash)
 File: lingbot-va/evaluation/robotwin/run_eval.sh
 
 CLI
-  run_eval.sh --mode {smoke,single,multi}
-              [--task_name <name>]        # single, smoke
-              [--task_list_id <0..8>]     # multi
+  run_eval.sh --mode {smoke,single,pool}
+              [--task_name <name>]        # smoke, single
               [--test_num <int>]          # default 25, smoke uses 1
-              [--save_root <path>]        # default /home/arash/EvalForWAMs/results
+              [--save_root <path>]        # default
+                                          # /home/arash/EvalForWAMs/results/bf16
               [--perf_log_dir <path>]     # default ${save_root}/perf
-              [--gpu_id <int>]            # default 0 for single, smoke
+              [--model_path <dir>]        # default
+                                          # models/lingbot-va-posttrain-robotwin
+              [--gpu_id <int>]            # default 0 for smoke, single
+              [--seed <int>]              # default 0
+              [--min_free_mb <int>]       # default 40000
+              [--gpu_wait_timeout <int>]  # default 0 (wait forever)
+              [--gpu_poll_interval <int>] # default 30
+              [--rerun_all]               # pool: ignore prior res.json
+
 Behavior
-- smoke: 1 GPU, 1 task (adjust_bottle), test_num=1. Starts 1 server, runs
-  1 client, waits, kills server.
-- single: 1 GPU, loops 15 tasks sequentially. One server reused across
-  tasks if server supports task switch; else restart per task.
-- multi: 8 GPUs. Starts 8 servers via launch_server_multigpus.sh. Runs
-  launch_client_multigpus.sh with task_list_id. Waits for all clients,
-  kills all servers.
+- smoke: 1 GPU, 1 task (default adjust_bottle), test_num=1.
+  Starts 1 server, waits for port, runs 1 client, kills server.
+- single: 1 GPU, sequential loop. If --task_name set, runs that one;
+  otherwise loops over SELECTED_TASKS. New server per task.
+- pool: queue = tasks needing run (per task_needs_run). Picks usable
+  GPUs (free VRAM >= MIN_FREE_MB) at start; spawns one worker per usable
+  GPU. Each worker pops next task from the shared queue (flock), starts
+  a fresh server on its GPU, runs the client, kills the server, loops.
+  Exits when queue empty.
+
+3.6 M7 monitor (Bash)
+File: monitor.sh (repo root)
+
+Inputs (env vars with defaults)
+- SAVE_ROOT      default /home/arash/EvalForWAMs/results/bf16
+- PERF_LOG_DIR   default ${SAVE_ROOT}/perf
+
+Outputs
+- stdout: GPU table (memory, util) then per-task table (task, GPU,
+  srv_pid, srv_alive, client_state, step, SR, perf_calls, last_ms, err).
+- Recommended invocation: watch -n 1 ./monitor.sh.
 
 
 4 RUNTIME FLOW
 -------------------------------------------------------------------------------
 4.1 Server lifecycle (per process)
-- Read CLI. Open perf_probe if --perf_log_dir set.
-- probe.begin_call(); with probe.stage("init"): load text_encoder, VAE,
-  transformer, action_head. probe.end_call().
-- Open websocket. Loop: receive obs; probe.begin_call(); with
-  probe.stage("text_encoder"): ...; with probe.stage("vae_encode"): ...;
-  with probe.stage("transformer"): ...; with probe.stage("action_head"):
-  ...; probe.end_call(); send actions.
+- Read CLI. If --perf_log_dir set: construct PerfProbe with
+  log_path=${perf_log_dir}/${perf_task_name}_rank<N>_<ts>.jsonl.
+- probe.begin_call(); with probe.stage("init"): load vae, tokenizer,
+  text_encoder, transformer, optional vae_half. probe.end_call().
+- Open websocket via run_async_server_mode.
+- Per incoming obs: probe.begin_call(); branch on flags:
+    reset            : stage(text_encoder) inside _reset.
+    compute_kv_cache : stage(vae_encode) inside _encode_obs;
+                       stage(transformer); stage(action_head).
+    infer            : stage(vae_encode) inside _encode_obs;
+                       stage(transformer); stage(action_head).
+  probe.end_call() in finally.
 
 4.2 Client lifecycle (per task)
-- Existing RoboTwin client behavior unchanged.
-- Writes SR to ${save_root}/<task>/.
+- RoboTwin client unchanged except for the robowin_root path fix.
+- Per-episode metrics written to
+  ${save_root}/stseed-<seed>/metrics/<task_name>/res.json.
 
 4.3 Aggregation flow
-- After all clients exit, M6 calls calc_perf_stat.py with save_root,
+- After all clients exit, run calc_perf_stat.py with save_root,
   perf_log_dir, out_dir=${save_root}/summary.
-- M5 walks perf_log_dir for *.jsonl. Walks save_root for SR files.
+- M5 walks perf_log_dir for *.jsonl; for each task keeps newest by mtime.
+- M5 walks save_root/stseed-*/metrics/*/res.json for SR.
 - Joins on task_name. Writes summary.csv and summary.json.
 
-4.4 Backup flow
+4.4 Pool worker flow (per worker)
+- Loop:
+    t = pop_task(queue_file, lock_file)
+    if t empty: break
+    wait_for_gpu_memory(gpu)
+    start_server(gpu, port, mport, t, server_log)
+    wait_for_port(port, 600)
+    start_client(t, port, test_num, client_log, gpu)
+    kill_pid_file(server_log.pid)
+
+4.5 Backup flow
 - Before any in-place edit on existing tracked files, the modifying step
   creates <file>.bak if absent. No automated restore. Manual revert via cp.
 
@@ -177,32 +248,41 @@ Behavior
 - lingbot-va/wan_va/utils/perf_probe.py
 - lingbot-va/evaluation/robotwin/calc_perf_stat.py
 - lingbot-va/evaluation/robotwin/run_eval.sh
+- monitor.sh                                            (repo root)
 
 5.2 Modified files (with .bak)
 - lingbot-va/wan_va/wan_va_server.py
-    add: import perf_probe; CLI arg --perf_log_dir;
-    wrap 5 stages with probe.stage(...).
+    add: import perf_probe; CLI args --perf_log_dir, --perf_task_name,
+    --model_path. Wrap 5 stages with probe.stage(...). Wrap full model
+    load with stage("init") under begin_call/end_call.
 - lingbot-va/evaluation/robotwin/launch_server.sh
-    add: forward --perf_log_dir to server command.
+    add: forward PERF_LOG_DIR / PERF_TASK_NAME env vars to server.
 - lingbot-va/evaluation/robotwin/launch_server_multigpus.sh
-    add: per-rank --perf_log_dir under unified directory.
+    add: per-rank perf_args from PERF_TASK_NAMES colon-separated list.
+- lingbot-va/evaluation/robotwin/eval_polict_client_openpi.py
+    edit: replace robowin_root placeholder with
+    /home/arash/EvalForWAMs/RoboTwin.
 
 5.3 Already modified (no further change)
 - lingbot-va/wan_va/configs/va_robotwin_cfg.py  (model path fixed)
 - lingbot-va/evaluation/robotwin/launch_client.sh  (test_num=25)
 - lingbot-va/evaluation/robotwin/launch_client_multigpus.sh
-    (test_num default=25; task_groups index 7 and 8 added for selected 15)
+    (test_num default=25; legacy script, unused by run_eval.sh)
 
 5.4 Default paths
-- save_root            /home/arash/EvalForWAMs/results
-- perf_log_dir         /home/arash/EvalForWAMs/results/perf
-- summary out_dir      /home/arash/EvalForWAMs/results/summary
+- save_root            /home/arash/EvalForWAMs/results/bf16
+- perf_log_dir         ${save_root}/perf
+- summary out_dir      ${save_root}/summary
+- log dir              ${save_root}/logs/<mode_tag>
+- visualization dir    ${save_root}/visualization
 - backup suffix        .bak
+- selected task list   SELECTED_TASKS array in run_eval.sh
+                       (15 tasks: 1 long, 4 medium-long, 10 short)
 
 
 6 IMPLEMENTATION PHASES
 -------------------------------------------------------------------------------
-Phase 1: Probe module
+Phase 1: Probe module                                            [DONE]
 Target  Implement M1 perf_probe with CUDA Event timing and peak memory.
 Modify  none
 Add     lingbot-va/wan_va/utils/perf_probe.py
@@ -210,14 +290,14 @@ Add     lingbot-va/wan_va/utils/perf_probe.py
 Verify  python -c "from wan_va.utils.perf_probe import PerfProbe" succeeds
         in lingbot-jw env.
 
-Phase 2: Server instrumentation
+Phase 2: Server instrumentation                                  [DONE]
 Target  Insert probe around 5 stages. Add --perf_log_dir CLI arg.
 Modify  lingbot-va/wan_va/wan_va_server.py  (backup .bak first)
 Add     none
 Verify  Launch server with --perf_log_dir tmp/. Send one dummy request.
         Confirm one JSONL line written with 5 stage records.
 
-Phase 3: Launch script wiring
+Phase 3: Launch script wiring                                    [DONE]
 Target  Forward perf_log_dir from launch scripts to server.
 Modify  lingbot-va/evaluation/robotwin/launch_server.sh           (backup)
         lingbot-va/evaluation/robotwin/launch_server_multigpus.sh (backup)
@@ -225,38 +305,447 @@ Add     none
 Verify  bash launch_server.sh starts server and JSONL appears under
         ${perf_log_dir}/.
 
-Phase 4: Smoke test mode
+Phase 4: Smoke test mode                                         [DONE]
 Target  M6 orchestrator with --mode smoke.
 Add     lingbot-va/evaluation/robotwin/run_eval.sh
 Verify  bash run_eval.sh --mode smoke produces
         results/perf/adjust_bottle_*.jsonl with at least 1 line and
         results/adjust_bottle/ SR output.
 
-Phase 5: Aggregator
+Phase 5: Aggregator                                              [DONE]
 Target  M5 reads perf JSONL and RoboTwin SR. Writes summary.csv and
         summary.json.
 Add     lingbot-va/evaluation/robotwin/calc_perf_stat.py
 Verify  Run on smoke output. summary.csv has 1 row for adjust_bottle with
         non-null SR and non-null mean_total_ms.
 
-Phase 6: Single-GPU full eval
+Phase 6: Single-GPU full eval                                    [DONE]
 Target  run_eval.sh --mode single loops the 15 selected tasks on one GPU.
         test_num=25 per task. Total 375 episodes.
 Modify  run_eval.sh
 Verify  results/summary/summary.csv has 15 rows after run.
 
-Phase 7: Multi-GPU full eval
-Target  run_eval.sh --mode multi starts 8 servers, then runs batch A
-        (task_list_id=7), then batch B (task_list_id=8). Aggregator runs
-        after each batch.
+Phase 7: Multi-GPU full eval                                     [DONE]
+Target  Multi-GPU 15-task eval across N GPUs.
+Implemented as run_eval.sh --mode pool (worker pool + flock-serialized
+shared queue). The original --mode multi was removed. Resume-aware:
+skips tasks whose res.json total_num >= test_num unless --rerun_all.
+VRAM-aware: each worker waits for >= MIN_FREE_MB free on its GPU.
+M7 monitor.sh added for live dashboard.
+Output at results/bf16/.
 Modify  run_eval.sh
-Verify  results/summary/summary.csv has 15 rows. peak_alloc_mb and
+Add     monitor.sh
+Verify  results/bf16/summary/summary.csv has 15 rows. peak_alloc_mb and
         mean_total_ms columns populated for every task.
 
 
-7 ACCEPTANCE
+7 ACCEPTANCE                                                     [DONE]
 -------------------------------------------------------------------------------
 - summary.csv has 15 rows for the selected task list after Phase 7.
 - Every row has success_rate, mean_total_ms, peak_alloc_mb non-null.
 - All modified upstream files have a .bak sibling.
-- run_eval.sh supports smoke, single, multi without code change.
+- run_eval.sh supports smoke, single, pool without code change.
+
+
+===============================================================================
+PART II  Post-Training Quantization of LingBot-VA via ViDiT-Q
+===============================================================================
+
+8 PROBLEM DEFINITION
+-------------------------------------------------------------------------------
+8.1 Current state
+- Baseline bf16 eval at results/bf16/summary/summary.csv: 15 tasks,
+  test_num=25 per task, mean SR ~0.86.
+- Transformer parameters: 5.09 B, all 2D nn.Linear weights.
+- Memory: init peak 23 301 MB; runtime peak ~32 000 MB.
+- Inference dtype: bf16 throughout (param_dtype = torch.bfloat16).
+- Distributed wrap: _configure_model -> shard_model (FSDP) at server init.
+- ViDiT-Q source tree at /home/arash/EvalForWAMs/ViDiT-Q/. Standalone
+  package quant_utils/qdiff/ is reusable as-is.
+
+8.2 Problem
+- No quantized variant exists.
+- No PTQ pipeline for WanModel.
+- No calibration data collection for LingBot-VA's two-stream
+  (video_mode and action_mode) Transformer.
+- No cross-checkpoint comparison (bf16 vs W8A8 vs W4A8).
+- Server load path is hardcoded to from_pretrained; no quantized branch.
+- No CUDA kernel for W8A8 GEMM matching WanTransformerBlock shape.
+
+8.3 Goal
+- Vendor qdiff package into lingbot-jw env as editable install.
+- Provide QuantWanTransformer subclass with PTQ surgery on nn.Linear.
+- Provide calibration runner that exercises both action_mode values.
+- Provide PTQ runner that writes quant_params.pth.
+- Server gains optional quantized load path; bf16 path unchanged.
+- Provide W8A8 and W4A8-mixed-precision configs.
+- Custom CUDA kernel for W8A8 Linear matching WanTransformerBlock,
+  enabling actual weight memory reduction at inference.
+- Cross-checkpoint comparison output extends summary aggregator.
+
+8.4 Non-goals
+- No retraining. No QAT. Only post-training quantization.
+- No attention-matmul quantization. Only nn.Linear weight + activation.
+- No quantization of text_encoder or VAE. Only transformer.
+
+
+9 SYSTEM STRUCTURE
+-------------------------------------------------------------------------------
+9.1 Modules
+Q1 quant_lib              Vendored qdiff package. Owns Quantizer and
+                          QuantizedLinear classes. Imported, not modified.
+Q2 quant_wan_transformer  Subclass of WanModel. Owns the layer-refactor,
+                          load/save quant_param_dict, set_init_done.
+Q3 calib_hook_manager     Owns activation-collection hooks on
+                          QuantizedLinear instances. Writes calib_data.pth.
+Q4 calib_runner           CLI entry. Loads FP model, invokes
+                          calib_hook_manager, runs N inference calls
+                          across both modes, dumps calib_data.pth.
+Q5 ptq_runner             CLI entry. Loads QuantWanTransformer, applies
+                          calib data, calls set_init_done,
+                          save_quant_param_dict, writes quant_params.pth.
+Q6 quant_server_loader    Branch inside wan_va_server.py that switches
+                          between bf16 from_pretrained and quantized
+                          QuantWanTransformer + load_quant_param_dict.
+Q7 quant_configs          YAML configs for w8a8, w4a8 mixed precision.
+Q8 quant_kernel           Custom CUDA extension for W8A8 GEMM. Provides
+                          one Python-facing class QuantWanLinearW8A8.
+Q9 quant_block_kernel     QuantWanTransformerBlockWithCudaKernel that
+                          replaces attention + FFN Linears with Q8 ops.
+Q10 cross_ckpt_aggregator Extended aggregator that takes multiple
+                          save_roots, emits comparison table.
+
+9.2 State ownership
+- Quantizer scale/zero_point: owned by Q2 instance, persisted to
+  quant_params.pth.
+- Calibration tensors: owned by Q3, persisted to calib_data.pth.
+- Active checkpoint selection: owned by Q6 via CLI arg.
+- Quant CUDA buffers (int8 weights, scales): owned by Q8.
+- Cross-checkpoint table: owned by Q10.
+
+
+10 INTERFACE DESIGN
+-------------------------------------------------------------------------------
+10.1 Q2 QuantWanTransformer
+File: lingbot-va/wan_va/quant/quant_wan_transformer.py
+
+  from wan_va.modules.model import WanModel
+  from qdiff.base.base_quantizer import BaseQuantizer
+  from qdiff.base.quant_layer import QuantizedLinear
+
+  class QuantWanTransformer(WanModel):
+      def __init__(self, quant_config: dict, **wan_init_kwargs) -> None: ...
+      def quant_layer_refactor(self) -> None: ...
+      def save_quant_param_dict(self) -> dict[str, dict]: ...
+      def load_quant_param_dict(self,
+                                quant_param_dict: dict[str, dict]) -> None: ...
+      def set_init_done(self) -> None: ...
+      def bitwidth_refactor(self) -> None: ...
+
+10.2 Q3 calib_hook_manager
+File: lingbot-va/wan_va/quant/calib_hook_manager.py
+
+  @dataclass
+  class CalibTensorEntry:
+      module_name: str
+      per_channel_max: torch.Tensor  # [C_in]
+
+  class CalibHookManager:
+      def __init__(self, model: nn.Module,
+                   target_class: type = QuantizedLinear) -> None: ...
+      def register(self) -> None: ...
+      def remove(self) -> None: ...
+      def export(self) -> dict[str, CalibTensorEntry]: ...
+      def dump(self, save_path: str) -> None: ...
+
+10.3 Q4 calib_runner
+File: lingbot-va/wan_va/quant/calib_runner.py
+
+  def run_calib(model: QuantWanTransformer,
+                obs_iterator: Iterable[dict],
+                n_calls: int,
+                save_path: str) -> None: ...
+
+  # CLI:
+  #   python -m wan_va.quant.calib_runner
+  #       --config-name robotwin
+  #       --quant_config <yaml>
+  #       --calib_save <pth>
+  #       --calib_source <fixture_dir>
+  #       --n_calls 32
+
+10.4 Q5 ptq_runner
+File: lingbot-va/wan_va/quant/ptq_runner.py
+
+  def run_ptq(quant_config_path: str,
+              calib_data_path: str,
+              quant_params_save: str,
+              wan_model_path: str) -> None: ...
+
+  # CLI:
+  #   python -m wan_va.quant.ptq_runner
+  #       --quant_config <yaml>
+  #       --calib_data <pth>
+  #       --quant_params_save <pth>
+  #       --wan_model_path <ckpt_dir>
+
+10.5 Q6 quant_server_loader (in wan_va_server.py)
+New CLI args
+  --quant_config <yaml>          # if set: use QuantWanTransformer
+  --quant_param_ckpt <pth>       # if set: load_quant_param_dict
+Behavior
+- If --quant_config absent: existing bf16 from_pretrained path. No change.
+- If --quant_config present: instantiate QuantWanTransformer(quant_config,
+  **wan_kwargs_loaded_from_disk). Then load_quant_param_dict.
+
+10.6 Q7 quant_configs
+Files
+  lingbot-va/wan_va/quant/configs/w8a8.yaml
+  lingbot-va/wan_va/quant/configs/w4a8_mp.yaml
+Schema  (matches ViDiT-Q config schema)
+  remain_fp_regex: <regex>     # layers kept FP
+  weight:  {n_bits: int | list, sym: bool}
+  act:     {n_bits: int | list, sym: bool}
+  smooth_quant: {alpha: float, layer_name_regex: str}    # optional
+  quarot:       {layer_name_regex: str}                  # optional
+  viditq:       {alpha: float, layer_name_regex: str}    # optional
+  mixed_precision:                                       # w4a8 only
+      weight: {layer_name_regex: list[str]}
+      act:    {layer_name_regex: list[str]}
+
+10.7 Q8 quant_kernel
+File tree: lingbot-va/wan_va/quant/kernel/
+  csrc/w8a8_gemm.cu              # GEMM int8 x int8 -> bf16
+  csrc/pybind.cpp
+  setup.py
+  qwan_extension/nn/qlinear.py
+Class
+  class QuantWanLinearW8A8(nn.Module):
+      def __init__(self, in_features: int, out_features: int,
+                   has_bias: bool) -> None: ...
+      # state_dict keys: int_weight (int8), scale_weight (bf16),
+      #                  zp_weight (bf16), bias (bf16, optional)
+      def forward(self, x: torch.Tensor,
+                  quant_params: QuantParams) -> torch.Tensor: ...
+
+10.8 Q9 quant_block_kernel
+File: lingbot-va/wan_va/quant/kernel/quant_wan_block.py
+
+  class QuantWanTransformerBlockWithCudaKernel(nn.Module):
+      def __init__(self, ref_block: WanTransformerBlock,
+                   quant_params: QuantParams) -> None: ...
+      def forward(self, *args, **kwargs) -> torch.Tensor: ...
+
+10.9 Q10 cross_ckpt_aggregator
+File: lingbot-va/evaluation/robotwin/calc_cross_ckpt.py
+
+  def main(save_roots: dict[str, str], out_dir: str) -> None: ...
+  # save_roots example: {"bf16": ".../results/bf16",
+  #                      "w8a8": ".../results/w8a8"}
+  # Output: out_dir/cross_summary.csv with columns:
+  #   task_name,
+  #   bf16_success_rate, w8a8_success_rate, w4a8_success_rate,
+  #   bf16_peak_alloc_mb, w8a8_peak_alloc_mb, w4a8_peak_alloc_mb,
+  #   bf16_mean_total_ms, w8a8_mean_total_ms, w4a8_mean_total_ms,
+  #   sr_delta_w8a8, sr_delta_w4a8
+
+
+11 RUNTIME FLOW
+-------------------------------------------------------------------------------
+11.1 Calibration flow (per quant_config)
+- Q4 launches QuantWanTransformer(quant_config). All nn.Linear (except
+  remain_fp_regex) become QuantizedLinear; weights are statically
+  quantized at refactor time.
+- Q3 registers forward_hooks on QuantizedLinear instances.
+- Q4 runs n_calls inference calls. The call iterator must yield obs that
+  cover both action_mode=False (video diffusion) and action_mode=True
+  (action diffusion). One real episode satisfies both.
+- Q3 reduces collected activations to per-channel max.
+- Q3 dumps calib_data.pth.
+
+11.2 PTQ flow
+- Q5 instantiates a fresh QuantWanTransformer(quant_config).
+- Loads calib_data.pth.
+- For each method (smooth_quant / quarot / viditq) flagged in
+  quant_config: run its init hook using calib data; update layer state.
+- Call model.set_init_done().
+- Call model.save_quant_param_dict() and torch.save to quant_params.pth.
+
+11.3 Quantized inference flow (server)
+- Server starts with --quant_config and --quant_param_ckpt.
+- Q6 branch builds QuantWanTransformer instead of WanModel.
+- Loads quant_params.pth via load_quant_param_dict.
+- Init stage probe still records init_peak_mb.
+- Per-call probe and per-stage probe unchanged (M1, M2 from Part I).
+- Stage transformer and stage action_head now measure quantized forward.
+
+11.4 Kernel inference flow (server)
+- Activated by additional CLI arg --quant_use_kernel.
+- After load_quant_param_dict, server calls
+  model.hardware_forward_refactor(kernel_weight_path), which:
+    - Replaces each WanTransformerBlock with
+      QuantWanTransformerBlockWithCudaKernel.
+    - Loads int8 weights and scales into kernel modules.
+- Forward goes through Q9 / Q8 path.
+
+11.5 Cross-checkpoint comparison flow
+- Q10 reads multiple save_roots, one per checkpoint variant.
+- Each save_root has its own perf/ and stseed-*/metrics/.
+- Output: cross_summary.csv joined on task_name.
+
+
+12 CODE MAPPING
+-------------------------------------------------------------------------------
+12.1 New files
+- lingbot-va/wan_va/quant/__init__.py
+- lingbot-va/wan_va/quant/quant_wan_transformer.py
+- lingbot-va/wan_va/quant/calib_hook_manager.py
+- lingbot-va/wan_va/quant/calib_runner.py
+- lingbot-va/wan_va/quant/ptq_runner.py
+- lingbot-va/wan_va/quant/configs/w8a8.yaml
+- lingbot-va/wan_va/quant/configs/w4a8_mp.yaml
+- lingbot-va/wan_va/quant/kernel/setup.py
+- lingbot-va/wan_va/quant/kernel/csrc/w8a8_gemm.cu
+- lingbot-va/wan_va/quant/kernel/csrc/pybind.cpp
+- lingbot-va/wan_va/quant/kernel/qwan_extension/__init__.py
+- lingbot-va/wan_va/quant/kernel/qwan_extension/nn/qlinear.py
+- lingbot-va/wan_va/quant/kernel/quant_wan_block.py
+- lingbot-va/evaluation/robotwin/calc_cross_ckpt.py
+
+12.2 Modified files (with .bak)
+- lingbot-va/wan_va/wan_va_server.py
+    add: CLI args --quant_config, --quant_param_ckpt, --quant_use_kernel.
+    add: Q6 quant_server_loader branch in __init__.
+- lingbot-va/evaluation/robotwin/run_eval.sh
+    add: CLI args --quant_config, --quant_param_ckpt; forward to server.
+    add: default --save_root /home/arash/EvalForWAMs/results/${tag}
+         where tag derives from quant config basename.
+
+12.3 Vendored
+- /home/arash/EvalForWAMs/ViDiT-Q/quant_utils
+    installed via pip install -e into lingbot-jw env. No modification.
+
+12.4 Default paths
+- calib_data            results/calib/calib_data_<config>.pth
+- quant_params          results/calib/quant_params_<config>.pth
+- w8a8 save_root        results/w8a8
+- w4a8 save_root        results/w4a8
+- kernel int weights    results/calib/int_weights_<config>.pth
+- cross summary out     results/cross_summary/
+
+
+13 IMPLEMENTATION PHASES
+-------------------------------------------------------------------------------
+Phase 8: vendor qdiff
+Target  Install ViDiT-Q quant_utils as editable package in lingbot-jw.
+Modify  none
+Add     none (third-party tree already present)
+Verify  python -c "from qdiff.base.quant_layer import QuantizedLinear"
+        succeeds in lingbot-jw env.
+
+Phase 9: QuantWanTransformer wrapper
+Target  Implement Q2.
+Add     lingbot-va/wan_va/quant/__init__.py
+        lingbot-va/wan_va/quant/quant_wan_transformer.py
+Modify  none
+Verify  Unit script instantiates QuantWanTransformer(w8a8_config,
+        **wan_kwargs); count of QuantizedLinear instances matches the
+        count of original nn.Linear minus remain_fp_regex matches.
+
+Phase 10: Quant configs
+Target  Implement Q7 configs.
+Add     lingbot-va/wan_va/quant/configs/w8a8.yaml
+        lingbot-va/wan_va/quant/configs/w4a8_mp.yaml
+Modify  none
+Verify  OmegaConf.load on each yaml returns expected keys.
+        remain_fp_regex covers patch_embedding_mlp, action_embedder,
+        time_proj, proj_out, action_proj_out, and adaLN modulation.
+
+Phase 11: Calibration runner
+Target  Implement Q3 and Q4.
+Add     lingbot-va/wan_va/quant/calib_hook_manager.py
+        lingbot-va/wan_va/quant/calib_runner.py
+Modify  none
+Verify  Run calib on one RoboTwin episode of adjust_bottle. Output
+        calib_data.pth contains an entry for every QuantizedLinear in
+        the model, each tensor shape == [in_features].
+
+Phase 12: PTQ runner
+Target  Implement Q5.
+Add     lingbot-va/wan_va/quant/ptq_runner.py
+Modify  none
+Verify  Given Phase 11 calib_data.pth and w8a8.yaml, produce
+        quant_params.pth. Key set covers all QuantizedLinear in model.
+
+Phase 13: Server quantized load path
+Target  Implement Q6 branch in wan_va_server.py.
+Modify  lingbot-va/wan_va/wan_va_server.py (already has .bak)
+        lingbot-va/evaluation/robotwin/run_eval.sh
+Add     none
+Verify  bash run_eval.sh --mode smoke --quant_config w8a8.yaml
+        --quant_param_ckpt <pth> emits SR (any value) and one perf JSONL
+        line with non-empty transformer stage record.
+
+Phase 14: W8A8 full eval
+Target  Run 15-task eval with w8a8 quantization. Compare to bf16.
+Add     none
+Modify  run_eval.sh tag derivation
+Verify  results/w8a8/summary/summary.csv has 15 rows. All success_rate
+        non-null. mean_transformer_ms recorded.
+
+Phase 15: W4A8 mixed precision full eval
+Target  Run 15-task eval with w4a8_mp quantization.
+Add     none
+Verify  results/w4a8/summary/summary.csv has 15 rows.
+
+Phase 16: Cross-checkpoint comparison
+Target  Implement Q10.
+Add     lingbot-va/evaluation/robotwin/calc_cross_ckpt.py
+Verify  Run on bf16, w8a8, w4a8 save_roots. cross_summary.csv has 15
+        rows. sr_delta_w8a8 and sr_delta_w4a8 columns populated.
+
+Phase 17: W8A8 CUDA kernel
+Target  Implement Q8: int8 x int8 -> bf16 GEMM with per-channel weight
+        scale and per-token activation scale.
+Add     lingbot-va/wan_va/quant/kernel/{setup.py, csrc/, qwan_extension/}
+Verify  python -m qwan_extension.bench (a small unit harness):
+        QuantWanLinearW8A8 forward matches Q8 algorithm-simulation output
+        within max abs error 1e-2 (bf16 tolerance).
+
+Phase 18: Block kernel integration
+Target  Implement Q9.
+Add     lingbot-va/wan_va/quant/kernel/quant_wan_block.py
+Modify  lingbot-va/wan_va/wan_va_server.py (already has .bak):
+        add hardware_forward_refactor branch under --quant_use_kernel.
+Verify  bash run_eval.sh --mode smoke --quant_config w8a8.yaml
+        --quant_param_ckpt <pth> --quant_use_kernel.
+        Smoke completes. peak_alloc_mb in JSONL is lower than the
+        algorithm-simulation run from Phase 14 by at least
+        weight_size_bytes / 2 (int8 vs bf16) for the transformer module.
+
+Phase 19: W8A8 kernel full eval
+Target  Run 15-task eval with --quant_use_kernel.
+Add     none
+Verify  results/w8a8_kernel/summary/summary.csv has 15 rows.
+        SR within +/-0.05 of Phase 14 algorithm-simulation per task.
+        peak_alloc_mb lower than Phase 14 per task.
+
+Phase 20: Final cross-checkpoint report
+Target  Re-run Q10 over bf16 / w8a8 / w4a8 / w8a8_kernel save_roots.
+Add     none
+Verify  cross_summary.csv has 15 rows and 4 variants per row.
+
+
+14 ACCEPTANCE  (Part II)
+-------------------------------------------------------------------------------
+- Phase 8-12 produce reusable PTQ tooling.
+- results/w8a8/summary/summary.csv has 15 rows. Mean SR delta vs bf16
+  recorded.
+- results/w4a8/summary/summary.csv has 15 rows.
+- results/w8a8_kernel/summary/summary.csv has 15 rows with measurable
+  peak_alloc_mb reduction.
+- cross_summary.csv joins all variants on task_name.
+- All modified upstream files have a .bak sibling.
+- run_eval.sh supports bf16 path (default) and quantized path
+  (--quant_config + --quant_param_ckpt [+ --quant_use_kernel]) without
+  further code change.
