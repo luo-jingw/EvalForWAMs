@@ -929,6 +929,14 @@ Verify  cross_summary.csv has 15 rows. All variants populated.
 
 15 EXTENSIBILITY  (adding a new quantization method)
 -------------------------------------------------------------------------------
+NOTE: After Part IV (PTQEval migration, Phases M1-M8), this section's
+directory convention is SUPERSEDED. Adding a new method or new WAM now
+follows Section 24 (PTQEval system structure). The loader contract below
+remains valid; the only change is the resolution path:
+    OLD: wan_va.quant.<name>.loader              (in lingbot-va tree)
+    NEW: ptqeval.wam.<wam>.method.<name>.loader  (in PTQEval tree)
+Section 26 Phase M7 added this note; PTQEval/README.md mirrors Section 24.
+
 15.1 Loader protocol
 The single contract that the server depends on:
 
