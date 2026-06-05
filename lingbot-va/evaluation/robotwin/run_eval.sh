@@ -35,6 +35,8 @@ MIN_FREE_MB="${MIN_FREE_MB:-40000}"
 GPU_WAIT_TIMEOUT="${GPU_WAIT_TIMEOUT:-0}"
 GPU_POLL_INTERVAL="${GPU_POLL_INTERVAL:-30}"
 MODEL_PATH=""
+VARIANT=""
+VARIANT_ARGS=""
 
 print_usage() {
     cat <<EOF
@@ -52,6 +54,10 @@ Usage: run_eval.sh --mode {smoke,single,pool} [opts]
   --gpu_wait_timeout <int>      seconds to wait for VRAM. 0 = forever. default 0
   --gpu_poll_interval <int>     seconds between VRAM polls. default 30
   --rerun_all                   pool: include all SELECTED_TASKS regardless of prior state
+  --variant <name>              quant method; resolves to wan_va.quant.<name>.loader
+                                If set and --save_root omitted, save_root becomes
+                                results/<variant_tag> derived from --variant_args basename.
+  --variant_args <yaml>         method-specific args yaml forwarded to the loader
 EOF
 }
 
@@ -70,6 +76,8 @@ while [ $# -gt 0 ]; do
         --gpu_poll_interval) GPU_POLL_INTERVAL="$2"; shift 2 ;;
         --rerun_all) RERUN_ALL="true"; shift 1 ;;
         --model_path) MODEL_PATH="$2"; shift 2 ;;
+        --variant) VARIANT="$2"; shift 2 ;;
+        --variant_args) VARIANT_ARGS="$2"; shift 2 ;;
         -h|--help) print_usage; exit 0 ;;
         *) echo "Unknown arg: $1"; print_usage; exit 1 ;;
     esac
@@ -79,6 +87,16 @@ if [ -z "$MODE" ]; then
     print_usage; exit 1
 fi
 
+if [ -z "$SAVE_ROOT" ] && [ -n "$VARIANT" ]; then
+    if [ -n "$VARIANT_ARGS" ]; then
+        # Derive tag from variant_args basename (strip .yaml / .yml extension).
+        va_base="$(basename "$VARIANT_ARGS")"
+        va_tag="${va_base%.yaml}"; va_tag="${va_tag%.yml}"
+        SAVE_ROOT="/home/arash/EvalForWAMs/results/${VARIANT}_${va_tag}"
+    else
+        SAVE_ROOT="/home/arash/EvalForWAMs/results/${VARIANT}"
+    fi
+fi
 SAVE_ROOT="${SAVE_ROOT:-$DEFAULT_SAVE_ROOT}"
 PERF_LOG_DIR="${PERF_LOG_DIR:-${SAVE_ROOT}/perf}"
 MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
@@ -159,10 +177,19 @@ start_server() {
     local task_name="$4"
     local server_log="$5"
 
+    local variant_args_cli=""
+    if [ -n "$VARIANT" ]; then
+        variant_args_cli="--variant $VARIANT"
+        if [ -n "$VARIANT_ARGS" ]; then
+            variant_args_cli="$variant_args_cli --variant_args $VARIANT_ARGS"
+        fi
+    fi
+
     conda activate "$SERVER_ENV"
     (
         cd "$LINGBOT_DIR"
         CUDA_VISIBLE_DEVICES="$gpu" \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         nohup python -m torch.distributed.run \
             --nproc_per_node 1 \
             --master_port "$master_port" \
@@ -173,6 +200,7 @@ start_server() {
             --perf_log_dir "$PERF_LOG_DIR" \
             --perf_task_name "$task_name" \
             --model_path "$MODEL_PATH" \
+            $variant_args_cli \
             > "$server_log" 2>&1 &
         echo $! > "${server_log}.pid"
     )

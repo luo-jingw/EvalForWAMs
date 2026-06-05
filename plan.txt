@@ -388,287 +388,308 @@ PART II  Post-Training Quantization of LingBot-VA via ViDiT-Q
 - No attention-matmul quantization. Only nn.Linear weight + activation.
 - No quantization of text_encoder or VAE. Only transformer.
 
+8.5 Pivot (after Phase 13)
+Phase 8-13 produced a working algorithm-simulation path (qdiff-based
+QuantizedLinear that holds bf16 dequant weights and computes dynamic
+activation quant in pure Python). Smoke verified SR preservation but
+showed runtime memory and latency overheads with no end-user payoff:
+the bf16 dequant weight has the same footprint as FP, and DynamicQuantizer
+intermediates inflate activation peak by ~30%.
 
-9 SYSTEM STRUCTURE
+We pivot to a kernel-only path:
+- True INT8 (and packed INT4) weight storage, BF16-native CUDA GEMM.
+- Per-channel symmetric weight scale, per-token symmetric activation scale.
+- Algorithm-simulation code is removed (Phase 14). The eval is meaningful
+  only against the kernel checkpoint.
+- Both W8A8 and W4A8 variants are implemented.
+
+
+9 SYSTEM STRUCTURE  (kernel-first, Phase 14+)
 -------------------------------------------------------------------------------
 9.1 Modules
-Q1 quant_lib              Vendored qdiff package. Owns Quantizer and
-                          QuantizedLinear classes. Imported, not modified.
-Q2 quant_wan_transformer  Subclass of WanModel. Owns the layer-refactor,
-                          load/save quant_param_dict, set_init_done.
-Q3 calib_hook_manager     Owns activation-collection hooks on
-                          QuantizedLinear instances. Writes calib_data.pth.
-Q4 calib_runner           CLI entry. Loads FP model, invokes
-                          calib_hook_manager, runs N inference calls
-                          across both modes, dumps calib_data.pth.
-Q5 ptq_runner             CLI entry. Loads QuantWanTransformer, applies
-                          calib data, calls set_init_done,
-                          save_quant_param_dict, writes quant_params.pth.
-Q6 quant_server_loader    Branch inside wan_va_server.py that switches
-                          between bf16 from_pretrained and quantized
-                          QuantWanTransformer + load_quant_param_dict.
-Q7 quant_configs          YAML configs for w8a8, w4a8 mixed precision.
-Q8 quant_kernel           Custom CUDA extension for W8A8 GEMM. Provides
-                          one Python-facing class QuantWanLinearW8A8.
-Q9 quant_block_kernel     QuantWanTransformerBlockWithCudaKernel that
-                          replaces attention + FFN Linears with Q8 ops.
-Q10 cross_ckpt_aggregator Extended aggregator that takes multiple
-                          save_roots, emits comparison table.
+Q1 quant_configs          YAML schema per variant: target Linear regex,
+                          weight bitwidth, runtime args. Stored under
+                          quant/viditq/configs/.
+Q2 ptq_kernel             CLI script that walks an FP WanTransformer3DModel
+                          and produces a state_dict with int weights +
+                          per-channel scales for every target Linear.
+                          Single output file int_weights_<variant>.pth.
+                          No dependency on qdiff.
+Q3 kernel_w8a8            BF16-native CUDA extension: per-token activation
+                          quant + W8A8 GEMM that returns BF16. Source
+                          under quant/viditq/kernel/csrc/.
+Q4 kernel_w4a8            BF16-native CUDA extension: same as Q3 but the
+                          weight is INT4 (packed 2 per INT8 byte).
+Q5 quant_linear_modules   Python nn.Module wrappers
+                          QuantWanLinearW8A8 / QuantWanLinearW4A8 around
+                          Q3 / Q4 kernels. state_dict-load compatible
+                          with Q2 output.
+Q6 quant_block_kernel     QuantWanTransformerBlockWithCudaKernel that
+                          mirrors WanTransformerBlock but swaps the 6
+                          target Linears (4 attn proj + 2 ffn) with Q5
+                          modules. Norm / rope / attention matmul stay FP.
+Q7 quant_server_loader    --variant / --variant_args dispatch already in
+                          wan_va_server.py. Resolves importlib path and
+                          calls Q8.load_quant_model. No change.
+Q8 viditq_loader          load_quant_model entry. Loads FP model, swaps
+                          every block for Q6, loads Q2 state_dict, returns
+                          model.
+Q9 cross_ckpt_aggregator  Reads multiple save_roots and emits
+                          cross_summary.csv joining bf16 + W8A8 kernel +
+                          W4A8 kernel.
 
 9.2 State ownership
-- Quantizer scale/zero_point: owned by Q2 instance, persisted to
-  quant_params.pth.
-- Calibration tensors: owned by Q3, persisted to calib_data.pth.
-- Active checkpoint selection: owned by Q6 via CLI arg.
-- Quant CUDA buffers (int8 weights, scales): owned by Q8.
-- Cross-checkpoint table: owned by Q10.
+- INT weights + per-channel scales: produced by Q2, persisted to
+  int_weights_<variant>.pth. Loaded by Q8.
+- Active checkpoint selection: owned by Q7 via --variant + --variant_args.
+- Per-token activation scale (runtime buffer): owned by Q5 module instance.
+- Cross-checkpoint table: owned by Q9.
 
 
-10 INTERFACE DESIGN
+10 INTERFACE DESIGN  (kernel-first)
 -------------------------------------------------------------------------------
-10.1 Q2 QuantWanTransformer
-File: lingbot-va/wan_va/quant/viditq/quant_wan_transformer.py
-
-  from wan_va.modules.model import WanModel
-  from qdiff.base.base_quantizer import BaseQuantizer
-  from qdiff.base.quant_layer import QuantizedLinear
-
-  class QuantWanTransformer(WanModel):
-      def __init__(self, quant_config: dict, **wan_init_kwargs) -> None: ...
-      def quant_layer_refactor(self) -> None: ...
-      def save_quant_param_dict(self) -> dict[str, dict]: ...
-      def load_quant_param_dict(self,
-                                quant_param_dict: dict[str, dict]) -> None: ...
-      def set_init_done(self) -> None: ...
-      def bitwidth_refactor(self) -> None: ...
-
-10.2 Q3 calib_hook_manager
-File: lingbot-va/wan_va/quant/viditq/calib_hook_manager.py
-
-  @dataclass
-  class CalibTensorEntry:
-      module_name: str
-      per_channel_max: torch.Tensor  # [C_in]
-
-  class CalibHookManager:
-      def __init__(self, model: nn.Module,
-                   target_class: type = QuantizedLinear) -> None: ...
-      def register(self) -> None: ...
-      def remove(self) -> None: ...
-      def export(self) -> dict[str, CalibTensorEntry]: ...
-      def dump(self, save_path: str) -> None: ...
-
-10.3 Q4 calib_runner
-File: lingbot-va/wan_va/quant/viditq/calib_runner.py
-
-  def run_calib(model: QuantWanTransformer,
-                obs_iterator: Iterable[dict],
-                n_calls: int,
-                save_path: str) -> None: ...
-
-  # CLI:
-  #   python -m wan_va.quant.viditq.calib_runner
-  #       --config-name robotwin
-  #       --quant_config <yaml>
-  #       --calib_save <pth>
-  #       --calib_source <fixture_dir>
-  #       --n_calls 32
-
-10.4 Q5 ptq_runner
-File: lingbot-va/wan_va/quant/viditq/ptq_runner.py
-
-  def run_ptq(quant_config_path: str,
-              calib_data_path: str,
-              quant_params_save: str,
-              wan_model_path: str) -> None: ...
-
-  # CLI:
-  #   python -m wan_va.quant.viditq.ptq_runner
-  #       --quant_config <yaml>
-  #       --calib_data <pth>
-  #       --quant_params_save <pth>
-  #       --wan_model_path <ckpt_dir>
-
-10.5 Q6 quant_server_loader (in wan_va_server.py)
-New CLI args
-  --variant <name>          # variant tag, e.g. viditq, awq, gptq.
-                            # Resolves to wan_va.quant.<name>.loader.
-  --variant_args <yaml>     # method-specific args yaml. Loaded via
-                            # OmegaConf and passed verbatim to loader.
-Behavior
-- If --variant absent: existing bf16 from_pretrained path. No change.
-- If --variant present:
-    mod = importlib.import_module(f"wan_va.quant.{variant}.loader")
-    args = OmegaConf.load(variant_args).to_container() if variant_args
-           else {}
-    model = mod.load_quant_model(
-        wan_model_path=cfg.wan22_pretrained_model_name_or_path,
-        variant_args=args,
-        device=device,
-        dtype=dtype,
-    )
-- The loader module must expose load_quant_model with the signature
-  defined in Section 15. Failure to import or to satisfy the signature
-  is a fatal startup error.
-
-10.6 Q7 quant_configs
+10.1 Q1 quant_configs
 Files
   lingbot-va/wan_va/quant/viditq/configs/w8a8.yaml
-  lingbot-va/wan_va/quant/viditq/configs/w4a8_mp.yaml
-Schema  (matches ViDiT-Q config schema)
-  remain_fp_regex: <regex>     # layers kept FP
-  weight:  {n_bits: int | list, sym: bool}
-  act:     {n_bits: int | list, sym: bool}
-  smooth_quant: {alpha: float, layer_name_regex: str}    # optional
-  quarot:       {layer_name_regex: str}                  # optional
-  viditq:       {alpha: float, layer_name_regex: str}    # optional
-  mixed_precision:                                       # w4a8 only
-      weight: {layer_name_regex: list[str]}
-      act:    {layer_name_regex: list[str]}
+  lingbot-va/wan_va/quant/viditq/configs/w4a8.yaml
+Schema (same shape for both variants)
+  remain_fp_regex: <regex>     # outer Linears kept FP
+  weight_bits: 8 | 4           # per-channel symmetric
+  act_bits:    8               # per-token symmetric, dynamic
+  weight_pack: int8 | int4_two_per_byte
+Runtime args yaml (separate, passed via --variant_args)
+  int_weights_ckpt: <path>     # produced by Q2 ptq_kernel
+  layer_config:     <path>     # path to a w8a8.yaml or w4a8.yaml above
 
-10.7 Q8 quant_kernel
+10.2 Q2 ptq_kernel
+File: lingbot-va/wan_va/quant/viditq/ptq.py
+
+  @dataclass
+  class IntLayerEntry:
+      int_weight: torch.Tensor    # int8 [C_out, C_in] or packed int8 [C_out, C_in/2]
+      scale_weight: torch.Tensor  # bf16 [C_out]
+      bias: torch.Tensor | None   # bf16 [C_out]
+
+  def compute_int_state_dict(
+      model: nn.Module,                # FP WanTransformer3DModel
+      remain_fp_regex: str,
+      weight_bits: int,                # 8 or 4
+  ) -> dict[str, IntLayerEntry]: ...
+
+  # CLI:
+  #   python -m wan_va.quant.viditq.ptq
+  #       --model_path <ckpt_dir>
+  #       --layer_config configs/w8a8.yaml | configs/w4a8.yaml
+  #       --output int_weights_<variant>.pth
+
+10.3 Q3 kernel_w8a8 (CUDA)
 File tree: lingbot-va/wan_va/quant/viditq/kernel/
-  csrc/w8a8_gemm.cu              # GEMM int8 x int8 -> bf16
+  csrc/act_quant_bf16.cu       # bf16 -> int8 per-token + bf16 scale
+  csrc/w8a8_gemm_bf16.cu       # int8 x int8 -> bf16 (per-channel w scale,
+                               # per-token x scale)
   csrc/pybind.cpp
-  setup.py
-  qwan_extension/nn/qlinear.py
-Class
+Python-side via pybind:
+  qwan_extension.fused.act_quant_bf16(x_bf16) -> (x_int8, scale_x_bf16)
+  qwan_extension.fused.w8a8_gemm_bf16(
+      x_int8, scale_x_bf16, w_int8, scale_w_bf16, bias_bf16 | None
+  ) -> y_bf16
+
+10.4 Q4 kernel_w4a8 (CUDA)
+File tree: same kernel/ as Q3
+  csrc/w4a8_gemm_bf16.cu       # packed int4 weight x int8 act -> bf16
+Python-side via pybind:
+  qwan_extension.fused.w4a8_gemm_bf16(
+      x_int8, scale_x_bf16, w_int4_packed, scale_w_bf16, bias_bf16 | None
+  ) -> y_bf16
+Notes
+  - Activation quant (act_quant_bf16) is shared with W8A8.
+  - Weight pack: 2 int4 per int8 byte, little-endian inside the byte.
+
+10.5 Q5 quant_linear_modules
+File: lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear_w8a8.py
+File: lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear_w4a8.py
+
   class QuantWanLinearW8A8(nn.Module):
       def __init__(self, in_features: int, out_features: int,
                    has_bias: bool) -> None: ...
-      # state_dict keys: int_weight (int8), scale_weight (bf16),
-      #                  zp_weight (bf16), bias (bf16, optional)
-      def forward(self, x: torch.Tensor,
-                  quant_params: QuantParams) -> torch.Tensor: ...
+      # state_dict keys:
+      #   int_weight   int8  [C_out, C_in]
+      #   scale_weight bf16  [C_out]
+      #   bias         bf16  [C_out] (optional)
+      def forward(self, x: torch.Tensor) -> torch.Tensor: ...
 
-10.8 Q9 quant_block_kernel
-File: lingbot-va/wan_va/quant/viditq/kernel/quant_wan_block.py
+  class QuantWanLinearW4A8(nn.Module):
+      def __init__(self, in_features: int, out_features: int,
+                   has_bias: bool) -> None: ...
+      # state_dict keys:
+      #   int_weight   int8  [C_out, C_in/2]   (2 int4 per byte)
+      #   scale_weight bf16  [C_out]
+      #   bias         bf16  [C_out] (optional)
+      def forward(self, x: torch.Tensor) -> torch.Tensor: ...
+
+10.6 Q6 quant_block_kernel
+File: lingbot-va/wan_va/quant/viditq/block/quant_wan_block.py
 
   class QuantWanTransformerBlockWithCudaKernel(nn.Module):
+      """Mirror WanTransformerBlock with target Linears swapped for the
+      kernel variant. Norm / rope / attention matmul stay FP."""
       def __init__(self, ref_block: WanTransformerBlock,
-                   quant_params: QuantParams) -> None: ...
+                   quant_linear_cls: type[nn.Module]) -> None: ...
       def forward(self, *args, **kwargs) -> torch.Tensor: ...
 
-10.9 Q10 cross_ckpt_aggregator
+10.7 Q7 quant_server_loader (in wan_va_server.py)
+New CLI args (already implemented in Phase 13, unchanged)
+  --variant <name>          # e.g. viditq
+  --variant_args <yaml>     # method-specific runtime args yaml
+Behavior
+- If --variant absent: existing bf16 from_pretrained path.
+- If --variant present:
+    mod = importlib.import_module(f"wan_va.quant.{variant}.loader")
+    args = OmegaConf.to_container(OmegaConf.load(variant_args), resolve=True)
+    model = mod.load_quant_model(wan_model_path=..., variant_args=args,
+                                 device=..., dtype=...)
+
+10.8 Q8 viditq_loader
+File: lingbot-va/wan_va/quant/viditq/loader.py
+
+  def load_quant_model(wan_model_path: str,
+                       variant_args: dict,
+                       device: torch.device,
+                       dtype: torch.dtype) -> nn.Module: ...
+
+Behavior
+- Read variant_args.layer_config to learn weight_bits and remain_fp_regex.
+- Load FP transformer to obtain the non-quantized graph (embeddings,
+  norms, attention matmul logic, ffn structure).
+- For each block (default 30): replace with
+  QuantWanTransformerBlockWithCudaKernel(ref_block, QuantWanLinearW8A8 or
+  QuantWanLinearW4A8 per weight_bits).
+- Load int_weights_<variant>.pth into the swapped modules.
+- Move to device, return.
+
+10.9 Q9 cross_ckpt_aggregator
 File: lingbot-va/evaluation/robotwin/calc_cross_ckpt.py
 
   def main(save_roots: dict[str, str], out_dir: str) -> None: ...
   # save_roots example: {"bf16": ".../results/bf16",
-  #                      "w8a8": ".../results/w8a8"}
+  #                      "viditq_w8a8": ".../results/viditq_w8a8_kernel",
+  #                      "viditq_w4a8": ".../results/viditq_w4a8_kernel"}
   # Output: out_dir/cross_summary.csv with columns:
   #   task_name,
-  #   bf16_success_rate, w8a8_success_rate, w4a8_success_rate,
-  #   bf16_peak_alloc_mb, w8a8_peak_alloc_mb, w4a8_peak_alloc_mb,
-  #   bf16_mean_total_ms, w8a8_mean_total_ms, w4a8_mean_total_ms,
-  #   sr_delta_w8a8, sr_delta_w4a8
+  #   <tag>_success_rate    (one column per variant tag)
+  #   <tag>_peak_alloc_mb
+  #   <tag>_mean_total_ms
+  #   sr_delta_<tag>        (delta vs bf16, per non-bf16 variant)
 
 
-11 RUNTIME FLOW
+11 RUNTIME FLOW  (kernel-first)
 -------------------------------------------------------------------------------
-11.1 Calibration flow (per quant_config)
-- Q4 launches QuantWanTransformer(quant_config). All nn.Linear (except
-  remain_fp_regex) become QuantizedLinear; weights are statically
-  quantized at refactor time.
-- Q3 registers forward_hooks on QuantizedLinear instances.
-- Q4 runs n_calls inference calls. The call iterator must yield obs that
-  cover both action_mode=False (video diffusion) and action_mode=True
-  (action diffusion). One real episode satisfies both.
-- Q3 reduces collected activations to per-channel max.
-- Q3 dumps calib_data.pth.
+11.1 PTQ flow (offline, per variant)
+- Q2 loads FP WanTransformer3DModel on a single GPU or CPU.
+- For each nn.Linear whose name does NOT match remain_fp_regex:
+    scale_w = max(|W|, dim=in_features) / qmax   # qmax = 127 for w8, 7 for w4
+    int_W   = round(W / scale_w).clamp(-qmax-1, qmax).to(int_dtype)
+    if w4: pack 2 nibbles per int8 byte (little-endian)
+    record (int_W, scale_w[, bias])
+- Dump dict[full_name -> IntLayerEntry] to int_weights_<variant>.pth.
 
-11.2 PTQ flow
-- Q5 instantiates a fresh QuantWanTransformer(quant_config).
-- Loads calib_data.pth.
-- For each method (smooth_quant / quarot / viditq) flagged in
-  quant_config: run its init hook using calib data; update layer state.
-- Call model.set_init_done().
-- Call model.save_quant_param_dict() and torch.save to quant_params.pth.
-
-11.3 Quantized inference flow (server)
+11.2 Quantized inference flow (server)
 - Server starts with --variant viditq --variant_args <yaml>.
-- Q6 branch imports wan_va.quant.viditq.loader and calls
-  load_quant_model(...). The loader builds QuantWanTransformer, loads
-  FP weights, then load_quant_param_dict from variant_args.
-- The returned module is assigned to self.transformer.
-- Init stage probe still records init_peak_mb.
-- Per-call probe and per-stage probe unchanged (M1, M2 from Part I).
-- Stage transformer and stage action_head now measure quantized forward.
+- Q7 branch imports wan_va.quant.viditq.loader and calls Q8.load_quant_model.
+- Q8:
+    1. Load FP WanTransformer3DModel (cheap source of non-quantized graph).
+    2. For each block, instantiate Q6 with the appropriate
+       QuantWanLinear[W8A8|W4A8] class derived from layer_config.weight_bits.
+    3. Load int_weights state_dict into the new blocks' Linear modules.
+    4. Drop the original FP blocks; keep everything else (embeddings,
+       norms, condition_embedders) as FP.
+- Returned module is assigned to self.transformer. FSDP wrap is skipped
+  (single-GPU eval; quantized modules are not FSDP-compatible).
+- Per-stage probe (M2) unchanged: stage transformer and stage action_head
+  now measure kernel-backed forward.
 
-11.4 Kernel inference flow (server)
-- Activated by setting use_kernel: true in variant_args yaml. Server
-  CLI surface unchanged.
-- Inside the viditq loader, after load_quant_param_dict, when
-  variant_args.use_kernel is true the loader calls
-  model.hardware_forward_refactor(kernel_weight_path), which:
-    - Replaces each WanTransformerBlock with
-      QuantWanTransformerBlockWithCudaKernel.
-    - Loads int8 weights and scales into kernel modules.
-- Forward goes through Q9 / Q8 path.
+11.3 Kernel forward sequence (per target Linear)
+  x_bf16  -> [Q3.act_quant_bf16] -> (x_int8, scale_x_bf16)
+                                  -> [Q3.w8a8_gemm_bf16 or Q4.w4a8_gemm_bf16]
+                                  -> y_bf16
+- Activation quant is per-token symmetric (scale computed online per row).
+- Weight quant is per-channel symmetric (scale frozen at PTQ).
 
-11.5 Cross-checkpoint comparison flow
-- Q10 reads multiple save_roots, one per checkpoint variant.
+11.4 Cross-checkpoint comparison flow
+- Q9 reads multiple save_roots, one per variant.
 - Each save_root has its own perf/ and stseed-*/metrics/.
 - Output: cross_summary.csv joined on task_name.
 
 
-12 CODE MAPPING
+12 CODE MAPPING  (kernel-first)
 -------------------------------------------------------------------------------
-12.1 New files
-- lingbot-va/wan_va/quant/__init__.py
-- lingbot-va/wan_va/quant/viditq/__init__.py
-- lingbot-va/wan_va/quant/viditq/loader.py              (Section 15 entry)
+12.1 New files (Phase 14+)
+- lingbot-va/wan_va/quant/viditq/ptq.py
+- lingbot-va/wan_va/quant/viditq/configs/w8a8.yaml          (rewrite)
+- lingbot-va/wan_va/quant/viditq/configs/w4a8.yaml
+- lingbot-va/wan_va/quant/viditq/configs/runtime_args_w8a8.yaml  (rewrite)
+- lingbot-va/wan_va/quant/viditq/configs/runtime_args_w4a8.yaml
+- lingbot-va/wan_va/quant/viditq/kernel/setup.py
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/act_quant_bf16.cu
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8_gemm_bf16.cu
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/w4a8_gemm_bf16.cu
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/pybind.cpp
+- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/__init__.py
+- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/base.py
+- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear_w8a8.py
+- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear_w4a8.py
+- lingbot-va/wan_va/quant/viditq/block/__init__.py
+- lingbot-va/wan_va/quant/viditq/block/quant_wan_block.py
+- lingbot-va/evaluation/robotwin/calc_cross_ckpt.py
+
+12.2 Files to delete (Phase 14 cleanup of algorithm-sim path)
 - lingbot-va/wan_va/quant/viditq/quant_wan_transformer.py
 - lingbot-va/wan_va/quant/viditq/calib_hook_manager.py
 - lingbot-va/wan_va/quant/viditq/calib_runner.py
 - lingbot-va/wan_va/quant/viditq/ptq_runner.py
-- lingbot-va/wan_va/quant/viditq/configs/w8a8.yaml
 - lingbot-va/wan_va/quant/viditq/configs/w4a8_mp.yaml
-- lingbot-va/wan_va/quant/viditq/configs/runtime_args_w8a8.yaml
-                                                        (--variant_args)
-- lingbot-va/wan_va/quant/viditq/configs/runtime_args_w4a8_mp.yaml
-- lingbot-va/wan_va/quant/viditq/kernel/setup.py
-- lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8_gemm.cu
-- lingbot-va/wan_va/quant/viditq/kernel/csrc/pybind.cpp
-- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/__init__.py
-- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear.py
-- lingbot-va/wan_va/quant/viditq/kernel/quant_wan_block.py
-- lingbot-va/evaluation/robotwin/calc_cross_ckpt.py
+- /home/arash/.conda/envs/lingbot-jw/lib/python3.10/site-packages/qdiff_editable.pth
+                                              (drop qdiff import path)
 
-12.2 Modified files (with .bak)
+12.3 Files rewritten in place
+- lingbot-va/wan_va/quant/viditq/loader.py
+    new body: build kernel blocks, swap into FP graph, load int_weights.
+    No qdiff import.
+
+12.4 Modified files (already done in Phase 13, no further change)
 - lingbot-va/wan_va/wan_va_server.py
-    add: CLI args --variant, --variant_args.
-    add: Q6 quant_server_loader branch in __init__: importlib resolves
-         wan_va.quant.<variant>.loader and calls load_quant_model().
 - lingbot-va/evaluation/robotwin/run_eval.sh
-    add: CLI args --variant, --variant_args; forward to server.
-    add: default --save_root /home/arash/EvalForWAMs/results/${variant}
-         when --variant set; default results/bf16 otherwise.
 
-12.3 Vendored
-- /home/arash/EvalForWAMs/ViDiT-Q/quant_utils
-    installed via pip install -e into lingbot-jw env. No modification.
-
-12.4 Default paths
-- per-variant calib_data    results/<variant>/calib/calib_data_<cfg>.pth
-- per-variant quant_params  results/<variant>/calib/quant_params_<cfg>.pth
-- per-variant kernel int_w  results/<variant>/calib/int_weights_<cfg>.pth
-- per-variant save_root     results/<variant>/
-                            (e.g. results/viditq_w8a8/,
-                             results/viditq_w4a8/, results/awq_w4/)
+12.5 Default paths
+- per-variant int_weights   results/<variant>_<tag>/calib/int_weights.pth
+- per-variant save_root     results/<variant>_<tag>/
+                            (e.g. results/viditq_w8a8_kernel/,
+                             results/viditq_w4a8_kernel/)
 - cross summary out         results/cross_summary/
 
 
 13 IMPLEMENTATION PHASES
 -------------------------------------------------------------------------------
-Phase 8: vendor qdiff
+Phase 8: vendor qdiff                          [DONE - SUPERSEDED by Phase 14]
 Target  Install ViDiT-Q quant_utils as editable package in lingbot-jw.
+Note    pip install -e produced an empty MAPPING in the editable finder
+        (setup.py-only project, no pyproject.toml). Resolved by writing a
+        plain qdiff_editable.pth pointing to quant_utils/. Also installed
+        omegaconf (transitive dep not listed).
 Modify  none
 Add     none (third-party tree already present)
 Verify  python -c "from qdiff.base.quant_layer import QuantizedLinear"
         succeeds in lingbot-jw env.
 
-Phase 9: QuantWanTransformer wrapper
+Phase 9: QuantWanTransformer wrapper           [DONE - SUPERSEDED by Phase 14]
 Target  Implement Q2.
+Note    HF from_pretrained makes subclassing painful; switched to module-
+        level surgery functions that operate on a loaded model instance.
+        State (quant_config, quant_param_dict) is attached via attribute
+        injection because qdiff hooks read them by name. Also added
+        free_fp_modules to drop the fp_module backup, halving runtime
+        weight memory. Verify: 314 nn.Linear -> 300 QuantizedLinear +
+        14 kept FP.
 Add     lingbot-va/wan_va/quant/__init__.py
         lingbot-va/wan_va/quant/viditq/__init__.py
         lingbot-va/wan_va/quant/viditq/quant_wan_transformer.py
@@ -677,7 +698,7 @@ Verify  Unit script instantiates QuantWanTransformer(w8a8_config,
         **wan_kwargs); count of QuantizedLinear instances matches the
         count of original nn.Linear minus remain_fp_regex matches.
 
-Phase 10: Quant configs
+Phase 10: Quant configs                        [DONE - REWRITTEN in Phase 14]
 Target  Implement Q7 configs.
 Add     lingbot-va/wan_va/quant/viditq/configs/w8a8.yaml
         lingbot-va/wan_va/quant/viditq/configs/w4a8_mp.yaml
@@ -686,8 +707,11 @@ Verify  OmegaConf.load on each yaml returns expected keys.
         remain_fp_regex covers patch_embedding_mlp, action_embedder,
         time_proj, proj_out, action_proj_out, and adaLN modulation.
 
-Phase 11: Calibration runner
+Phase 11: Calibration runner                   [DONE - SUPERSEDED by Phase 14]
 Target  Implement Q3 and Q4.
+Note    For plain W8A8 / W4A8, calib is not required (only smooth_quant /
+        viditq methods need it). The runner exists for future runs;
+        Phase 12 W8A8 PTQ proved out without it.
 Add     lingbot-va/wan_va/quant/viditq/calib_hook_manager.py
         lingbot-va/wan_va/quant/viditq/calib_runner.py
 Modify  none
@@ -695,16 +719,29 @@ Verify  Run calib on one RoboTwin episode of adjust_bottle. Output
         calib_data.pth contains an entry for every QuantizedLinear in
         the model, each tensor shape == [in_features].
 
-Phase 12: PTQ runner
+Phase 12: PTQ runner                           [DONE - SUPERSEDED by Phase 18]
 Target  Implement Q5.
+Note    W8A8 quant_params.pth: 5.1 MB, 600 entries (300 layers x weight +
+        act). Each entry has delta [out, 1] and zero_point [out, 1] bf16.
 Add     lingbot-va/wan_va/quant/viditq/ptq_runner.py
 Modify  none
 Verify  Given Phase 11 calib_data.pth and w8a8.yaml, produce
         quant_params.pth. Key set covers all QuantizedLinear in model.
 
-Phase 13: Variant loader and server dispatch
+Phase 13: Variant loader and server dispatch   [DONE - loader rewritten Phase 20]
 Target  Implement Q6 dispatch in wan_va_server.py, viditq loader, and
         run_eval.sh forwarding.
+Note    Fixes during bring-up:
+        - server sys.path needed lingbot-va/ (so wan_va.* resolves)
+        - OmegaConf.to_container is module-level, not DictConfig method
+        - QuantizedLinear keeps fp_module + new self.weight => 2x weight
+          memory at init; runtime fixed by free_fp_modules in loader
+        - DynamicQuantizer per-forward intermediates fragment VRAM;
+          set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in
+          start_server
+        Smoke verify (adjust_bottle, 1 episode): SR 1/1, 12 perf records.
+        algorithm-sim peak ~41 GB (vs bf16 32 GB); mean infer +48%.
+        These overheads vanish in the kernel path (Phase 17-19).
 Add     lingbot-va/wan_va/quant/viditq/loader.py
         lingbot-va/wan_va/quant/viditq/configs/runtime_args_w8a8.yaml
 Modify  lingbot-va/wan_va/wan_va_server.py (already has .bak)
@@ -713,66 +750,135 @@ Verify  bash run_eval.sh --mode smoke --variant viditq
         --variant_args .../runtime_args_w8a8.yaml emits SR (any value)
         and one perf JSONL line with non-empty transformer stage record.
 
-Phase 14: viditq_w8a8 full eval
-Target  Run 15-task eval with viditq W8A8. Compare to bf16.
-Add     none
-Verify  results/viditq_w8a8/summary/summary.csv has 15 rows. All
-        success_rate non-null. mean_transformer_ms recorded.
+Phase 14: Remove algorithm-simulation path
+Target  Delete every file under quant/viditq/ that the algorithm-sim path
+        introduced (Section 12.2 list). Drop qdiff_editable.pth from
+        site-packages. Delete results/viditq_runtime_args_w8a8/ smoke
+        output. Rewrite configs/w8a8.yaml with the new schema (Section
+        10.1). Add configs/w4a8.yaml.
+Add     lingbot-va/wan_va/quant/viditq/configs/w8a8.yaml (rewrite)
+        lingbot-va/wan_va/quant/viditq/configs/w4a8.yaml
+Modify  none in server / run_eval.sh (variant CLI still valid)
+Verify  Bare bf16 path still works:
+            bash run_eval.sh --mode smoke (no --variant)
+        Must complete and write summary.csv as in Part I.
+        qdiff is no longer imported anywhere under lingbot-va/wan_va/.
 
-Phase 15: viditq_w4a8_mp full eval
-Target  Run 15-task eval with viditq W4A8 mixed precision.
-Add     lingbot-va/wan_va/quant/viditq/configs/runtime_args_w4a8_mp.yaml
-Verify  results/viditq_w4a8_mp/summary/summary.csv has 15 rows.
+Phase 15: W8A8 BF16-native CUDA kernel
+Target  Implement Q3. Two CUDA sources: act_quant_bf16.cu and
+        w8a8_gemm_bf16.cu. pybind exposes
+        qwan_extension.fused.act_quant_bf16 and
+        qwan_extension.fused.w8a8_gemm_bf16.
+Add     lingbot-va/wan_va/quant/viditq/kernel/setup.py
+        lingbot-va/wan_va/quant/viditq/kernel/csrc/act_quant_bf16.cu
+        lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8_gemm_bf16.cu
+        lingbot-va/wan_va/quant/viditq/kernel/csrc/pybind.cpp
+        lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/__init__.py
+Verify  python -m qwan_extension.bench_w8a8 (small bench script):
+        for a few representative shapes (3072x3072, 3072x14336,
+        14336x3072), kernel output vs naive PyTorch reference
+            ref = (round((x/scale_x)) * scale_x) @ ((round(w/scale_w)) *
+                                                   scale_w).T + bias
+        passes max abs error < 1e-2 (bf16 tolerance).
 
-Phase 16: Cross-checkpoint comparison
-Target  Implement Q10.
-Add     lingbot-va/evaluation/robotwin/calc_cross_ckpt.py
-Verify  Run on bf16, viditq_w8a8, viditq_w4a8_mp save_roots.
-        cross_summary.csv has 15 rows. per-variant sr_delta columns
-        populated.
+Phase 16: W4A8 BF16-native CUDA kernel
+Target  Implement Q4. Reuse act_quant_bf16 from Phase 15. Add
+        w4a8_gemm_bf16.cu. Add pack/unpack helpers for int4 weight.
+Add     lingbot-va/wan_va/quant/viditq/kernel/csrc/w4a8_gemm_bf16.cu
+Modify  lingbot-va/wan_va/quant/viditq/kernel/csrc/pybind.cpp (add binding)
+Verify  python -m qwan_extension.bench_w4a8: same shape set as Phase 15;
+        max abs error < 2e-2 (looser tolerance for 4-bit weight).
 
-Phase 17: W8A8 CUDA kernel
-Target  Implement Q8: int8 x int8 -> bf16 GEMM with per-channel weight
-        scale and per-token activation scale.
-Add     lingbot-va/wan_va/quant/viditq/kernel/{setup.py, csrc/,
-        qwan_extension/}
-Verify  python -m qwan_extension.bench (a small unit harness):
-        QuantWanLinearW8A8 forward matches Q8 algorithm-simulation output
-        within max abs error 1e-2 (bf16 tolerance).
+Phase 17: Python wrappers (QuantWanLinearW8A8 / QuantWanLinearW4A8)
+Target  Implement Q5. Two nn.Module classes following Section 10.5.
+        Each owns int_weight, scale_weight, bias as buffers / parameters.
+        forward calls Q3 / Q4 kernels via qwan_extension.fused.
+Add     lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/base.py
+        lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear_w8a8.py
+        lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear_w4a8.py
+Verify  Unit script: build QuantWanLinearW8A8 from a torch.nn.Linear,
+        run forward on random input, output shape and dtype correct;
+        same for QuantWanLinearW4A8.
 
-Phase 18: Block kernel integration
-Target  Implement Q9 and extend viditq loader with use_kernel branch.
-Add     lingbot-va/wan_va/quant/viditq/kernel/quant_wan_block.py
-Modify  lingbot-va/wan_va/quant/viditq/loader.py (use_kernel branch)
+Phase 18: PTQ (FP -> int weights + scales)
+Target  Implement Q2. Walks an FP WanTransformer3DModel, for each target
+        Linear computes int_weight + scale_weight (and int4-packs when
+        weight_bits == 4). Dumps state_dict to int_weights_<variant>.pth.
+        No qdiff dependency.
+Add     lingbot-va/wan_va/quant/viditq/ptq.py
+Verify  Two real runs:
+            python -m wan_va.quant.viditq.ptq
+                --layer_config configs/w8a8.yaml
+                --output results/viditq_w8a8_kernel/calib/int_weights.pth
+            python -m wan_va.quant.viditq.ptq
+                --layer_config configs/w4a8.yaml
+                --output results/viditq_w4a8_kernel/calib/int_weights.pth
+        Both files exist; each contains 300 entries; W4A8 file size is
+        roughly half of W8A8.
+
+Phase 19: Block-level integration
+Target  Implement Q6. QuantWanTransformerBlockWithCudaKernel takes a
+        reference WanTransformerBlock and a quant_linear_cls
+        (QuantWanLinearW8A8 or W4A8). Constructs a new block whose 6
+        target Linears (4 attn projection + 2 ffn) are kernel-backed;
+        every other submodule is reused from the reference.
+Add     lingbot-va/wan_va/quant/viditq/block/__init__.py
+        lingbot-va/wan_va/quant/viditq/block/quant_wan_block.py
+Verify  Unit script: build a single QuantWanTransformerBlockWithCudaKernel
+        from one reference block, forward on a fake activation, output
+        shape matches reference; max abs error < 0.1 (looser due to
+        end-to-end quant noise).
+
+Phase 20: viditq loader rewrite
+Target  Replace the algorithm-sim body of loader.py with a kernel-only
+        path: load FP transformer, swap every block for Q6 with the right
+        quant_linear_cls, load int_weights state_dict, return.
+        layer_config (path) and int_weights_ckpt (path) come from
+        variant_args yaml. No use_kernel flag; kernel is the only mode.
+Modify  lingbot-va/wan_va/quant/viditq/loader.py (rewrite)
+Add     lingbot-va/wan_va/quant/viditq/configs/runtime_args_w8a8.yaml
+                                                                (rewrite)
+        lingbot-va/wan_va/quant/viditq/configs/runtime_args_w4a8.yaml
 Verify  bash run_eval.sh --mode smoke --variant viditq
-        --variant_args .../runtime_args_w8a8_kernel.yaml.
-        Smoke completes. peak_alloc_mb in JSONL is lower than the
-        algorithm-simulation run from Phase 14 by at least
-        weight_size_bytes / 2 (int8 vs bf16) for the transformer module.
+            --variant_args .../runtime_args_w8a8.yaml
+        completes. summary.csv has 1 row. peak_alloc_mb LOWER than
+        bf16 baseline 32 034 MB by at least (5.09B params * weight saving
+        ratio / 2 bytes) GB.
 
-Phase 19: viditq_w8a8_kernel full eval
-Target  Run 15-task eval with kernel-backed viditq W8A8.
-Add     lingbot-va/wan_va/quant/viditq/configs/runtime_args_w8a8_kernel.yaml
-Verify  results/viditq_w8a8_kernel/summary/summary.csv has 15 rows.
-        SR within +/-0.05 of Phase 14 per task. peak_alloc_mb lower
-        than Phase 14 per task.
-
-Phase 20: Final cross-checkpoint report
-Target  Re-run Q10 over bf16, viditq_w8a8, viditq_w4a8_mp,
-        viditq_w8a8_kernel save_roots.
+Phase 21: viditq_w8a8_kernel full eval
+Target  Run 15-task eval with W8A8 kernel.
 Add     none
-Verify  cross_summary.csv has 15 rows and 4 variants per row.
+Verify  results/viditq_w8a8_kernel/summary/summary.csv has 15 rows. All
+        success_rate non-null. peak_alloc_mb lower than bf16 per task.
+
+Phase 22: viditq_w4a8_kernel full eval
+Target  Run 15-task eval with W4A8 kernel.
+Add     none
+Verify  results/viditq_w4a8_kernel/summary/summary.csv has 15 rows.
+        peak_alloc_mb lower than viditq_w8a8_kernel per task.
+
+Phase 23: Cross-checkpoint report
+Target  Implement Q9. Read bf16 + viditq_w8a8_kernel + viditq_w4a8_kernel
+        save_roots. Join on task_name. Emit cross_summary.csv with
+        per-variant SR, peak_alloc_mb, mean_total_ms columns and
+        sr_delta_<tag> vs bf16.
+Add     lingbot-va/evaluation/robotwin/calc_cross_ckpt.py
+Verify  cross_summary.csv has 15 rows. All variants populated.
 
 
-14 ACCEPTANCE  (Part II)
+14 ACCEPTANCE  (Part II, kernel-first)
 -------------------------------------------------------------------------------
-- Phase 8-12 produce reusable PTQ tooling under quant/viditq/.
-- results/viditq_w8a8/summary/summary.csv has 15 rows. Mean SR delta vs
-  bf16 recorded.
-- results/viditq_w4a8_mp/summary/summary.csv has 15 rows.
-- results/viditq_w8a8_kernel/summary/summary.csv has 15 rows with
-  measurable peak_alloc_mb reduction.
-- cross_summary.csv joins all variants on task_name.
+- After Phase 14: algorithm-simulation code is removed from
+  lingbot-va/wan_va/quant/viditq/. qdiff is no longer imported in any
+  production path under lingbot-va/.
+- After Phase 15-19: kernel-backed QuantWanLinearW8A8 and
+  QuantWanLinearW4A8 pass per-shape numerical tolerance vs PyTorch ref.
+- After Phase 20: server smoke with --variant viditq runs the kernel path
+  and produces lower peak_alloc_mb than bf16 baseline.
+- results/viditq_w8a8_kernel/summary/summary.csv has 15 rows.
+- results/viditq_w4a8_kernel/summary/summary.csv has 15 rows.
+- cross_summary.csv joins bf16 + viditq_w8a8_kernel + viditq_w4a8_kernel
+  on task_name. sr_delta columns populated.
 - All modified upstream files have a .bak sibling.
 - run_eval.sh supports bf16 path (default, no --variant) and any
   quantized variant via --variant <name> --variant_args <yaml> without
@@ -813,11 +919,13 @@ A variant directory MUST contain:
   __init__.py
   loader.py                   (exposes load_quant_model)
 A variant directory MAY contain:
-  quant_<model>.py            method-specific wrapper subclass
-  calib_runner.py             standalone CLI for calibration
-  ptq_runner.py               standalone CLI for PTQ
-  configs/*.yaml              method-specific configs and runtime args
-  kernel/                     optional CUDA extension
+  ptq.py                      standalone CLI: FP -> int weights + scales
+  calib_*.py                  optional calibration if the method needs it
+  configs/*.yaml              method-specific layer configs and runtime args
+  kernel/                     CUDA extension; build under setup.py here
+  block/                      block-level kernel-replacement modules
+Rule: all method-specific code stays inside this directory. The eval
+pipeline (M1-M7, Q9 cross_ckpt) is method-agnostic.
 
 15.3 Add-a-method checklist
 Step 1  Create lingbot-va/wan_va/quant/<name>/loader.py with

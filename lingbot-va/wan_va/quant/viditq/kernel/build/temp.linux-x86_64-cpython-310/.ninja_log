@@ -1,0 +1,8 @@
+# ninja log v5
+1	14626	1780628516819062728	/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/build/temp.linux-x86_64-cpython-310/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/csrc/pybind.o	797ff0e199efcc25
+9	37807	1780628623468212695	/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/build/temp.linux-x86_64-cpython-310/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8_gemm_bf16.o	d73ce1da987a0316
+9	38902	1780628624576141579	/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/build/temp.linux-x86_64-cpython-310/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/csrc/act_quant_bf16.o	4aa30a5eea58a866
+16	14675	1780629103960685648	/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/build/temp.linux-x86_64-cpython-310/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/csrc/pybind.o	797ff0e199efcc25
+12	39375	1780629159436992710	/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/build/temp.linux-x86_64-cpython-310/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8_gemm_bf16.o	d73ce1da987a0316
+11	39392	1780629159452991647	/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/build/temp.linux-x86_64-cpython-310/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/csrc/w4a8_gemm_bf16.o	3e0b7bc73ec15a7b
+11	39869	1780629159948958687	/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/build/temp.linux-x86_64-cpython-310/home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/kernel/csrc/act_quant_bf16.o	4aa30a5eea58a866

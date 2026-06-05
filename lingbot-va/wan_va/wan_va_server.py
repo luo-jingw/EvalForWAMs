@@ -18,6 +18,9 @@ from einops import rearrange
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Parent of wan_va/ so that absolute imports like wan_va.quant.viditq.loader
+# resolve (used by --variant dispatch).
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model
@@ -39,6 +42,7 @@ from utils import (
     save_async,
 )
 from utils.perf_probe import PerfProbe
+from omegaconf import OmegaConf
 
 
 class VA_Server:
@@ -100,20 +104,40 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
 
-            self.transformer = load_transformer(
-                os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                             'transformer'),
-                torch_dtype=self.dtype,
-                torch_device=self.device,
-                attn_mode="torch"
-            )
-            shard_fn = shard_model
-            self.transformer = _configure_model(model=self.transformer,
-                                                shard_fn=shard_fn,
-                                                param_dtype=self.dtype,
-                                                device=self.device,
-                                                eval_mode=True,
-                                                )
+            variant: Optional[str] = getattr(job_config, 'variant', None)
+            variant_args_path: Optional[str] = getattr(job_config, 'variant_args', None)
+            transformer_dir = os.path.join(
+                job_config.wan22_pretrained_model_name_or_path, 'transformer')
+            if variant:
+                import importlib
+                loader_mod = importlib.import_module(
+                    f"wan_va.quant.{variant}.loader")
+                variant_args_dict: dict = {}
+                if variant_args_path:
+                    variant_args_dict = OmegaConf.to_container(
+                        OmegaConf.load(variant_args_path), resolve=True)
+                self.transformer = loader_mod.load_quant_model(
+                    wan_model_path=transformer_dir,
+                    variant_args=variant_args_dict,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                # Quantized variants run single-GPU. Skip FSDP wrap.
+                self.transformer.eval().requires_grad_(False)
+            else:
+                self.transformer = load_transformer(
+                    transformer_dir,
+                    torch_dtype=self.dtype,
+                    torch_device=self.device,
+                    attn_mode="torch"
+                )
+                shard_fn = shard_model
+                self.transformer = _configure_model(model=self.transformer,
+                                                    shard_fn=shard_fn,
+                                                    param_dtype=self.dtype,
+                                                    device=self.device,
+                                                    eval_mode=True,
+                                                    )
 
             self.env_type = job_config.env_type
             self.streaming_vae_half = None
@@ -731,6 +755,10 @@ def run(args):
         config.perf_task_name = args.perf_task_name
     if args.model_path is not None:
         config.wan22_pretrained_model_name_or_path = args.model_path
+    if args.variant is not None:
+        config.variant = args.variant
+    if args.variant_args is not None:
+        config.variant_args = args.variant_args
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -789,6 +817,20 @@ def main():
         type=str,
         default=None,
         help='override wan22_pretrained_model_name_or_path from config (e.g. quantized variant).'
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help='quant variant name. Resolves to wan_va.quant.<variant>.loader. '
+             'If unset, the original bf16 from_pretrained path is used.'
+    )
+    parser.add_argument(
+        "--variant_args",
+        type=str,
+        default=None,
+        help='path to a yaml file with method-specific args; loaded via '
+             'OmegaConf and passed to load_quant_model as a plain dict.'
     )
     args = parser.parse_args()
     run(args)
