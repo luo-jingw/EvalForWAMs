@@ -2,93 +2,159 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
 
   项目本质
 
-  对 LingBot-VA（5.09B params bf16 WAN transformer）做 ViDiT-Q 量化（W8A8 + W4A8），在 RoboTwin 15 任务上评估 success rate / GPU 显存峰值 / 推理时延，做 bf16 baseline
+  对 LingBot-VA（5.09B params bf16 WAN transformer）做 ViDiT-Q 量化（W8A8 + W4A8），
+  在 RoboTwin 15 任务上评估 success rate / GPU 显存峰值 / 推理时延，做 bf16 baseline
   三方对比。评估性研究项目，要求忠实复刻 ViDiT-Q 方法，不私自简化。
 
   工作目录
 
   /home/arash/EvalForWAMs/
-  - lingbot-va/ — LingBot-VA 仓库 + 我们加的 quant/probe/eval 代码
-  - RoboTwin/ — RoboTwin 2.0 仿真 
-  - ViDiT-Q/ — ViDiT-Q 源码（参考实现）
-  - models/lingbot-va-posttrain-robotwin/ — bf16 权重
-  - results/{bf16, viditq_w8a8_kernel, viditq_w4a8_kernel}/ — 评估输出
-  - plan.txt — 唯一权威计划书（Part I/II/III 三段，1438 行）
-  - principle.txt — 设计原则（一切显式、最小实现、不回退、无装饰魔法）
-  - monitor.sh — watch -n 1 用的实时 dashboard
+  - PTQEval/                — 所有 research 代码集中地。pip install -e PTQEval/ 生成
+                              ptqeval 包。包含 perf probe / aggregator / orchestrator /
+                              lingbot_va WAM fork / viditq method 的全部实现。
+                              扩展新 WAM 或新 method 都在这里。
+  - lingbot-va/             — LingBot-VA 上游仓库。工作树 == .git_orig HEAD (upstream-equivalent，
+                              0 modified files)。提供 wan_va.* 模块给 PTQEval 引用，
+                              不再保存我们的 research 代码。
+  - RoboTwin/               — RoboTwin 2.0 仿真。upstream pristine。
+  - ViDiT-Q/                — ViDiT-Q 源码（参考实现 + verbatim copy 源头）。upstream pristine。
+  - models/lingbot-va-posttrain-robotwin/  — bf16 权重
+  - results/{bf16, viditq_w8a8_kernel, viditq_w4a8_kernel}/  — 评估输出
+  - plan.txt                — 唯一权威计划书（Part I-IV，1700+ 行）。Section 0 = P1-P4 原则。
+  - principle.txt           — 11 行设计原则（信息最小化、显式、最小实现）
+  - ProjectDescription.txt  — 本文件（session 交接说明）
+
+  注：每个第三方子仓库内有 .git_orig（upstream baseline 备份，gitignored，不要动）。
+      顶层 /home/arash/EvalForWAMs/.git 是统一管理用，跟踪 PTQEval/ 和子仓库的所有改动。
 
   环境
 
   - Conda env lingbot-jw（server + PTQ + kernel build）
   - Conda env RoboTwin-jw（client + sapien 仿真）
   - GPU：8× RTX A6000 (sm_86, 48 GB)，CUDA 12.6（/usr/local/cuda-12.6/bin/nvcc）
+  - lingbot-jw 和 RoboTwin-jw 都需要 pip install -e PTQEval/
+  - lingbot-jw 还需要 pip install --no-build-isolation -e PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/
 
-  整体架构（M / Q 模块编号在 plan.txt 中）
+  整体架构（PTQEval 内）
 
-  评估管道（method-agnostic, Part I）：
-    M1 perf_probe     - PerfProbe 类，CUDA Event 时延 + peak memory，写 JSONL
-    M2 server         - wan_va_server.py，5 阶段插桩 (init/text_encoder/vae_encode/transformer/action_head)
-    M5 aggregator     - calc_perf_stat.py，JSONL + RoboTwin SR → summary.csv/json
-    M6 orchestrator   - run_eval.sh，3 模式 (smoke/single/pool)，pool 是 worker-queue + flock + VRAM 等待
-    M7 monitor        - monitor.sh 实时 dashboard
+  ptqeval/eval/             WAM/method/benchmark-agnostic
+    perf_probe.py           M1: PerfProbe 类，CUDA Event 时延 + peak memory，写 JSONL
+    aggregator.py           M5: perf JSONL + RoboTwin SR -> summary.{csv,json}
+    run_eval.sh             M6 orchestrator: smoke / single / pool。env-var 驱动
+                            (WAM_NAME / WAM_MODEL_PATH / ROBOTWIN_ROOT / SAVE_ROOT /
+                             VARIANT / VARIANT_ARGS)
+    monitor.sh              M7: watch -n 1 实时 dashboard
 
-  量化变体（plug-in, Part II/III, 通过 importlib 加载）：
-    Q1-Q11  - configs / ptq / kernel / linear modules / block / loader / cross_ckpt 等
-    Server  - 用 --variant viditq --variant_args <yaml> 切换
+  ptqeval/wam/lingbot_va/   lingbot_va WAM adapter
+    __init__.py             设置 LINGBOT_VA_PATH 到 sys.path（供 server.py 跨包用）
+    server.py               fork 自 lingbot-va/wan_va/wan_va_server.py，
+                            内插 5 阶段 probe (init/text_encoder/vae_encode/transformer/
+                            action_head) + --variant dispatch
+    eval_client.py          fork 自 RoboTwin client，ROBOTWIN_ROOT env var 化
+    tasks.py                SELECTED_15_TASKS + EVAL_STEP_LIMIT
+    launchers/              4 个 bash launcher（独立入口；run_eval.sh subsume 同等功能）
+    method/viditq/          ViDiT-Q quant 实现（per (WAM, method) 配对）
+      ptq.py                FP -> int weights state_dict
+      loader.py             load_quant_model(...) - server importlib 入口
+      block.py              WanTransformerBlock 子类，swap 6 个 target Linear
+                            (self-attn to_q/k/v/out[0] + ffn net[0].proj/net[2])
+      check_block.py        block-level 前向数值正确性测试
+      configs/              w8a8.yaml / w4a8.yaml / runtime_args_*.yaml
+      kernel/               method-only CUDA extension (qwan_extension._C)
+        csrc/infra/         verbatim ViDiT-Q 头（mma/cp_async/permuted_smem/
+                            utils/math/reduction_utils/dispatch_utils）
+        csrc/act_quant_bf16.cu                per-token sym act quant (我们写的)
+        csrc/{w8a8,w4a8}_gemm_bf16.cu         旧 scalar kernel（Phase 26 / 28 删）
+        csrc/quant_gemm_common.cuh            旧 scalar header（Phase 26 删）
+        csrc/pybind.cpp                       绑定
+        qwan_extension/nn/                    Python nn.Module 包装 + base
+        qwan_extension/{bench,check}_*.py     bench / 数值验证
+
+  Server 通过 --variant viditq --variant_args <yaml> 切量化路径。Loader 解析路径模板：
+    importlib.import_module(f"ptqeval.wam.{wam_name}.method.{method_name}.loader")
+  加新方法只需在 ptqeval/wam/<wam>/method/<new>/ 下加 loader.py 等，server 无需修改。
 
   关键约定
 
-  1. 量化方法：per-channel asymmetric weight（int8 + int16 zero-point）+ per-token symmetric activation（与 ViDiT-Q W8A8/W4A8 config 一致）。
-  2. CUDA kernel 来源：完整拷贝 ViDiT-Q 的 w8a8_gemm_cuda.cu 和 w4a8_per_channel_gemm_cuda_qserve.cu，仅做一处扩展：加 typename OutT 模板参数 + DtypeTraits<__nv_bfloat16>
-  特化，让 ViDiT-Q 原本只支持 fp16 输出变成 fp16 + bf16 双支持。其他模板分支（weight_asym, has_bias, ScaleMulMode, OutputDtype, K_STAGE, CTA tile）一律保留。
+  1. 量化方法：per-channel asymmetric weight（int8 + int16 zero-point）+
+     per-token symmetric activation（与 ViDiT-Q W8A8/W4A8 config 一致）。
+  2. CUDA kernel 来源：整文件 verbatim 拷贝 ViDiT-Q 的 w8a8_gemm_cuda.cu 和
+     w4a8_per_channel_gemm_cuda_qserve.cu，仅做一处扩展：加 typename OutT
+     模板参数 + DtypeTraits<__nv_bfloat16> 特化，让 ViDiT-Q 原本只支持 fp16
+     输出变成 fp16 + bf16 双支持。其他模板分支（weight_asym, has_bias,
+     ScaleMulMode, OutputDtype, K_STAGE, CTA tile）一律保留。
   3. fp16 launcher 保留：作为对照实验，bench 时与 bf16 数值对比。
-  4. 修改 upstream 必备份：所有改过的 upstream 文件留 .bak。
+  4. 第三方仓库工作树 == upstream（lingbot-va/.git_orig HEAD）。所有研究代码
+     在 PTQEval/。修改 upstream 是反模式；新功能 fork 进 PTQEval。
   5. 任务集：15 个 RoboTwin 任务（1 long + 4 medium-long + 10 short），每任务 25 episode。
 
   当前进度状态
 
-  Part I（监控 + 评估管道）全部完成
+  Part I-IV 全部到位；Part III 待开始。
 
-  - bf16 baseline 已跑完：results/bf16/summary/summary.csv 15 任务，mean SR ≈ 0.86，peak ~32 GB，mean infer 4–13 s/call
+  - Part I（监控 + 评估管道）：DONE。bf16 baseline 跑过：
+    results/bf16/summary/summary.csv 15 任务，mean SR ≈ 0.86，peak ~32 GB，
+    mean infer 4-13 s/call。
+  - Part II（量化骨架）：DONE 但 scalar kernel 报废。PTQ + loader + block 全
+    通；自写 scalar kernel 慢 25×（transformer stage 85 s/call vs bf16 3.5 s）。
+  - Part IV（PTQEval migration, Phase M1-M7）：DONE。HEAD = 9a1e80c。
+    研究代码集中到 PTQEval/；lingbot-va 工作树 0 diff vs .git_orig HEAD；
+    smoke bf16 跑通（SR=1/1，perf JSONL 形态等价于 pre-migration）。
+  - Part III（忠实移植 ViDiT-Q kernel）：未实现。仅完成 Phase 24a 中拷贝
+    7 个 infra 头的部分（M2 时随 kernel/ 整树搬到 PTQEval/）。
 
-  Part II（量化骨架）已完成但 kernel 报废
+  Part III 待办（按顺序；路径全在 PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/ 下）：
 
-  - PTQ pipeline、loader、block wrapper、server dispatch 全通
-  - 自写的 scalar kernel 慢 25×（transformer stage 85 s/call vs bf16 3.5 s），通宵只跑完 1 短任务
-
-  Part III（忠实移植 ViDiT-Q kernel）— 计划已写，未实现
-
-  Phase 24a → 30，按顺序执行：
-  - 24a 拷贝 infra（mma/cp_async/permuted_smem/utils）+ toy m16n8k32 MMA 单测
-  - 24b 整文件移植 ViDiT-Q w8a8_gemm_cuda.cu fp16 版本，bench 通过
+  - M8 / Phase 24a 余项：写 csrc/toy_mma_int8.cu（cp_async + ldmatrix +
+    mma.sync s8s8s32，单 warp 单 atom M=16 N=8 K=32）+ pybind binding +
+    qwan_extension/check_toy_mma.py（int32 ref 对比）+ setup.py 加 csrc/infra
+    include_dirs + 新 toy 源
+  - 24b 整文件移植 ViDiT-Q w8a8_gemm_cuda.cu fp16 版本到 csrc/w8a8/，bench 通过
   - 24c 扩展 act_quant_bf16 多输出 per-row sum_x（用于 asym 校正项）
   - 24d 重写 ptq.py 切 asymmetric per-channel，state_dict 加 zp_weight (int16) key
-  - 25 加 OutT 模板 + DtypeTraits + bf16 launcher
-  - 26 改 Python wrapper / loader 适配新 state_dict 4-key schema，删旧 scalar kernel
-  - 27 W8A8 15 任务全 eval（替代 Phase 21）
-  - 28 同样手法移植 W4A8 QServe kernel 
+  - 25 加 OutT 模板 + DtypeTraits<__nv_bfloat16> 特化 + bf16 launcher
+  - 26 改 qwan_extension/nn/* + loader.py 适配新 state_dict 4-key schema，
+    删旧 scalar kernel（csrc/{w8a8,w4a8}_gemm_bf16.cu, quant_gemm_common.cuh）
+  - 27 W8A8 15 任务全 eval（替代旧 Phase 21）
+  - 28 同样手法移植 W4A8 QServe kernel 到 csrc/w4a8_qserve/
   - 29 W4A8 15 任务全 eval
-  - 30 cross-checkpoint 报告
+  - 30 cross-checkpoint 报告（results/cross_summary/）
 
   待替换的过时 artifact（新 session 别复用）
 
   - results/viditq_w8a8_kernel/calib/int_weights.pth（sym 权重，Phase 24d 重新生成 asym 版）
   - results/viditq_w4a8_kernel/calib/int_weights.pth（同上）
-  - results/viditq_w8a8_kernel/perf/*.jsonl（慢 kernel 数据，Phase 27 后 aggregator 用 mtime 自动跳过老文件）
+  - results/viditq_w8a8_kernel/perf/*.jsonl（慢 kernel 数据，Phase 27 后 aggregator 用 mtime 自动跳过）
   - results/viditq_w8a8_kernel/stseed-10000/metrics/adjust_bottle/（Phase 27 用 --rerun_all 重跑）
+  - results/m4_smoke / m5_smoke_bf16 / m6_smoke_bf16（migration 期间的临时验证产物，可删）
 
   新 session 第一步建议
 
   1. Read /home/arash/EvalForWAMs/principle.txt — 内化设计原则
-  2. Read /home/arash/EvalForWAMs/plan.txt — 完整计划书（重点 Section 16-22 Part III）
-  3. 确认从 Phase 24a 起步：拷贝 ViDiT-Q 7 个 infra 头文件到 lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/，写 toy MMA 单测验证基础设施编译 + 数值正确
-  4. 用户偏好：让用户执行需要交互的命令（pip install、nvcc build、run_eval.sh），claude 只读结果改代码
+  2. Read /home/arash/EvalForWAMs/plan.txt — 完整计划书。重点：
+     - Section 0 (P1-P4 原则)
+     - Section 24 (PTQEval 系统结构)
+     - Section 26 (Phase M1-M8 migration；M8 即 Phase 24a 续作)
+     - Section 21 (Phase 24a-30 Part III)
+  3. Read /home/arash/EvalForWAMs/PTQEval/README.md — quick start + 目录约定
+  4. 确认从 Phase 24a 余项起步：写 toy MMA 单元（位置：
+     PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/csrc/toy_mma_int8.cu）。
+     设计要点（在 session 中已讨论确定）：
+     - 单 warp 单 atom：M=16, N=8, K=32
+     - A 用 mma::ldmatrix_m8n8x4，地址公式同 ViDiT-Q gemm_utils.cuh share_to_reg_A
+       (lane t addr = &smemA[(t%16)*32 + (t/16)*16])，4 fragments 顺序 = a[0..3]，无 swap
+     - B 手动 byte-pack（PTX m16n8k32 的 B layout 用 ldmatrix.x2 不直接合，
+       Phase 24b 整文件移植时再 verbatim 用 ViDiT-Q 的 share_to_reg_B 即可）
+     - cp_async + commit_group + wait_group<0> + __syncwarp 标准三件套
+  5. 用户偏好：让用户执行需要交互的命令（pip install、nvcc build、
+     run_eval.sh），claude 只读结果改代码
 
   用户偏好（要点）
 
   - 中文交流，代码英文
   - 不用表情
   - 短句、信息最小化
-  - 不擅自简化、优化、回退；评估保真度优先
+  - 不擅自简化、优化、回退；评估保真度优先（P1, P2）
   - 计划修改先 plan.txt，再问"开始执行吗"
   - 长 build/eval 让用户跑，贴结果回来分析
+  - 第三方仓库工作树纯净，研究代码只在 PTQEval/ 内扩展（P3, P4）

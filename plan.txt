@@ -1323,6 +1323,15 @@ Unchanged (Section 11.4).
 
 21 IMPLEMENTATION PHASES
 -------------------------------------------------------------------------------
+NOTE (post Part IV migration): Paths below are written in the original
+form "csrc/..." / "qwan_extension/..." relative to a viditq/kernel/ root.
+After Phase M8 (Section 26) that root resolved at
+    lingbot-va/wan_va/quant/viditq/kernel/      (OLD; deleted in M6)
+    PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/   (NEW; current)
+Phase 24a's csrc/infra/* was already copied to the NEW location during
+M2; the remaining items (toy_mma_int8.cu, pybind binding, setup.py
+include_dirs change, check_toy_mma.py) target the NEW location too.
+
 Phase 24a: Infra copy + toy MMA verify
 Target  Copy ViDiT-Q csrc/infra files verbatim. Write a minimal toy
         kernel that uses cp_async + ldmatrix + mma.sync s8s8s32 to
