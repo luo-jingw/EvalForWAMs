@@ -1,35 +1,40 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 """Phase 19: block-level kernel integration.
 
-QuantWanTransformerBlockWithCudaKernel mutates a reference
-WanTransformerBlock in place by swapping the 6 target Linears for
-kernel-backed quantized variants, then delegates forward to the mutated
-ref block.
+QuantWanTransformerBlockWithCudaKernel is a subclass of WanTransformerBlock
+that adopts a reference block's submodules and swaps the 6 target Linears
+for kernel-backed quantized variants. All other submodules (norms,
+cross-attn, scale_shift_table) are reused as-is.
 
-Targets (per Section 9 / 10.6):
-    self-attn (attn1):  to_q, to_k, to_v, to_out[0]
-    feed-forward (ffn): net[0].proj (up), net[2] (down)
+Structure matches WanTransformerBlock exactly so:
+  - model.blocks[i].attn1 / attn2 / ffn are directly accessible (used by
+    WanTransformer3DModel.clear_cache, create_empty_cache, etc).
+  - state_dict keys mirror the FP block layout (no extra prefix), so
+    ptq.py's int_weights .pth loads in place via model.load_state_dict.
+  - forward is inherited from WanTransformerBlock; no delegation hop.
+
+Targets:
+  self-attn (attn1):  to_q, to_k, to_v, to_out[0]
+  feed-forward (ffn): net[0].proj (up), net[2] (down)
 Untouched:
-    cross-attn (attn2): all 4 Linears stay FP.
-    Norms (FP32LayerNorm), RMSNorm in WanAttention, rope, scale_shift_table.
+  cross-attn (attn2): all 4 Linears stay FP.
+  Norms (FP32LayerNorm), RMSNorm in WanAttention, rope, scale_shift_table.
 """
 from __future__ import annotations
 
-import torch
 import torch.nn as nn
 
 from qwan_extension.nn.base import QuantWanLinearBase
 from wan_va.modules.model import WanTransformerBlock
 
 
-class QuantWanTransformerBlockWithCudaKernel(nn.Module):
+class QuantWanTransformerBlockWithCudaKernel(WanTransformerBlock):
 
     def __init__(
         self,
         ref_block: WanTransformerBlock,
         quant_linear_cls: type[QuantWanLinearBase],
     ) -> None:
-        super().__init__()
         assert isinstance(ref_block, WanTransformerBlock), (
             f"ref_block must be WanTransformerBlock, got {type(ref_block)}"
         )
@@ -37,23 +42,28 @@ class QuantWanTransformerBlockWithCudaKernel(nn.Module):
             f"quant_linear_cls must subclass QuantWanLinearBase, got {quant_linear_cls}"
         )
 
-        # 4 self-attention projections.
-        ref_block.attn1.to_q = quant_linear_cls.from_fp_linear(ref_block.attn1.to_q)
-        ref_block.attn1.to_k = quant_linear_cls.from_fp_linear(ref_block.attn1.to_k)
-        ref_block.attn1.to_v = quant_linear_cls.from_fp_linear(ref_block.attn1.to_v)
-        ref_block.attn1.to_out[0] = quant_linear_cls.from_fp_linear(
-            ref_block.attn1.to_out[0]
-        )
+        # Bypass WanTransformerBlock.__init__ (which would build a fresh
+        # block from scratch). Initialize nn.Module's own bookkeeping then
+        # adopt every submodule from the reference.
+        nn.Module.__init__(self)
+        self.attn_mode = ref_block.attn_mode
+        self.norm1 = ref_block.norm1
+        self.attn1 = ref_block.attn1
+        self.attn2 = ref_block.attn2
+        self.norm2 = ref_block.norm2
+        self.ffn = ref_block.ffn
+        self.norm3 = ref_block.norm3
+        self.scale_shift_table = ref_block.scale_shift_table
 
-        # 2 feed-forward projections (diffusers FeedForward layout:
-        #   net[0] is GEGLU/GELU wrapper exposing .proj; net[2] is the down Linear).
-        ref_block.ffn.net[0].proj = quant_linear_cls.from_fp_linear(
-            ref_block.ffn.net[0].proj
-        )
-        ref_block.ffn.net[2] = quant_linear_cls.from_fp_linear(ref_block.ffn.net[2])
+        # Swap the 6 target Linears in place. self.attn1 / self.ffn are
+        # the same Python objects as ref_block.attn1 / ref_block.ffn, so
+        # this also mutates ref_block; the caller should treat ref_block
+        # as consumed.
+        self.attn1.to_q = quant_linear_cls.from_fp_linear(self.attn1.to_q)
+        self.attn1.to_k = quant_linear_cls.from_fp_linear(self.attn1.to_k)
+        self.attn1.to_v = quant_linear_cls.from_fp_linear(self.attn1.to_v)
+        self.attn1.to_out[0] = quant_linear_cls.from_fp_linear(self.attn1.to_out[0])
+        self.ffn.net[0].proj = quant_linear_cls.from_fp_linear(self.ffn.net[0].proj)
+        self.ffn.net[2] = quant_linear_cls.from_fp_linear(self.ffn.net[2])
 
-        # Adopt the (now-mutated) reference block as our forward implementation.
-        self._block: WanTransformerBlock = ref_block
-
-    def forward(self, *args, **kwargs) -> torch.Tensor:
-        return self._block(*args, **kwargs)
+    # forward is inherited from WanTransformerBlock.

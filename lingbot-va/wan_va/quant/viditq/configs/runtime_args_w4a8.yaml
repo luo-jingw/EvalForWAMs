@@ -1,0 +1,4 @@
+# Runtime args for --variant viditq, W4A8 kernel path.
+# Consumed by wan_va.quant.viditq.loader.load_quant_model.
+layer_config: /home/arash/EvalForWAMs/lingbot-va/wan_va/quant/viditq/configs/w4a8.yaml
+int_weights_ckpt: /home/arash/EvalForWAMs/results/viditq_w4a8_kernel/calib/int_weights.pth
