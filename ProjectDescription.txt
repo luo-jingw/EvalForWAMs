@@ -1,0 +1,94 @@
+LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
+
+  项目本质
+
+  对 LingBot-VA（5.09B params bf16 WAN transformer）做 ViDiT-Q 量化（W8A8 + W4A8），在 RoboTwin 15 任务上评估 success rate / GPU 显存峰值 / 推理时延，做 bf16 baseline
+  三方对比。评估性研究项目，要求忠实复刻 ViDiT-Q 方法，不私自简化。
+
+  工作目录
+
+  /home/arash/EvalForWAMs/
+  - lingbot-va/ — LingBot-VA 仓库 + 我们加的 quant/probe/eval 代码
+  - RoboTwin/ — RoboTwin 2.0 仿真 
+  - ViDiT-Q/ — ViDiT-Q 源码（参考实现）
+  - models/lingbot-va-posttrain-robotwin/ — bf16 权重
+  - results/{bf16, viditq_w8a8_kernel, viditq_w4a8_kernel}/ — 评估输出
+  - plan.txt — 唯一权威计划书（Part I/II/III 三段，1438 行）
+  - principle.txt — 设计原则（一切显式、最小实现、不回退、无装饰魔法）
+  - monitor.sh — watch -n 1 用的实时 dashboard
+
+  环境
+
+  - Conda env lingbot-jw（server + PTQ + kernel build）
+  - Conda env RoboTwin-jw（client + sapien 仿真）
+  - GPU：8× RTX A6000 (sm_86, 48 GB)，CUDA 12.6（/usr/local/cuda-12.6/bin/nvcc）
+
+  整体架构（M / Q 模块编号在 plan.txt 中）
+
+  评估管道（method-agnostic, Part I）：
+    M1 perf_probe     - PerfProbe 类，CUDA Event 时延 + peak memory，写 JSONL
+    M2 server         - wan_va_server.py，5 阶段插桩 (init/text_encoder/vae_encode/transformer/action_head)
+    M5 aggregator     - calc_perf_stat.py，JSONL + RoboTwin SR → summary.csv/json
+    M6 orchestrator   - run_eval.sh，3 模式 (smoke/single/pool)，pool 是 worker-queue + flock + VRAM 等待
+    M7 monitor        - monitor.sh 实时 dashboard
+
+  量化变体（plug-in, Part II/III, 通过 importlib 加载）：
+    Q1-Q11  - configs / ptq / kernel / linear modules / block / loader / cross_ckpt 等
+    Server  - 用 --variant viditq --variant_args <yaml> 切换
+
+  关键约定
+
+  1. 量化方法：per-channel asymmetric weight（int8 + int16 zero-point）+ per-token symmetric activation（与 ViDiT-Q W8A8/W4A8 config 一致）。
+  2. CUDA kernel 来源：完整拷贝 ViDiT-Q 的 w8a8_gemm_cuda.cu 和 w4a8_per_channel_gemm_cuda_qserve.cu，仅做一处扩展：加 typename OutT 模板参数 + DtypeTraits<__nv_bfloat16>
+  特化，让 ViDiT-Q 原本只支持 fp16 输出变成 fp16 + bf16 双支持。其他模板分支（weight_asym, has_bias, ScaleMulMode, OutputDtype, K_STAGE, CTA tile）一律保留。
+  3. fp16 launcher 保留：作为对照实验，bench 时与 bf16 数值对比。
+  4. 修改 upstream 必备份：所有改过的 upstream 文件留 .bak。
+  5. 任务集：15 个 RoboTwin 任务（1 long + 4 medium-long + 10 short），每任务 25 episode。
+
+  当前进度状态
+
+  Part I（监控 + 评估管道）全部完成
+
+  - bf16 baseline 已跑完：results/bf16/summary/summary.csv 15 任务，mean SR ≈ 0.86，peak ~32 GB，mean infer 4–13 s/call
+
+  Part II（量化骨架）已完成但 kernel 报废
+
+  - PTQ pipeline、loader、block wrapper、server dispatch 全通
+  - 自写的 scalar kernel 慢 25×（transformer stage 85 s/call vs bf16 3.5 s），通宵只跑完 1 短任务
+
+  Part III（忠实移植 ViDiT-Q kernel）— 计划已写，未实现
+
+  Phase 24a → 30，按顺序执行：
+  - 24a 拷贝 infra（mma/cp_async/permuted_smem/utils）+ toy m16n8k32 MMA 单测
+  - 24b 整文件移植 ViDiT-Q w8a8_gemm_cuda.cu fp16 版本，bench 通过
+  - 24c 扩展 act_quant_bf16 多输出 per-row sum_x（用于 asym 校正项）
+  - 24d 重写 ptq.py 切 asymmetric per-channel，state_dict 加 zp_weight (int16) key
+  - 25 加 OutT 模板 + DtypeTraits + bf16 launcher
+  - 26 改 Python wrapper / loader 适配新 state_dict 4-key schema，删旧 scalar kernel
+  - 27 W8A8 15 任务全 eval（替代 Phase 21）
+  - 28 同样手法移植 W4A8 QServe kernel 
+  - 29 W4A8 15 任务全 eval
+  - 30 cross-checkpoint 报告
+
+  待替换的过时 artifact（新 session 别复用）
+
+  - results/viditq_w8a8_kernel/calib/int_weights.pth（sym 权重，Phase 24d 重新生成 asym 版）
+  - results/viditq_w4a8_kernel/calib/int_weights.pth（同上）
+  - results/viditq_w8a8_kernel/perf/*.jsonl（慢 kernel 数据，Phase 27 后 aggregator 用 mtime 自动跳过老文件）
+  - results/viditq_w8a8_kernel/stseed-10000/metrics/adjust_bottle/（Phase 27 用 --rerun_all 重跑）
+
+  新 session 第一步建议
+
+  1. Read /home/arash/EvalForWAMs/principle.txt — 内化设计原则
+  2. Read /home/arash/EvalForWAMs/plan.txt — 完整计划书（重点 Section 16-22 Part III）
+  3. 确认从 Phase 24a 起步：拷贝 ViDiT-Q 7 个 infra 头文件到 lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/，写 toy MMA 单测验证基础设施编译 + 数值正确
+  4. 用户偏好：让用户执行需要交互的命令（pip install、nvcc build、run_eval.sh），claude 只读结果改代码
+
+  用户偏好（要点）
+
+  - 中文交流，代码英文
+  - 不用表情
+  - 短句、信息最小化
+  - 不擅自简化、优化、回退；评估保真度优先
+  - 计划修改先 plan.txt，再问"开始执行吗"
+  - 长 build/eval 让用户跑，贴结果回来分析

@@ -764,7 +764,11 @@ Verify  Bare bf16 path still works:
         Must complete and write summary.csv as in Part I.
         qdiff is no longer imported anywhere under lingbot-va/wan_va/.
 
-Phase 15: W8A8 BF16-native CUDA kernel
+Phase 15: W8A8 BF16-native CUDA kernel        [DONE - SUPERSEDED by Phase 25]
+Note    First-cut scalar kernel (no tensor cores). Numerically correct
+        (bench err 0) but ~25x slower than bf16 baseline; Phase 21 run
+        confirmed it is unusable for full eval. Phase 24-25 ports the
+        ViDiT-Q m16n8k32 MMA kernel as replacement.
 Target  Implement Q3. Two CUDA sources: act_quant_bf16.cu and
         w8a8_gemm_bf16.cu. pybind exposes
         qwan_extension.fused.act_quant_bf16 and
@@ -781,7 +785,9 @@ Verify  python -m qwan_extension.bench_w8a8 (small bench script):
                                                    scale_w).T + bias
         passes max abs error < 1e-2 (bf16 tolerance).
 
-Phase 16: W4A8 BF16-native CUDA kernel
+Phase 16: W4A8 BF16-native CUDA kernel        [DONE - SUPERSEDED by Phase 28]
+Note    Same architectural issue as Phase 15. Replaced by Phase 28 (port
+        of ViDiT-Q QServe W4A8 kernel).
 Target  Implement Q4. Reuse act_quant_bf16 from Phase 15. Add
         w4a8_gemm_bf16.cu. Add pack/unpack helpers for int4 weight.
 Add     lingbot-va/wan_va/quant/viditq/kernel/csrc/w4a8_gemm_bf16.cu
@@ -789,7 +795,10 @@ Modify  lingbot-va/wan_va/quant/viditq/kernel/csrc/pybind.cpp (add binding)
 Verify  python -m qwan_extension.bench_w4a8: same shape set as Phase 15;
         max abs error < 2e-2 (looser tolerance for 4-bit weight).
 
-Phase 17: Python wrappers (QuantWanLinearW8A8 / QuantWanLinearW4A8)
+Phase 17: Python wrappers           [DONE - INTERFACE EXTENDED in Phase 26]
+Note    Wrappers still valid. Phase 26 extends their state_dict schema
+        to include zp_weight (asymmetric weight quant) and updates
+        forward to consume sum_x from the extended act_quant kernel.
 Target  Implement Q5. Two nn.Module classes following Section 10.5.
         Each owns int_weight, scale_weight, bias as buffers / parameters.
         forward calls Q3 / Q4 kernels via qwan_extension.fused.
@@ -800,7 +809,12 @@ Verify  Unit script: build QuantWanLinearW8A8 from a torch.nn.Linear,
         run forward on random input, output shape and dtype correct;
         same for QuantWanLinearW4A8.
 
-Phase 18: PTQ (FP -> int weights + scales)
+Phase 18: PTQ (FP -> int weights + scales)    [DONE - SUPERSEDED by Phase 24d]
+Note    Current ptq.py uses per-channel SYMMETRIC weight quant. For
+        faithful ViDiT-Q evaluation Phase 24d rewrites it as per-channel
+        ASYMMETRIC (scale + int16 zero-point per output channel),
+        matching ViDiT-Q's W8A8 config (weight.sym=False, act.sym=True).
+        State_dict gains a zp_weight key per layer.
 Target  Implement Q2. Walks an FP WanTransformer3DModel, for each target
         Linear computes int_weight + scale_weight (and int4-packs when
         weight_bits == 4). Dumps state_dict to int_weights_<variant>.pth.
@@ -816,7 +830,9 @@ Verify  Two real runs:
         Both files exist; each contains 300 entries; W4A8 file size is
         roughly half of W8A8.
 
-Phase 19: Block-level integration
+Phase 19: Block-level integration                                [DONE]
+Note    Block class unchanged by Part III. It only swaps Linear modules;
+        the swap is independent of the kernel's internal MMA scheme.
 Target  Implement Q6. QuantWanTransformerBlockWithCudaKernel takes a
         reference WanTransformerBlock and a quant_linear_cls
         (QuantWanLinearW8A8 or W4A8). Constructs a new block whose 6
@@ -829,7 +845,10 @@ Verify  Unit script: build a single QuantWanTransformerBlockWithCudaKernel
         shape matches reference; max abs error < 0.1 (looser due to
         end-to-end quant noise).
 
-Phase 20: viditq loader rewrite
+Phase 20: viditq loader rewrite     [DONE - INTERFACE EXTENDED in Phase 26]
+Note    Smoke verified: model loads, kernel forward runs end-to-end.
+        Phase 26 extends the key-remap to also forward zp_weight buffers
+        from the new asym ptq output to the kernel modules.
 Target  Replace the algorithm-sim body of loader.py with a kernel-only
         path: load FP transformer, swap every block for Q6 with the right
         quant_linear_cls, load int_weights state_dict, return.
@@ -845,19 +864,26 @@ Verify  bash run_eval.sh --mode smoke --variant viditq
         bf16 baseline 32 034 MB by at least (5.09B params * weight saving
         ratio / 2 bytes) GB.
 
-Phase 21: viditq_w8a8_kernel full eval
+Phase 21: viditq_w8a8_kernel full eval        [ATTEMPTED - SUPERSEDED by Phase 27]
+Note    Run overnight on scalar Phase 15 kernel: 1 short task completed
+        in ~8h (vs ~25 min on bf16). transformer stage ~85s/call (vs
+        ~3.5s bf16, 24x). Phase 27 reruns this eval after Phase 24-26
+        ports the ViDiT-Q MMA kernel.
 Target  Run 15-task eval with W8A8 kernel.
 Add     none
 Verify  results/viditq_w8a8_kernel/summary/summary.csv has 15 rows. All
         success_rate non-null. peak_alloc_mb lower than bf16 per task.
 
-Phase 22: viditq_w4a8_kernel full eval
+Phase 22: viditq_w4a8_kernel full eval                  [SUPERSEDED by Phase 29]
 Target  Run 15-task eval with W4A8 kernel.
 Add     none
 Verify  results/viditq_w4a8_kernel/summary/summary.csv has 15 rows.
         peak_alloc_mb lower than viditq_w8a8_kernel per task.
 
-Phase 23: Cross-checkpoint report
+Phase 23: Cross-checkpoint report            [DEFERRED until Phase 27 + 29]
+Note    Aggregator logic is kernel-impl-agnostic. Runs after Phase 27
+        (W8A8 full eval) and Phase 29 (W4A8 full eval) populate the
+        save_roots.
 Target  Implement Q9. Read bf16 + viditq_w8a8_kernel + viditq_w4a8_kernel
         save_roots. Join on task_name. Emit cross_summary.csv with
         per-variant SR, peak_alloc_mb, mean_total_ms columns and
@@ -945,3 +971,468 @@ Step 4  Add the new save_root to the cross_ckpt_aggregator input set.
   added.
 - No registry, no factory, no plugin manager. Resolution is exactly
   importlib.import_module(f"wan_va.quant.{variant}.loader").
+
+
+===============================================================================
+PART III  Faithful ViDiT-Q Kernel Port (asym W, MMA tensor cores, bf16+fp16)
+===============================================================================
+
+16 PROBLEM DEFINITION
+-------------------------------------------------------------------------------
+16.1 Current state (after Phase 20)
+- Loader (Section 10.8) loads FP transformer, wraps every block with
+  QuantWanTransformerBlockWithCudaKernel, loads int_weights state_dict,
+  returns nn.Module. Server smoke verified.
+- Existing PTQ (Phase 18) writes per-channel SYMMETRIC weight quant:
+  state_dict = {<name>.int_weight, <name>.scale_weight, <name>.bias}.
+- Existing GEMM kernel (Phase 15) is a scalar 1-thread-per-output kernel.
+  Numerically correct, but ~25x slower than bf16 baseline at WAN shapes.
+- Phase 21 run confirmed kernel slowness blocks full eval.
+
+16.2 Problem
+- Current quant method (symmetric weight) is NOT the ViDiT-Q W8A8 method.
+  Faithful evaluation requires per-channel asymmetric weight with int16
+  zero-point per output channel.
+- Current kernel does not use Ampere INT8 tensor cores (mma.sync.aligned.
+  m16n8k32.s32.s8.s8.s32). Wall-clock unusable.
+- The asymmetric weight method requires an additional per-row activation
+  sum (sum_A) in the epilogue. Current act_quant_bf16 does not produce it.
+
+16.3 Goal
+- Replace ptq.py with asymmetric per-channel weight quant matching
+  ViDiT-Q's W8A8 / W4A8 configs (weight.sym=False, act.sym=True).
+- Port ViDiT-Q's MMA-based GEMM kernels (w8a8_gemm_cuda.cu and
+  w4a8_per_channel_gemm_cuda_qserve.cu) verbatim into our tree.
+- Extend act_quant_bf16 to also output sum_x (per-row dequant sum).
+- Add bf16 output as a new OutT template instantiation alongside
+  ViDiT-Q's existing fp16 + int32 paths. fp16 path preserved as
+  numerical reference for evaluation.
+- All ViDiT-Q template branches preserved: weight_asym (true/false),
+  has_bias (true/false), OutputDtype (fp16/bf16/int32), ScaleMulMode
+  (kMode1/kMode2), K_STAGE, CTA/WARP tile shapes.
+
+16.4 Faithfulness constraint
+- Quant method must match ViDiT-Q exactly. No private simplification.
+- Kernel must match ViDiT-Q structurally. Permitted additions: a new
+  OutT template parameter that selects bf16 epilogue; corresponding
+  DtypeTraits<__nv_bfloat16> specialization. No deletion of existing
+  template branches, ScaleMulMode variants, OutputDtype variants.
+- Reasoning: this work is the evaluation harness for ViDiT-Q on
+  LingBot-VA. The published method must be reproduced as-is to keep
+  numerical and design comparability.
+
+16.5 Non-goals
+- No new quantization method invented here. Only ViDiT-Q W8A8 + W4A8.
+- No fusion with norm or activation (ViDiT-Q kernel structure is
+  bare GEMM + epilogue; norm stays as separate FP kernel).
+- No multi-GPU GEMM split.
+
+
+17 SYSTEM STRUCTURE
+-------------------------------------------------------------------------------
+17.1 Module deltas (vs Section 9)
+Q1 quant_configs       Add yaml fields weight.sym, act.sym; remove
+                       weight_pack (W4 packing is a kernel detail, not
+                       a config knob).
+Q2 ptq_kernel          Rewrite for per-channel asymmetric weight.
+                       Output 4 tensors per layer: int_weight,
+                       scale_weight, zp_weight (int16), bias.
+Q3 kernel_w8a8         Port of ViDiT-Q w8a8_gemm_cuda.cu. New OutT
+                       template parameter. Verbatim copy of mma /
+                       cp_async / permuted_smem / utils infrastructure.
+Q4 kernel_w4a8         Port of ViDiT-Q w4a8_per_channel_gemm_cuda_qserve.cu.
+                       Same OutT extension.
+Q5 quant_linear_modules Add zp_weight buffer; forward calls
+                       act_quant_bf16_with_sum then the new kernel.
+Q6 quant_block_kernel  Unchanged.
+Q7 quant_server_loader Unchanged.
+Q8 viditq_loader       Key remap extends to include zp_weight.
+Q9 cross_ckpt_aggregator Unchanged.
+Q10 act_quant_with_sum NEW. Extension of act_quant_bf16. Per-token
+                       symmetric quant, plus one extra reduction:
+                       sum_x[n] = scale_x[n] * sum_k(x_int8[n,k]),
+                       stored as bf16 [N]. Used by asym epilogue.
+Q11 epilogue_dtype_traits NEW. C++ header. Specializations:
+                       DtypeTraits<__half> and DtypeTraits<__nv_bfloat16>.
+                       Provide packed2 type and three conversion intrinsics
+                       (to_float, to_float2, from_float2). The MMA-based
+                       kernel uses these in epilogue.
+
+17.2 State ownership (vs Section 9.2)
+- Weight zero-point (int16 per output channel) lives in
+  int_weights_<variant>.pth alongside scale_weight. Owned by Q2 at PTQ
+  time, loaded by Q8 into Q5 module buffers.
+- Per-row activation sum is owned by Q10 (transient per forward call,
+  not persisted).
+
+
+18 INTERFACE DESIGN
+-------------------------------------------------------------------------------
+18.1 Q1 quant_configs (revised schema)
+Files
+  lingbot-va/wan_va/quant/viditq/configs/w8a8.yaml
+  lingbot-va/wan_va/quant/viditq/configs/w4a8.yaml
+Schema
+  remain_fp_regex: <regex>
+  weight:
+    n_bits: 8 | 4
+    sym: false                # ViDiT-Q default
+  act:
+    n_bits: 8
+    sym: true                 # ViDiT-Q default
+
+18.2 Q2 ptq_kernel (rewritten)
+File: lingbot-va/wan_va/quant/viditq/ptq.py
+
+  @dataclass
+  class IntLayerEntry:
+      int_weight: torch.Tensor      # int8 [C_out, C_in] or [C_out, C_in/2]
+      scale_weight: torch.Tensor    # bf16 [C_out]
+      zp_weight: torch.Tensor       # int16 [C_out]
+      bias: Optional[torch.Tensor]  # bf16 [C_out] or None
+
+  def compute_int_state_dict(
+      model: nn.Module,
+      remain_fp_regex: str,
+      weight_bits: int,             # 8 or 4
+      weight_sym: bool,             # always False for Part III
+  ) -> dict[str, IntLayerEntry]: ...
+
+Asymmetric per-channel formula (matches qdiff StaticQuantizer asym path):
+  for each Linear, with weight W[C_out, C_in]:
+      x_max = W.max(dim=1)                          # [C_out]
+      x_min = W.min(dim=1)                          # [C_out]
+      n_levels = 2**weight_bits
+      delta = (x_max - x_min) / (n_levels - 1)      # scale, [C_out], fp32
+      zp_f  = round(x_min / delta) + (n_levels / 2) # [C_out], fp32
+      int_w = round(W / delta + zp_f)               # [C_out, C_in]
+      int_w = clamp(int_w - n_levels/2, -n_levels/2-1, n_levels/2)
+              .to(int8)                             # signed int8
+      # Notes:
+      #   delta is stored as bf16 in scale_weight.
+      #   zp_f - n_levels/2 is stored as int16 in zp_weight to match
+      #   the kernel's short2 load.
+For W4 case (n_levels = 16), additionally pack 2 nibbles per byte
+  (low nibble = col 2c, high nibble = col 2c+1, signed).
+
+Flat state_dict keys:
+  <name>.int_weight     int8 [C_out, C_in] or [C_out, C_in/2]
+  <name>.scale_weight   bf16 [C_out]
+  <name>.zp_weight      int16 [C_out]
+  <name>.bias           bf16 [C_out]   (omitted if absent)
+
+18.3 Q10 act_quant_bf16_with_sum (extension of Q3)
+File: lingbot-va/wan_va/quant/viditq/kernel/csrc/act_quant_bf16.cu (modified)
+
+  Python entry (new, alongside existing act_quant_bf16):
+    x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum(x_bf16)
+  Shapes:
+    x_int8         [N, K] int8
+    scale_x_bf16   [N]    bf16
+    sum_x_bf16     [N]    bf16    (= scale_x * sum_k(x_int8))
+
+The original 1-arg signature stays available for callers that do not
+need sum (none in production).
+
+18.4 Q3 / Q4 kernel signatures (after port + OutT extension)
+File: lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8/w8a8_gemm.cu
+      lingbot-va/wan_va/quant/viditq/kernel/csrc/w4a8_qserve/w4a8_gemm_qserve.cu
+
+  template <
+      typename OutT,            # __half | __nv_bfloat16
+      uint32_t CTA_M, uint32_t CTA_N, uint32_t CTA_K,
+      uint32_t WARP_M, uint32_t WARP_N, uint32_t CTA_STRIDE,
+      uint32_t K_STAGE,
+      bool has_bias, bool weight_asym,
+      ScaleMulMode scale_mul_mode
+  >
+  __global__ void quant_gemm_int8_kernel(...)        # MMA core
+
+Host-facing launchers (exposed via pybind):
+  w8a8_of_bf16_bias_weight_asym(input, weight, output, bias,
+      scale_input, scale_weight, sum_input, zp_weight, M, N, K)
+  w8a8_of_fp16_bias_weight_asym(...)
+  w8a8_of_bf16_nobias_weight_sym(...)
+  w8a8_of_fp16_nobias_weight_sym(...)
+  w8a8_of_int32_nobias_weight_sym(...)               # int32 acc dump
+And analogous w4a8_of_{bf16, fp16}_... pair.
+
+Notation matches ViDiT-Q's launcher naming. Dimension labels follow
+ViDiT-Q convention: M = tokens (=N_ours), N = out_features (=M_ours),
+K = in_features. Wrappers handle the swap explicitly.
+
+18.5 Q11 epilogue_dtype_traits
+File: lingbot-va/wan_va/quant/viditq/kernel/csrc/epilogue_dtype_traits.cuh
+
+  template <typename T> struct DtypeTraits;
+
+  template <> struct DtypeTraits<__half> {
+      using packed2 = __half2;
+      __device__ static float  to_float(__half x);
+      __device__ static float2 to_float2(__half2 x);
+      __device__ static __half2 from_float2(float2 x);
+  };
+
+  template <> struct DtypeTraits<__nv_bfloat16> {
+      using packed2 = __nv_bfloat162;
+      __device__ static float  to_float(__nv_bfloat16 x);
+      __device__ static float2 to_float2(__nv_bfloat162 x);
+      __device__ static __nv_bfloat162 from_float2(float2 x);
+  };
+
+The MMA kernel uses Trait::to_float / to_float2 to convert scale + bias
+to fp32, and Trait::from_float2 to write packed2 results into RC.
+
+18.6 Q5 quant_linear_modules (state_dict extension)
+state_dict keys per Q5 module instance (W8A8 and W4A8 share schema):
+  int_weight     int8  [C_out, C_in_pack]
+  scale_weight   bf16  [C_out]
+  zp_weight      int16 [C_out]
+  bias           bf16  [C_out]   (omitted when has_bias=False)
+Forward:
+  x_int8, scale_x, sum_x = act_quant_bf16_with_sum(x_2d)
+  y = w8a8_of_bf16_bias_weight_asym(
+        x_int8, self.int_weight, scale_x, self.scale_weight,
+        sum_x, self.zp_weight, self.bias)
+W4A8 uses w4a8_of_bf16_bias_weight_asym; same arg shape.
+
+18.7 Q8 viditq_loader key remap
+File: lingbot-va/wan_va/quant/viditq/loader.py (modified)
+
+Remap unchanged for int_weight, scale_weight, bias. Additionally remap
+<name>.zp_weight -> <name in kernel block>._block.zp_weight. After
+loading, no key is allowed in `unexpected`; `missing` covers FP-kept
+modules only.
+
+
+19 RUNTIME FLOW
+-------------------------------------------------------------------------------
+19.1 PTQ flow (offline, per variant)
+- Q2 loads FP WanTransformer3DModel.
+- For each nn.Linear whose name does NOT match remain_fp_regex:
+    apply asymmetric per-channel formula (Section 18.2).
+    For W4: pack 2 nibbles per byte after the int_w computation.
+- Dump dict[full_name -> IntLayerEntry] to int_weights_<variant>.pth.
+
+19.2 Quantized inference flow (server)
+- Server starts with --variant viditq --variant_args <yaml>.
+- Q7 imports wan_va.quant.viditq.loader and calls Q8.load_quant_model.
+- Q8:
+    1. Load FP WanTransformer3DModel.
+    2. For each block, instantiate Q6 with the appropriate QuantWanLinear
+       class. Constructor calls from_fp_linear which initializes int /
+       scale / zp / bias buffers from FP weights using the same
+       asymmetric formula (matches Q2 numerically).
+    3. Load int_weights_<variant>.pth into the kernel modules. The
+       loaded values overwrite the from_fp_linear initialization.
+- Returned module assigned to self.transformer. FSDP wrap skipped.
+
+19.3 Kernel forward sequence (per target Linear)
+  x_bf16  -> [Q10.act_quant_bf16_with_sum] -> (x_int8, scale_x, sum_x)
+                                            -> [Q3.w8a8_of_bf16_bias_weight_asym
+                                                or Q4.w4a8_of_bf16_bias_weight_asym]
+                                            -> y_bf16
+Inside kernel epilogue (per ViDiT-Q):
+  acc_int32 -> psums_fp32 = acc * scale_A * scale_B
+  if weight_asym: psums_fp32 += sum_A * zp_B * scale_B
+  if has_bias:    psums_fp32 += bias
+  output_bf16   = DtypeTraits<__nv_bfloat16>::from_float2(psums_fp32)
+
+19.4 Cross-checkpoint comparison flow
+Unchanged (Section 11.4).
+
+
+20 CODE MAPPING
+-------------------------------------------------------------------------------
+20.1 New files (Part III)
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/mma.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/cp_async.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/permuted_smem.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/utils.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/math.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/reduction_utils.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/infra/dispatch_utils.h
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/epilogue_dtype_traits.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8/gemm_utils.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8/w8a8_gemm.cu
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/w4a8_qserve/gemm_utils.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/w4a8_qserve/w4a8_gemm_qserve.cu
+- (no separate fp16 source: same .cu instantiates both __half and
+   __nv_bfloat16 via OutT.)
+
+20.2 Files rewritten in place
+- lingbot-va/wan_va/quant/viditq/ptq.py
+    asym formula; emit zp_weight; new yaml schema fields.
+- lingbot-va/wan_va/quant/viditq/configs/w8a8.yaml
+    new schema (Section 18.1).
+- lingbot-va/wan_va/quant/viditq/configs/w4a8.yaml
+    new schema.
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/act_quant_bf16.cu
+    add act_quant_bf16_with_sum host wrapper and kernel pass.
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/pybind.cpp
+    bindings for new launcher names.
+- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/base.py
+    add zp_weight buffer; forward calls sum-extended act_quant kernel.
+- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear_w8a8.py
+    forward calls w8a8_of_bf16_bias_weight_asym; from_fp_linear uses
+    asym per-channel formula.
+- lingbot-va/wan_va/quant/viditq/kernel/qwan_extension/nn/qlinear_w4a8.py
+    same treatment.
+- lingbot-va/wan_va/quant/viditq/loader.py
+    key remap includes zp_weight.
+- lingbot-va/wan_va/quant/viditq/kernel/setup.py
+    include_dirs add csrc/infra and csrc/; new source list.
+
+20.3 Files deleted
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/quant_gemm_common.cuh
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/w8a8_gemm_bf16.cu
+- lingbot-va/wan_va/quant/viditq/kernel/csrc/w4a8_gemm_bf16.cu
+
+20.4 Files unchanged
+- lingbot-va/wan_va/quant/viditq/block/quant_wan_block.py
+- lingbot-va/wan_va/wan_va_server.py (variant dispatch already in place)
+- lingbot-va/evaluation/robotwin/run_eval.sh
+- lingbot-va/evaluation/robotwin/calc_perf_stat.py
+
+20.5 Default paths unchanged from Section 12.5.
+
+
+21 IMPLEMENTATION PHASES
+-------------------------------------------------------------------------------
+Phase 24a: Infra copy + toy MMA verify
+Target  Copy ViDiT-Q csrc/infra files verbatim. Write a minimal toy
+        kernel that uses cp_async + ldmatrix + mma.sync s8s8s32 to
+        compute one CTA_M x CTA_N tile of INT8 GEMM (no scales, no
+        epilogue). Pure correctness target.
+Add     csrc/infra/* (mma.cuh, cp_async.cuh, permuted_smem.cuh,
+        utils.cuh, math.cuh, reduction_utils.cuh, dispatch_utils.h)
+        csrc/toy_mma_int8.cu
+        qwan_extension/check_toy_mma.py
+Modify  setup.py (add include_dirs, add toy source)
+Verify  python -m qwan_extension.check_toy_mma: small shape (64x64x64
+        or aligned to MMA atom) toy_int8_gemm matches Python int32
+        reference with 0 error.
+
+Phase 24b: W8A8 fp16 verbatim port
+Target  Copy ViDiT-Q csrc/qgemm/w8a8/{gemm_utils.cuh, w8a8_gemm_cuda.cu}
+        as-is (rename to gemm_utils.cuh + w8a8_gemm.cu under our tree).
+        Update only its #include paths to point to csrc/infra/. Expose
+        the ViDiT-Q host launcher w8a8_of_fp16_bias_weight_asym via
+        pybind under name w8a8_of_fp16_bias_weight_asym.
+Add     csrc/w8a8/gemm_utils.cuh
+        csrc/w8a8/w8a8_gemm.cu (verbatim, only header paths edited)
+Modify  csrc/pybind.cpp
+        setup.py
+Verify  qwan_extension.bench_w8a8_fp16 (new bench script): for shapes
+        (256, 3072, 3072), (256, 3072, 14336), (256, 14336, 3072),
+        kernel output vs naive Python ref using the same asym scheme
+        passes max abs error < 1e-2 (fp16 tol).
+
+Phase 24c: act_quant extension with sum_x
+Target  Implement Q10 act_quant_bf16_with_sum. Add a second block-wide
+        reduction inside the existing per-row kernel: while quantizing,
+        accumulate sum_local = sum(x_dequant). After quant phase,
+        reduce to a single per-row value and store as bf16.
+Add     none (extend existing file)
+Modify  csrc/act_quant_bf16.cu
+        csrc/pybind.cpp
+        qwan_extension/__init__.py (export new name)
+Verify  Unit script: random bf16 input; check
+            sum_x[n] ~= scale_x[n] * sum_k(x_int8[n,k])
+        within bf16 noise (< 1e-3 relative).
+
+Phase 24d: PTQ rewrite (asymmetric per-channel)
+Target  Implement Q2 with the asymmetric formula (Section 18.2).
+        IntLayerEntry gains zp_weight: int16 [C_out]. Output state_dict
+        has 4 keys per layer. W4 case packs nibbles after asym quant.
+Modify  wan_va/quant/viditq/ptq.py
+        wan_va/quant/viditq/configs/w8a8.yaml (new schema)
+        wan_va/quant/viditq/configs/w4a8.yaml (new schema)
+Verify  Run ptq on adjust_bottle dummy (or real model with the new
+        configs). int_weights_<variant>.pth has 300 layers, each with
+        4 tensors (int_weight, scale_weight, zp_weight, bias). zp_weight
+        dtype is int16 with shape [C_out].
+
+Phase 25: Add OutT template + bf16 instantiation
+Target  Add csrc/epilogue_dtype_traits.cuh with __half and
+        __nv_bfloat16 specializations. Refactor the W8A8 kernel
+        signature to add typename OutT as the first template param.
+        Replace half-specific intrinsics in the epilogue with
+        DtypeTraits<OutT>:: calls. Add host launcher
+        w8a8_of_bf16_bias_weight_asym (plus the no-bias and weight-sym
+        variants for full faithfulness coverage).
+Add     csrc/epilogue_dtype_traits.cuh
+Modify  csrc/w8a8/w8a8_gemm.cu
+        csrc/pybind.cpp
+Verify  qwan_extension.bench_w8a8_bf16: max abs err < 1e-2 vs naive ref.
+        The fp16 launcher from Phase 24b still passes (regression check).
+        Single-shape wall-clock vs torch.nn.functional.linear bf16 ratio
+        recorded in the bench output.
+
+Phase 26: Q5 wrappers + Q8 loader update
+Target  Update QuantWanLinearW8A8 / W4A8 base to register zp_weight
+        buffer, and call act_quant_bf16_with_sum + the new launcher.
+        Update from_fp_linear to use asym per-channel formula
+        (matches Q2). Update Q8 loader's key remap to forward
+        zp_weight onto kernel modules. Delete the obsolete scalar
+        kernel sources.
+Modify  qwan_extension/nn/base.py
+        qwan_extension/nn/qlinear_w8a8.py
+        wan_va/quant/viditq/loader.py
+Delete  csrc/quant_gemm_common.cuh
+        csrc/w8a8_gemm_bf16.cu
+        csrc/w4a8_gemm_bf16.cu
+Verify  python -m qwan_extension.check_qlinear (existing script,
+        regenerated against new state schema) passes W8A8 cases.
+        python -m wan_va.quant.viditq.block.check_block W8A8 passes.
+        Smoke run (adjust_bottle, test_num=1) completes; perf log
+        transformer stage <= 2x bf16 baseline per call.
+
+Phase 27: W8A8 full eval (replaces Phase 21)
+Target  Re-run 15-task eval with the ported kernel.
+Modify  none
+Verify  results/viditq_w8a8_kernel/summary/summary.csv has 15 rows.
+        mean_total_ms within 1.5x of bf16 baseline (or better).
+        peak_alloc_mb at least 3 GB lower than bf16 baseline.
+
+Phase 28: W4A8 QServe port (mirrors Phase 24b + 25 for W4)
+Target  Copy ViDiT-Q csrc/qgemm/w4a8/w4a8_per_channel_gemm_cuda_qserve.cu
+        and its gemm_utils header (if any) into our tree. Apply the
+        same OutT template extension + bf16 instantiation. Update Q5's
+        QuantWanLinearW4A8 forward to call w4a8_of_bf16_bias_weight_asym.
+Add     csrc/w4a8_qserve/gemm_utils.cuh (if present in ViDiT-Q)
+        csrc/w4a8_qserve/w4a8_gemm_qserve.cu
+Modify  csrc/pybind.cpp
+        qwan_extension/nn/qlinear_w4a8.py
+        setup.py
+Verify  qwan_extension.bench_w4a8_bf16: max abs err < 2e-2.
+        qwan_extension.check_qlinear W4A8 cases pass.
+        block check_block W4A8 passes.
+
+Phase 29: W4A8 full eval (replaces Phase 22)
+Target  Re-run 15-task eval with the ported W4A8 kernel.
+Verify  results/viditq_w4a8_kernel/summary/summary.csv has 15 rows.
+        peak_alloc_mb at least 5 GB lower than bf16 baseline.
+
+Phase 30: Cross-checkpoint report (advances Phase 23)
+Target  Run Q9 cross_ckpt_aggregator over bf16, viditq_w8a8_kernel,
+        viditq_w4a8_kernel save_roots.
+Verify  cross_summary.csv has 15 rows. Three variant columns populated.
+
+
+22 ACCEPTANCE  (Part III)
+-------------------------------------------------------------------------------
+- PTQ output state_dict carries per-channel asymmetric weight quant
+  with int16 zero_point per output channel.
+- W8A8 GEMM kernel uses mma.sync.aligned.m16n8k32.s32.s8.s8.s32 with
+  cp_async-staged shared-memory tiling, swizzled smem, and bf16 epilogue.
+- fp16 launcher and bf16 launcher coexist; fp16 path acts as a
+  numerical reference and is exercised by Phase 24b bench.
+- W4A8 path goes through the QServe-style per-channel int4 kernel,
+  same OutT extension applied.
+- 15-task summary.csv exists for viditq_w8a8_kernel and
+  viditq_w4a8_kernel save_roots. cross_summary.csv joins all three
+  variants.
+- All template branches of ViDiT-Q's original kernel are preserved
+  (weight_asym, has_bias, OutputDtype, ScaleMulMode, K_STAGE, tile
+  shapes). No private deletion of these.
