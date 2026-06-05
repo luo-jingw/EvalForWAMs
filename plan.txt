@@ -16,6 +16,8 @@ P3 Copy + rename + modify as the default extension pattern. Avoid
 P4 First-principles, straight-through first. Abstract only when a second
    concrete instance demands it. Premature abstraction over a single
    instance is forbidden.
+P5 Commit after each milestone (phase / sub-phase) completes. Commit
+   message body compressed to one sentence; no multi-line summary.
 
 
 1 PROBLEM DEFINITION
