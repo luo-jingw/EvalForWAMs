@@ -2,6 +2,22 @@
 LingBot-VA on RoboTwin: Success Rate Eval + Memory & Latency Monitoring Plan
 ===============================================================================
 
+0 PRINCIPLES  (apply to every Phase below)
+-------------------------------------------------------------------------------
+P1 Research-oriented project. Faithful reproduction of published methods
+   takes precedence over implementation convenience.
+P2 No private simplification or optimization of an algorithm. Equivalent
+   engineering means are permitted (e.g., C++ template instantiation,
+   verbatim kernel transcription, type-aware refactor without semantic
+   change).
+P3 Copy + rename + modify as the default extension pattern. Avoid
+   modifying third-party repositories in place; favor a fork inside our
+   own tree.
+P4 First-principles, straight-through first. Abstract only when a second
+   concrete instance demands it. Premature abstraction over a single
+   instance is forbidden.
+
+
 1 PROBLEM DEFINITION
 -------------------------------------------------------------------------------
 1.1 Current state
@@ -1436,3 +1452,256 @@ Verify  cross_summary.csv has 15 rows. Three variant columns populated.
 - All template branches of ViDiT-Q's original kernel are preserved
   (weight_asym, has_bias, OutputDtype, ScaleMulMode, K_STAGE, tile
   shapes). No private deletion of these.
+
+
+===============================================================================
+PART IV  PTQEval Migration  (centralize research code; subrepos -> upstream)
+===============================================================================
+
+23 PROBLEM DEFINITION
+-------------------------------------------------------------------------------
+23.1 Current state
+- All research code lives inside lingbot-va/: perf probe, aggregator,
+  run_eval, monitor, viditq quant tree, server instrumentation.
+- lingbot-va/ working tree diff vs .git_orig: 8 modified upstream files
+  + ~35 new files.
+- RoboTwin/ and ViDiT-Q/ working trees are effectively pristine.
+
+23.2 Problem
+- Future N WAMs x M quant methods => locality lost if research code
+  stays inside each WAM tree.
+- Every WAM would carry its own copy of perf probe / aggregator /
+  orchestrator. Violates P3, P4.
+
+23.3 Goal
+- New PTQEval/ at repo root holds all research code.
+- Each third-party subrepo's working tree returns to upstream-equivalent
+  (0 modified files in lingbot-va/ after migration).
+- server.py is forked into PTQEval/ptqeval/wam/<wam>/server.py (not
+  in-place patched, per P3).
+- Single Loader contract per (WAM, method) pair; resolved by importlib
+  from a fixed namespace template.
+
+23.4 Non-goals
+- No WAMAdapter / QuantMethod protocol abstraction (P4: single instance,
+  no premature abstraction).
+- No benchmark-axis abstraction. RoboTwin stays inline under wam/
+  lingbot_va/.
+- No restructure of viditq internals. Files moved verbatim.
+
+
+24 SYSTEM STRUCTURE
+-------------------------------------------------------------------------------
+PTQEval/
+  pyproject.toml                    pip install -e PTQEval/
+  ptqeval/
+    __init__.py
+    eval/                           WAM/method/benchmark-agnostic
+      perf_probe.py                 from wan_va/utils/perf_probe.py
+      aggregator.py                 from evaluation/robotwin/calc_perf_stat.py
+      cross_ckpt.py                 Q9 (new, Phase 30)
+      run_eval.sh                   env-var driven; from evaluation/robotwin/
+      monitor.sh                    from repo-root monitor.sh
+    wam/
+      lingbot_va/
+        __init__.py
+        server.py                   FORK of wan_va/wan_va_server.py
+        eval_client.py              FORK of evaluation/robotwin/
+                                    eval_polict_client_openpi.py
+        tasks.py                    SELECTED_15_TASKS list + EVAL_STEP_LIMIT
+                                    dict (was inline in launch_client_multigpus.sh)
+        launchers/
+          launch_server.sh
+          launch_server_multigpus.sh
+          launch_client.sh
+          launch_client_multigpus.sh
+        method/
+          __init__.py
+          viditq/
+            __init__.py
+            ptq.py                  WAM-agnostic algorithm
+            loader.py               (WAM x method)
+            block.py                (WAM x method); was block/quant_wan_block.py
+            check_block.py          (WAM x method)
+            configs/
+              w8a8.yaml             remain_fp_regex matches WanModel layer names
+              w4a8.yaml
+              runtime_args_w8a8.yaml
+              runtime_args_w4a8.yaml
+            kernel/                 Method-only (zero WAM coupling)
+              setup.py              extension name kept as qwan_extension._C
+              csrc/
+                pybind.cpp
+                act_quant_bf16.cu
+                w8a8_gemm_bf16.cu      scalar; Phase 26 deletes
+                w4a8_gemm_bf16.cu      scalar; Phase 26 deletes
+                quant_gemm_common.cuh  scalar; Phase 26 deletes
+                dispatch_utils.h
+                infra/                 Phase 24a verbatim ViDiT-Q headers
+                w8a8/                  Phase 24b verbatim ViDiT-Q W8A8 MMA
+                w4a8_qserve/           Phase 28 verbatim QServe W4A8
+                epilogue_dtype_traits.cuh  Phase 25 (OutT bf16+fp16)
+              qwan_extension/
+                __init__.py
+                bench_w8a8.py
+                bench_w4a8.py
+                check_qlinear.py
+                check_toy_mma.py     Phase 24a verify
+                bench_w8a8_fp16.py   Phase 24b verify
+                bench_w8a8_bf16.py   Phase 25 verify
+                bench_w4a8_bf16.py   Phase 28 verify
+                nn/
+                  base.py
+                  qlinear_w8a8.py
+                  qlinear_w4a8.py
+
+Add a WAM (per P3, copy template):
+  PTQEval/ptqeval/wam/<new_wam>/{server.py, eval_client.py, tasks.py,
+                                  launchers/, method/<existing methods>/...}
+
+Add a method (per P3, per existing WAM):
+  PTQEval/ptqeval/wam/<wam>/method/<new_method>/{ptq.py, loader.py,
+                                                  block.py, configs/, kernel/}
+
+
+25 INTERFACE DESIGN  (minimal; per P4)
+-------------------------------------------------------------------------------
+25.1 Loader contract  (per WAM x method)
+  # ptqeval/wam/<wam>/method/<method>/loader.py
+  def load_quant_model(wam_model_path: str,
+                       variant_args: dict,
+                       device: torch.device,
+                       dtype: torch.dtype) -> nn.Module: ...
+Resolution by the forked server:
+  importlib.import_module(
+      f"ptqeval.wam.{wam_name}.method.{method_name}.loader"
+  )
+
+25.2 perf_probe ABI unchanged from Section 3.1 (file moves only).
+25.3 aggregator entry unchanged from Section 3.4 (file moves only).
+25.4 Forked server keeps identical 5 probe stages and JSONL schema
+     (Section 3.1, 3.2).
+25.5 run_eval.sh env vars (replace prior CLI defaults):
+     WAM_NAME            required, e.g. "lingbot_va"
+     WAM_MODEL_PATH      required (absolute path to FP checkpoint dir)
+     ROBOTWIN_ROOT       required (absolute path to RoboTwin/ subrepo)
+     SAVE_ROOT           required (absolute path; default
+                         /home/arash/EvalForWAMs/results/<variant_tag>)
+     PERF_LOG_DIR        default ${SAVE_ROOT}/perf
+     VARIANT             optional ("viditq" or unset for bf16)
+     VARIANT_ARGS        optional, path to runtime_args_*.yaml
+
+25.6 tasks.py contract per WAM:
+     SELECTED_15_TASKS: list[str]
+     EVAL_STEP_LIMIT:   dict[str, int]
+     Shell launchers read these via:
+       python -c "from ptqeval.wam.<wam>.tasks import SELECTED_15_TASKS \
+                  as t; print(' '.join(t))"
+
+
+26 IMPLEMENTATION PHASES  (Migration; precedes Phase 24a)
+-------------------------------------------------------------------------------
+Phase M1: PTQEval skeleton
+Target  Create PTQEval/{pyproject.toml, ptqeval/__init__.py,
+        ptqeval/eval/__init__.py,
+        ptqeval/wam/__init__.py,
+        ptqeval/wam/lingbot_va/__init__.py,
+        ptqeval/wam/lingbot_va/method/__init__.py}.
+        pyproject.toml declares package ptqeval, editable install.
+Verify  pip install -e PTQEval/ succeeds in lingbot-jw.
+        python -c "import ptqeval" succeeds.
+
+Phase M2: Move method/viditq/kernel/
+Target  Copy lingbot-va/wan_va/quant/viditq/kernel/ verbatim to
+        PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/.
+        Extension name kept as qwan_extension._C; only the kernel/
+        directory location changes.
+Verify  pip install -e <new kernel dir>/ builds (sm_86).
+        bench_w8a8.py + bench_w4a8.py still pass numerical correctness
+        on scalar kernel.
+
+Phase M3: Move method/viditq/{ptq, configs, block, check_block, loader}
+Target  Copy + import-path adjust:
+          from wan_va.modules.model import WanTransformerBlock  (unchanged;
+            lingbot-va remains on sys.path)
+          from qwan_extension.nn import ...  (unchanged; kept by M2)
+        runtime_args_*.yaml absolute paths rewritten to PTQEval-relative.
+Verify  python -m ptqeval.wam.lingbot_va.method.viditq.ptq <args>
+        produces int_weights.pth byte-identical to pre-migration output.
+
+Phase M4: Move eval/{perf_probe, aggregator, monitor, run_eval}
+Target  Copy + import-path adjust. Replace hardcoded lingbot-va paths in
+        shell scripts with env-var lookups (Section 25.5). tasks.py
+        consumed via python -c invocation (Section 25.6).
+Verify  Smoke (1 task, test_num=1) from PTQEval produces summary.csv
+        functionally identical to pre-migration version (modulo
+        timestamps).
+
+Phase M5: Fork wam/lingbot_va/{server, eval_client, launchers}
+Target  Copy:
+          wan_va_server.py                 -> ptqeval/wam/lingbot_va/server.py
+          eval_polict_client_openpi.py     -> ptqeval/wam/lingbot_va/eval_client.py
+          launch_*.sh                      -> ptqeval/wam/lingbot_va/launchers/
+        Adjust imports:
+          wan_va.utils.perf_probe  -> ptqeval.eval.perf_probe
+          variant dispatch path    -> ptqeval.wam.<wam>.method.<m>.loader
+        server.py reads model path from WAM_MODEL_PATH env var (revert
+        va_robotwin_cfg.py to upstream).
+        eval_client.py reads RoboTwin root from ROBOTWIN_ROOT env var.
+        Launcher bash invokes:
+          python -m ptqeval.wam.lingbot_va.server <args>
+Verify  Smoke bf16 from PTQEval works.
+        Smoke --variant viditq from PTQEval works on scalar kernel.
+
+Phase M6: Restore lingbot-va working tree
+Target  In lingbot-va/, restore each modified upstream file or revert
+        manually using GIT_DIR=.git_orig git checkout HEAD -- <file>:
+          evaluation/robotwin/eval_polict_client_openpi.py
+          evaluation/robotwin/launch_server.sh
+          evaluation/robotwin/launch_server_multigpus.sh
+          wan_va/wan_va_server.py
+          wan_va/configs/va_robotwin_cfg.py    (revert; path moves to env)
+          wan_va/utils/__init__.py             (revert add of PerfProbe export)
+        Delete:
+          wan_va/quant/                        (entire subtree)
+          wan_va/utils/perf_probe.py
+          evaluation/robotwin/run_eval.sh
+          evaluation/robotwin/calc_perf_stat.py
+        Remove .bak files (the forked server.py in PTQEval is now the
+        authoritative diff source).
+Verify  cd lingbot-va && GIT_DIR=.git_orig git status --short
+        --untracked-files=all | grep -vE '^\?\? \.git_orig/'
+        is empty (modulo gitignored items).
+
+Phase M7: Doc + extensibility checklist
+Target  Append note to Section 15 (Part II extensibility): superseded
+        by Section 24 (PTQEval system structure) for any new method or
+        WAM.
+        Add PTQEval/README.md mirroring Section 24 layout and the
+        add-a-WAM / add-a-method conventions.
+Verify  README and plan cross-reference. Section 15 has the supersedence
+        note.
+
+Phase M8: Phase 24a in new location
+Target  Phase 24a target paths (Section 21) now resolve under
+        PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/csrc/infra/.
+        Subsequent Phases 24b-30 unchanged in intent; all paths shift
+        accordingly.
+Verify  toy_mma_int8_gemm test passes (zero error vs Python int32 ref).
+
+
+27 ACCEPTANCE  (Part IV)
+-------------------------------------------------------------------------------
+- lingbot-va/ working tree diff vs .git_orig: 0 modified files
+  (modulo gitignored items). No .bak files remaining (M6 cleanup).
+- RoboTwin/ working tree diff vs .git_orig: empty (=0.49.1 already in
+  repo-root .gitignore).
+- ViDiT-Q/ working tree diff vs .git_orig: empty (qdiff.egg-info,
+  __pycache__ are gitignored).
+- PTQEval/ runs full eval pipeline end-to-end without importing any
+  modified file from lingbot-va/. Only imports from lingbot-va/ are
+  from upstream-equivalent files (wan_va.modules.model.*, etc.).
+- Section 15 marked as superseded; PTQEval/README.md cross-references
+  Section 24.
+- Phase 24a target paths updated to PTQEval-relative; Phase 24b-30
+  paths shifted accordingly.
