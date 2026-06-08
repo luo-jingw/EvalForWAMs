@@ -1129,20 +1129,23 @@ File: lingbot-va/wan_va/quant/viditq/ptq.py
       weight_sym: bool,             # always False for Part III
   ) -> dict[str, IntLayerEntry]: ...
 
-Asymmetric per-channel formula (matches qdiff StaticQuantizer asym path):
+Asymmetric per-channel formula (matches ViDiT-Q DynamicQuantizer asym
+path, quant_utils/qdiff/base/base_quantizer.py:130-156):
   for each Linear, with weight W[C_out, C_in]:
-      x_max = W.max(dim=1)                          # [C_out]
-      x_min = W.min(dim=1)                          # [C_out]
+      x_max = W.amax(dim=1).clamp_min(0.0)          # [C_out], force >=0
+      x_min = W.amin(dim=1).clamp_max(0.0)          # [C_out], force <=0
       n_levels = 2**weight_bits
       delta = (x_max - x_min) / (n_levels - 1)      # scale, [C_out], fp32
-      zp_f  = round(x_min / delta) + (n_levels / 2) # [C_out], fp32
-      int_w = round(W / delta + zp_f)               # [C_out, C_in]
-      int_w = clamp(int_w - n_levels/2, -n_levels/2-1, n_levels/2)
-              .to(int8)                             # signed int8
-      # Notes:
+      zp    = round(x_min / delta) + (n_levels / 2) # [C_out], integer-valued fp32
+      int_w = round(W / delta) - zp                 # [C_out, C_in]
+      int_w = clamp(int_w, -n_levels/2, n_levels/2 - 1).to(int8)
+                                                    # [-128, 127] for w8;
+                                                    # [-8, 7] for w4 before packing.
+      # Storage:
       #   delta is stored as bf16 in scale_weight.
-      #   zp_f - n_levels/2 is stored as int16 in zp_weight to match
-      #   the kernel's short2 load.
+      #   zp    is stored as int16 in zp_weight (matches the kernel's short2 load).
+      # Algorithm matches the W8A8 kernel epilogue convention w_real =
+      # scale_w * (w_int + zp_w) verified in Phase 24b.
 For W4 case (n_levels = 16), additionally pack 2 nibbles per byte
   (low nibble = col 2c, high nibble = col 2c+1, signed).
 
