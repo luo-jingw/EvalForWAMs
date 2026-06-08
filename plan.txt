@@ -1351,17 +1351,23 @@ Verify  python -m qwan_extension.check_toy_mma: small shape (64x64x64
 Phase 24b: W8A8 fp16 verbatim port
 Target  Copy ViDiT-Q csrc/qgemm/w8a8/{gemm_utils.cuh, w8a8_gemm_cuda.cu}
         as-is (rename to gemm_utils.cuh + w8a8_gemm.cu under our tree).
-        Update only its #include paths to point to csrc/infra/. Expose
-        the ViDiT-Q host launcher w8a8_of_fp16_bias_weight_asym via
-        pybind under name w8a8_of_fp16_bias_weight_asym.
+        Update only its #include paths to point to ../infra/. Expose the
+        ViDiT-Q host launcher w8a8_of16_bias_weight_asym via pybind
+        under the same name.
 Add     csrc/w8a8/gemm_utils.cuh
         csrc/w8a8/w8a8_gemm.cu (verbatim, only header paths edited)
 Modify  csrc/pybind.cpp
         setup.py
 Verify  qwan_extension.bench_w8a8_fp16 (new bench script): for shapes
         (256, 3072, 3072), (256, 3072, 14336), (256, 14336, 3072),
-        kernel output vs naive Python ref using the same asym scheme
-        passes max abs error < 1e-2 (fp16 tol).
+        compare kernel output against the ViDiT-Q-reference asym formula
+        evaluated in fp32 on GPU
+        (output_ref = (F.linear(x_fp32, w_fp32) * scale_x * scale_w
+                       + input_sum * zp_weight * scale_w + bias).to(fp16))
+        and assert max relative error < 5e-3 (fp16 mantissa ~1e-3 noise
+        + final-cast 1-ULP rounding margin). Input distribution mirrors
+        ViDiT-Q bench_gemm.py (int8 in [-80, 80], scale_input mean ~0.01,
+        scale_weight mean ~0.15, bias ~200, zp_weight in [-10, 10]).
 
 Phase 24c: act_quant extension with sum_x
 Target  Implement Q10 act_quant_bf16_with_sum. Add a second block-wide

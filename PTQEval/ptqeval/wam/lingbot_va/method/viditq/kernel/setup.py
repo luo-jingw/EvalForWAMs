@@ -23,6 +23,7 @@ def _sources() -> list[str]:
         os.path.join(CSRC, "w8a8_gemm_bf16.cu"),
         os.path.join(CSRC, "w4a8_gemm_bf16.cu"),
         os.path.join(CSRC, "toy_mma_int8.cu"),
+        os.path.join(CSRC, "w8a8", "w8a8_gemm.cu"),
     ]
 
 

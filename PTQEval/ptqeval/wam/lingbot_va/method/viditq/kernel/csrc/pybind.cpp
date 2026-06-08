@@ -30,6 +30,17 @@ void toy_mma_int8_gemm(
     torch::Tensor c
 );
 
+// w8a8/w8a8_gemm.cu (verbatim port of ViDiT-Q w8a8_gemm_cuda.cu)
+torch::Tensor w8a8_of16_bias_weight_asym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight,
+    torch::Tensor sum_input,
+    torch::Tensor zp_weight
+);
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "qwan_extension: BF16-native int8/int4 GEMM kernels for LingBot-VA.";
@@ -70,4 +81,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("a"),
           py::arg("b"),
           py::arg("c"));
+
+    m.def("w8a8_of16_bias_weight_asym",
+          &w8a8_of16_bias_weight_asym,
+          "ViDiT-Q W8A8 GEMM (fp16 output, asymmetric weight, with bias).\n"
+          "Computes y[m,n] = scale_input[m] * scale_weight[n] *\n"
+          "  (sum_k(input_int8[m,k] * weight_int8[n,k])"
+          " - zp_weight[n] * sum_k(input_int8[m,k])) + bias[n].\n"
+          "Shapes: input [M,K] int8, weight [N,K] int8, bias [N] fp16,\n"
+          "  scale_input [M] fp16, scale_weight [N] fp16,\n"
+          "  sum_input [M] fp16 (= sum_k(input_int8[m,k]) cast to fp16),\n"
+          "  zp_weight [N] int16. Output [M,N] fp16.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("bias"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"),
+          py::arg("sum_input"),
+          py::arg("zp_weight"));
 }
