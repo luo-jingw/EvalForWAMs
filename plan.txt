@@ -1074,15 +1074,20 @@ Q6 quant_block_kernel  Unchanged.
 Q7 quant_server_loader Unchanged.
 Q8 viditq_loader       Key remap extends to include zp_weight.
 Q9 cross_ckpt_aggregator Unchanged.
-Q10 act_quant_with_sum NEW. Extension of act_quant_bf16. Per-token
-                       symmetric quant, plus one extra reduction:
-                       sum_x[n] = scale_x[n] * sum_k(x_int8[n,k]),
-                       stored as bf16 [N]. Used by asym epilogue.
-Q11 epilogue_dtype_traits NEW. C++ header. Specializations:
-                       DtypeTraits<__half> and DtypeTraits<__nv_bfloat16>.
-                       Provide packed2 type and three conversion intrinsics
-                       (to_float, to_float2, from_float2). The MMA-based
-                       kernel uses these in epilogue.
+Q10 act_quant_with_sum NEW. Verbatim port of ViDiT-Q csrc/fused/fused.cu
+                       QuantKernel + quant_sum host launcher. Extended
+                       via typename DType template + Q11 DtypeTraits to
+                       support bf16 in addition to ViDiT-Q's native fp16.
+                       SumType::kPostQuant path emits
+                       sum_x[n] = scale_x[n] * sum_k(x_int8[n,k]) per row.
+                       Used by asym epilogue.
+Q11 dtype_traits       NEW. C++ header at csrc/dtype_traits.cuh.
+                       Specializations: DtypeTraits<__half> and
+                       DtypeTraits<__nv_bfloat16>. Phase 24c uses
+                       Packed2 type + to_float, from_float_rn, habs
+                       intrinsics for the act_quant kernel; Phase 25
+                       extends with from_float2_rn for the GEMM
+                       epilogue. Shared across both kernels.
 
 17.2 State ownership (vs Section 9.2)
 - Weight zero-point (int16 per output channel) lives in
@@ -1369,18 +1374,42 @@ Verify  qwan_extension.bench_w8a8_fp16 (new bench script): for shapes
         ViDiT-Q bench_gemm.py (int8 in [-80, 80], scale_input mean ~0.01,
         scale_weight mean ~0.15, bias ~200, zp_weight in [-10, 10]).
 
-Phase 24c: act_quant extension with sum_x
-Target  Implement Q10 act_quant_bf16_with_sum. Add a second block-wide
-        reduction inside the existing per-row kernel: while quantizing,
-        accumulate sum_local = sum(x_dequant). After quant phase,
-        reduce to a single per-row value and store as bf16.
-Add     none (extend existing file)
-Modify  csrc/act_quant_bf16.cu
-        csrc/pybind.cpp
-        qwan_extension/__init__.py (export new name)
-Verify  Unit script: random bf16 input; check
-            sum_x[n] ~= scale_x[n] * sum_k(x_int8[n,k])
-        within bf16 noise (< 1e-3 relative).
+Phase 24c: Port ViDiT-Q quant_sum kernel + bf16 type extension
+Target  Port ViDiT-Q csrc/fused/fused.cu QuantKernel + quant_sum host
+        launcher verbatim into csrc/fused/fused.cu (header paths only:
+        ../X -> ../infra/X, same pattern as Phase 24b). Add Q11
+        csrc/dtype_traits.cuh with __half + __nv_bfloat16 specializations
+        (Packed2, to_float, from_float_rn, habs). Add typename DType as
+        first template parameter to QuantKernel; replace half-specific
+        intrinsics in the body with DtypeTraits<DType>:: calls. Add bf16
+        host launcher quant_sum_bf16 that instantiates
+        QuantKernel<__nv_bfloat16, ...>. The original fp16 launcher
+        quant_sum (instantiating QuantKernel<__half, ...>) preserves
+        ViDiT-Q's exact semantics as a regression reference.
+Add     csrc/fused/fused.cu  (verbatim from ViDiT-Q with header paths
+                              edited and typename DType templating)
+        csrc/dtype_traits.cuh
+        qwan_extension/bench_quant_sum.py
+Modify  csrc/pybind.cpp  (expose quant_sum + quant_sum_bf16)
+        setup.py  (add csrc/fused/fused.cu source)
+        qwan_extension/__init__.py  (export both names)
+Verify  bench_quant_sum.py covers both dtype paths:
+          - fp16: QuantKernel<__half, ...> output reproduces
+            (scale * x_fp32).sum(dim=1).to(fp16); assert max_rel < 1e-2
+          - bf16: QuantKernel<__nv_bfloat16, ...> output reproduces
+            (scale * x_fp32).sum(dim=1).to(bf16); assert max_rel < 1e-1
+        Looser bf16 bound is the joint floor of (i) bf16's 7-bit
+        mantissa (ULP ~ X/128 at magnitude X), and (ii) --use_fast_math
+        approximate fp32 division (kept verbatim from ViDiT-Q upstream
+        setup) which produces ~1 fp32 ULP divergence in
+        tmp_scale = 127/amax. Combined effect flips up to ~8 borderline
+        int8 values per row in bf16; worst-case sum_rel ~ 8/128 = 6.25%,
+        bound set to 1e-1 with ~2x margin.
+
+Note    Phase 25 reuses Q11 DtypeTraits established here (extends with
+        from_float2_rn for the GEMM epilogue). The scratch
+        csrc/act_quant_bf16.cu (written from scratch in pre-Part-III
+        work) remains in place until Phase 26 cleanup deletes it.
 
 Phase 24d: PTQ rewrite (asymmetric per-channel)
 Target  Implement Q2 with the asymmetric formula (Section 18.2).
@@ -1395,17 +1424,20 @@ Verify  Run ptq on adjust_bottle dummy (or real model with the new
         dtype is int16 with shape [C_out].
 
 Phase 25: Add OutT template + bf16 instantiation
-Target  Add csrc/epilogue_dtype_traits.cuh with __half and
-        __nv_bfloat16 specializations. Refactor the W8A8 kernel
-        signature to add typename OutT as the first template param.
-        Replace half-specific intrinsics in the epilogue with
-        DtypeTraits<OutT>:: calls. Add host launcher
+Target  Extend csrc/dtype_traits.cuh (added in Phase 24c) with
+        from_float2_rn for the GEMM epilogue (Packed2 already exists).
+        Refactor the W8A8 kernel signature to add typename OutT as the
+        first template param. Replace half-specific intrinsics in the
+        epilogue with DtypeTraits<OutT>:: calls. Add host launcher
         w8a8_of_bf16_bias_weight_asym (plus the no-bias and weight-sym
         variants for full faithfulness coverage).
-Add     csrc/epilogue_dtype_traits.cuh
-Modify  csrc/w8a8/w8a8_gemm.cu
+Add     none (csrc/dtype_traits.cuh exists from Phase 24c; extended
+              in place)
+Modify  csrc/dtype_traits.cuh
+        csrc/w8a8/w8a8_gemm.cu
         csrc/pybind.cpp
-Verify  qwan_extension.bench_w8a8_bf16: max abs err < 1e-2 vs naive ref.
+Verify  qwan_extension.bench_w8a8_bf16: max_rel < 5e-3 vs ViDiT-Q-style
+        bf16 reference (mirror of Phase 24b bench in bf16 domain).
         The fp16 launcher from Phase 24b still passes (regression check).
         Single-shape wall-clock vs torch.nn.functional.linear bf16 ratio
         recorded in the bench output.
@@ -1423,6 +1455,11 @@ Modify  qwan_extension/nn/base.py
 Delete  csrc/quant_gemm_common.cuh
         csrc/w8a8_gemm_bf16.cu
         csrc/w4a8_gemm_bf16.cu
+        csrc/act_quant_bf16.cu       (scratch bf16 act quant; superseded
+                                      by csrc/fused/fused.cu QuantKernel
+                                      <__nv_bfloat16> in Phase 24c)
+Also drop the corresponding act_quant_bf16 binding from csrc/pybind.cpp
+and the act_quant_bf16 export from qwan_extension/__init__.py.
 Verify  python -m qwan_extension.check_qlinear (existing script,
         regenerated against new state schema) passes W8A8 cases.
         python -m wan_va.quant.viditq.block.check_block W8A8 passes.

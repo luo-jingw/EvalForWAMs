@@ -12,10 +12,14 @@ from qwan_extension._C import (
     act_quant_bf16,
     w8a8_gemm_bf16,
     w4a8_gemm_bf16,
+    quant_sum,
+    quant_sum_bf16,
 )
 
 __all__ = [
     "act_quant_bf16",
     "w8a8_gemm_bf16",
     "w4a8_gemm_bf16",
+    "quant_sum",
+    "quant_sum_bf16",
 ]

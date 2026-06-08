@@ -41,6 +41,18 @@ torch::Tensor w8a8_of16_bias_weight_asym(
     torch::Tensor zp_weight
 );
 
+// fused/fused.cu (verbatim port of ViDiT-Q quant_sum + bf16 extension)
+torch::Tensor quant_sum(
+    torch::Tensor &input,
+    torch::Tensor &sum_output,
+    torch::Tensor &scaling
+);
+torch::Tensor quant_sum_bf16(
+    torch::Tensor &input,
+    torch::Tensor &sum_output,
+    torch::Tensor &scaling
+);
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "qwan_extension: BF16-native int8/int4 GEMM kernels for LingBot-VA.";
@@ -99,4 +111,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("scale_weight"),
           py::arg("sum_input"),
           py::arg("zp_weight"));
+
+    m.def("quant_sum",
+          &quant_sum,
+          "ViDiT-Q fp16 per-token symmetric quant with fused post-quant\n"
+          "row-sum. input [..., H] fp16; writes int8 output, fills\n"
+          "scaling [tokens] fp16 with max(|x|)/127 and sum_output [tokens]\n"
+          "fp16 with sum_k(scaling[m] * x_int8[m,k]). H <= 8192, must be\n"
+          "%128 (or %256 if H > 4096).",
+          py::arg("input"),
+          py::arg("sum_output"),
+          py::arg("scaling"));
+
+    m.def("quant_sum_bf16",
+          &quant_sum_bf16,
+          "bf16 instantiation of QuantKernel (Phase 24c extension).\n"
+          "Same semantics as quant_sum but consumes/produces bf16.",
+          py::arg("input"),
+          py::arg("sum_output"),
+          py::arg("scaling"));
 }
