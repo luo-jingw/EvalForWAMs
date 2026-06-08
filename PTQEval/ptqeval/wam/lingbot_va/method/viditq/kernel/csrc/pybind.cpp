@@ -23,6 +23,13 @@ torch::Tensor w4a8_gemm_bf16(
     c10::optional<torch::Tensor> bias_bf16
 );
 
+// toy_mma_int8.cu
+void toy_mma_int8_gemm(
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor c
+);
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "qwan_extension: BF16-native int8/int4 GEMM kernels for LingBot-VA.";
@@ -54,4 +61,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("w_int4_packed"),
           py::arg("scale_w_bf16"),
           py::arg("bias_bf16") = c10::nullopt);
+
+    m.def("toy_mma_int8_gemm",
+          &toy_mma_int8_gemm,
+          "Phase 24a toy: single-CTA m16n8k32 s8s8s32 MMA (correctness only).\n"
+          "a: int8 [16, 32], b: int8 [8, 32], c: int32 [16, 8]. Computes "
+          "c = a @ b.T.",
+          py::arg("a"),
+          py::arg("b"),
+          py::arg("c"));
 }

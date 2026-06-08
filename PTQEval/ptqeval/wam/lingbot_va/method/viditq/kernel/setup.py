@@ -13,6 +13,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 CSRC = os.path.join(THIS_DIR, "csrc")
+CSRC_INFRA = os.path.join(CSRC, "infra")
 
 
 def _sources() -> list[str]:
@@ -21,6 +22,7 @@ def _sources() -> list[str]:
         os.path.join(CSRC, "act_quant_bf16.cu"),
         os.path.join(CSRC, "w8a8_gemm_bf16.cu"),
         os.path.join(CSRC, "w4a8_gemm_bf16.cu"),
+        os.path.join(CSRC, "toy_mma_int8.cu"),
     ]
 
 
@@ -33,7 +35,7 @@ setup(
         CUDAExtension(
             name="qwan_extension._C",
             sources=_sources(),
-            include_dirs=[CSRC],
+            include_dirs=[CSRC, CSRC_INFRA],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": [
