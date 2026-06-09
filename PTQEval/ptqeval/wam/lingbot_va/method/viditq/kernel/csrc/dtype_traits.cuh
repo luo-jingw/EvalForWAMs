@@ -18,7 +18,8 @@
 //   }
 //
 // Phase 24c adds: Packed2, to_float, from_float_rn, habs (act_quant path).
-// Phase 25  adds: from_float2_rn for the GEMM epilogue.
+// Phase 25  adds: to_float2, from_float2_rn for the GEMM epilogue
+//                 (packed pair loads/stores of scale_B, sum_A, bias).
 
 #pragma once
 
@@ -38,8 +39,16 @@ struct DtypeTraits<__half> {
         return __half2float(v);
     }
 
+    static __device__ __forceinline__ float2 to_float2(__half2 v) {
+        return __half22float2(v);
+    }
+
     static __device__ __forceinline__ __half from_float_rn(float v) {
         return __float2half_rn(v);
+    }
+
+    static __device__ __forceinline__ __half2 from_float2_rn(float2 v) {
+        return __float22half2_rn(v);
     }
 
     static __device__ __forceinline__ __half habs(__half v) {
@@ -56,8 +65,16 @@ struct DtypeTraits<__nv_bfloat16> {
         return __bfloat162float(v);
     }
 
+    static __device__ __forceinline__ float2 to_float2(__nv_bfloat162 v) {
+        return __bfloat1622float2(v);
+    }
+
     static __device__ __forceinline__ __nv_bfloat16 from_float_rn(float v) {
         return __float2bfloat16_rn(v);
+    }
+
+    static __device__ __forceinline__ __nv_bfloat162 from_float2_rn(float2 v) {
+        return __float22bfloat162_rn(v);
     }
 
     static __device__ __forceinline__ __nv_bfloat16 habs(__nv_bfloat16 v) {

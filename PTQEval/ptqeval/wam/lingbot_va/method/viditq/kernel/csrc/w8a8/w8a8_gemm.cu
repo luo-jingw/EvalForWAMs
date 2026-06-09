@@ -1,4 +1,5 @@
 #include "../infra/utils.cuh"
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
 #include <torch/extension.h>
@@ -8,14 +9,18 @@
 #include "../infra/permuted_smem.cuh"
 #include "gemm_utils.cuh"
 
+// Phase 25: DtypeTraits abstracts fp16 / bf16 epilogue intrinsics so the
+// kernel templated on `typename OutT` can target both without code dup.
+#include "../dtype_traits.cuh"
+
 #define PACK_SIZE_C16 8 // how many elements a load/store 128b instruction can manage for C
 #define PACK_SIZE_C32 4
 
-template <uint32_t CTA_M, uint32_t CTA_N, uint32_t CTA_K, uint32_t WARP_M, uint32_t WARP_N, uint32_t CTA_STRIDE, OutputDtype output_dtype=OutputDtype::kFloat16, uint32_t K_STAGE=2, bool has_bias=false, bool weight_asym=false, ScaleMulMode scale_mul_mode=ScaleMulMode::kMode1>
+template <typename OutT = __half, uint32_t CTA_M, uint32_t CTA_N, uint32_t CTA_K, uint32_t WARP_M, uint32_t WARP_N, uint32_t CTA_STRIDE, OutputDtype output_dtype=OutputDtype::kFloat16, uint32_t K_STAGE=2, bool has_bias=false, bool weight_asym=false, ScaleMulMode scale_mul_mode=ScaleMulMode::kMode1>
 __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const int8_t *__restrict__ B,
-                              half *__restrict__ C16, int32_t *__restrict__ C32, const half __restrict__ *Bias, 
-                              const half *__restrict__ scale_A, const half *__restrict__ scale_B,
-                              const half *__restrict__ sum_A, const int16_t *__restrict__ zp_B,
+                              OutT *__restrict__ C16, int32_t *__restrict__ C32, const OutT *__restrict__ Bias,
+                              const OutT *__restrict__ scale_A, const OutT *__restrict__ scale_B,
+                              const OutT *__restrict__ sum_A, const int16_t *__restrict__ zp_B,
                               const int M, const int N, const int K)
 {
   static_assert(K_STAGE > 1);
@@ -79,7 +84,7 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
   // each warp loads a few rows for A
   const int8_t *A_warp_base_ptr = A + blockIdx_m * CTA_M * K + CTA_M / num_warps * warp_id * K;
   const int8_t *B_warp_base_ptr = B + blockIdx_n * CTA_N * K + CTA_N / num_warps * warp_id * K;
-  half *C16_warp_base_ptr = C16 + blockIdx_m * CTA_M * N + CTA_M / num_warps * warp_id * N + blockIdx_n * CTA_N;
+  OutT *C16_warp_base_ptr = C16 + blockIdx_m * CTA_M * N + CTA_M / num_warps * warp_id * N + blockIdx_n * CTA_N;
   int32_t *C32_warp_base_ptr = C32 + blockIdx_m * CTA_M * N + CTA_M / num_warps * warp_id * N + blockIdx_n * CTA_N;
 
   constexpr uint32_t global_to_shared_line_lanes = (AB_SMEM_STRIDE == 64) ? 4 : 8; // when loading from global to shared memory, how many lanes are used to load a line
@@ -391,15 +396,20 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
     tensor_core_mma<num_tiles_m, num_tiles_n>(RC, RA[reg_load_idx], RB[reg_load_idx]);
   }
 
-  // fp16 output
+  // fp16 / bf16 output (Phase 25: templated on OutT via DtypeTraits;
+  // the OutputDtype::kFloat16 enum name predates the bf16 extension
+  // and now covers both half + __nv_bfloat16 paths, dispatched by OutT.)
   if constexpr (output_dtype == OutputDtype::kFloat16)
   {
+    using Traits  = DtypeTraits<OutT>;
+    using Packed2 = typename Traits::Packed2;
+
     // not well optimized, but this part is not bottleneck
-    const half *scale_A_warp_ptr = scale_A + blockIdx_m * CTA_M + get_warp_idx_m<num_warps_m, num_warps_n>() * WARP_M;
-    const half *scale_B_warp_ptr = scale_B + blockIdx_n * CTA_N + get_warp_idx_n<num_warps_m, num_warps_n>() * WARP_N;
+    const OutT *scale_A_warp_ptr = scale_A + blockIdx_m * CTA_M + get_warp_idx_m<num_warps_m, num_warps_n>() * WARP_M;
+    const OutT *scale_B_warp_ptr = scale_B + blockIdx_n * CTA_N + get_warp_idx_n<num_warps_m, num_warps_n>() * WARP_N;
     const int16_t *zp_B_warp_ptr = zp_B + blockIdx_n * CTA_N + get_warp_idx_n<num_warps_m, num_warps_n>() * WARP_N;
-    const half *sum_a_warp_ptr = sum_A + blockIdx_m * CTA_M + get_warp_idx_m<num_warps_m, num_warps_n>() * WARP_M;
-    const half *bias_warp_ptr = Bias + blockIdx_n * CTA_N + get_warp_idx_n<num_warps_m, num_warps_n>() * WARP_N;
+    const OutT *sum_a_warp_ptr = sum_A + blockIdx_m * CTA_M + get_warp_idx_m<num_warps_m, num_warps_n>() * WARP_M;
+    const OutT *bias_warp_ptr = Bias + blockIdx_n * CTA_N + get_warp_idx_n<num_warps_m, num_warps_n>() * WARP_N;
 
     float a_scale = 1.0f;
     float2 b_scale = {1.0f, 1.0f};
@@ -413,8 +423,8 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
 #pragma unroll
       for (uint32_t j = 0; j < num_tiles_n; j++)
       {
-        a_scale = __half2float(*(scale_A_warp_ptr + i * MMA_M + lane_id / 4));
-        b_scale = __half22float2(*reinterpret_cast<const half2*>(scale_B_warp_ptr + j * MMA_N + 2 * (lane_id % 4)));
+        a_scale = Traits::to_float(*(scale_A_warp_ptr + i * MMA_M + lane_id / 4));
+        b_scale = Traits::to_float2(*reinterpret_cast<const Packed2*>(scale_B_warp_ptr + j * MMA_N + 2 * (lane_id % 4)));
         psums = make_float2(__int2float_rn(RC[i][j][0]), __int2float_rn(RC[i][j][1]));
         if constexpr (scale_mul_mode == ScaleMulMode::kMode1)
         {
@@ -428,20 +438,20 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
         }
         if constexpr (weight_asym)
         {
-          a_sum = __half2float(*(sum_a_warp_ptr + i * MMA_M + lane_id / 4));
+          a_sum = Traits::to_float(*(sum_a_warp_ptr + i * MMA_M + lane_id / 4));
           zp_b = *reinterpret_cast<const short2*>(zp_B_warp_ptr + j * MMA_N + 2 * (lane_id % 4));
           psums.x = psums.x + a_sum * static_cast<float>(zp_b.x) * b_scale.x;
           psums.y = psums.y + a_sum * static_cast<float>(zp_b.y) * b_scale.y;
         }
         if constexpr (has_bias)
         {
-          bias = __half22float2(*reinterpret_cast<const half2*>(bias_warp_ptr + j * MMA_N + 2 * (lane_id % 4)));
+          bias = Traits::to_float2(*reinterpret_cast<const Packed2*>(bias_warp_ptr + j * MMA_N + 2 * (lane_id % 4)));
           psums.x += bias.x;
           psums.y += bias.y;
         }
-        ((half2*)RC[i][j])[0] = __float22half2_rn(psums);
+        ((Packed2*)RC[i][j])[0] = Traits::from_float2_rn(psums);
         
-        a_scale = __half2float(*(scale_A_warp_ptr + i * MMA_M + lane_id / 4 + 8));
+        a_scale = Traits::to_float(*(scale_A_warp_ptr + i * MMA_M + lane_id / 4 + 8));
         psums = make_float2(__int2float_rn(RC[i][j][2]), __int2float_rn(RC[i][j][3]));
         if constexpr (scale_mul_mode == ScaleMulMode::kMode1)
         {
@@ -455,7 +465,7 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
         }
         if constexpr (weight_asym)
         {
-          a_sum = __half2float(*(sum_a_warp_ptr + i * MMA_M + lane_id / 4 + 8));
+          a_sum = Traits::to_float(*(sum_a_warp_ptr + i * MMA_M + lane_id / 4 + 8));
           psums.x = psums.x + a_sum * static_cast<float>(zp_b.x) * b_scale.x;
           psums.y = psums.y + a_sum * static_cast<float>(zp_b.y) * b_scale.y;
         }
@@ -464,10 +474,10 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
           psums.x += bias.x;
           psums.y += bias.y;
         }
-        ((half2*)RC[i][j])[2] = __float22half2_rn(psums);
+        ((Packed2*)RC[i][j])[2] = Traits::from_float2_rn(psums);
 
-        a_scale = __half2float(*(scale_A_warp_ptr + i * MMA_M + lane_id / 4));
-        b_scale = __half22float2(*reinterpret_cast<const half2*>(scale_B_warp_ptr + j * MMA_N + 2 * (lane_id % 4) + 8));
+        a_scale = Traits::to_float(*(scale_A_warp_ptr + i * MMA_M + lane_id / 4));
+        b_scale = Traits::to_float2(*reinterpret_cast<const Packed2*>(scale_B_warp_ptr + j * MMA_N + 2 * (lane_id % 4) + 8));
         psums = make_float2(__int2float_rn(RC[i][j][4]), __int2float_rn(RC[i][j][5]));
         if constexpr (scale_mul_mode == ScaleMulMode::kMode1)
         {
@@ -481,20 +491,20 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
         }
         if constexpr (weight_asym)
         {
-          a_sum = __half2float(*(sum_a_warp_ptr + i * MMA_M + lane_id / 4));
+          a_sum = Traits::to_float(*(sum_a_warp_ptr + i * MMA_M + lane_id / 4));
           zp_b = *reinterpret_cast<const short2*>(zp_B_warp_ptr + j * MMA_N + 2 * (lane_id % 4) + 8);
           psums.x = psums.x + a_sum * static_cast<float>(zp_b.x) * b_scale.x;
           psums.y = psums.y + a_sum * static_cast<float>(zp_b.y) * b_scale.y;
         }
         if constexpr (has_bias)
         {
-          bias = __half22float2(*reinterpret_cast<const half2*>(bias_warp_ptr + j * MMA_N + 2 * (lane_id % 4) + 8));
+          bias = Traits::to_float2(*reinterpret_cast<const Packed2*>(bias_warp_ptr + j * MMA_N + 2 * (lane_id % 4) + 8));
           psums.x += bias.x;
           psums.y += bias.y;
         }
-        ((half2*)RC[i][j])[4] = __float22half2_rn(psums);
+        ((Packed2*)RC[i][j])[4] = Traits::from_float2_rn(psums);
 
-        a_scale = __half2float(*(scale_A_warp_ptr + i * MMA_M + lane_id / 4 + 8));
+        a_scale = Traits::to_float(*(scale_A_warp_ptr + i * MMA_M + lane_id / 4 + 8));
         psums = make_float2(__int2float_rn(RC[i][j][6]), __int2float_rn(RC[i][j][7]));
         if constexpr (scale_mul_mode == ScaleMulMode::kMode1)
         {
@@ -508,7 +518,7 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
         }
         if constexpr (weight_asym)
         {
-          a_sum = __half2float(*(sum_a_warp_ptr + i * MMA_M + lane_id / 4 + 8));
+          a_sum = Traits::to_float(*(sum_a_warp_ptr + i * MMA_M + lane_id / 4 + 8));
           psums.x = psums.x + a_sum * static_cast<float>(zp_b.x) * b_scale.x;
           psums.y = psums.y + a_sum * static_cast<float>(zp_b.y) * b_scale.y;
         }
@@ -517,7 +527,7 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
           psums.x += bias.x;
           psums.y += bias.y;
         }
-        ((half2*)RC[i][j])[6] = __float22half2_rn(psums);
+        ((Packed2*)RC[i][j])[6] = Traits::from_float2_rn(psums);
       }
     }
 
@@ -545,7 +555,7 @@ __global__ void GemmInt8SharedRegPipelineV2(const int8_t *__restrict__ A, const 
 
     __syncthreads();
 
-    half *C_lane_ptr = C16_warp_base_ptr + lane_id / global_to_shared_line_lanes_C16 * N + lane_id % global_to_shared_line_lanes_C16 * PACK_SIZE_C16;
+    OutT *C_lane_ptr = C16_warp_base_ptr + lane_id / global_to_shared_line_lanes_C16 * N + lane_id % global_to_shared_line_lanes_C16 * PACK_SIZE_C16;
     uint32_t offset_C = smem_C16.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_C16 * C16_smem_iters_col + lane_id / global_to_shared_line_lanes_C16, lane_id % global_to_shared_line_lanes_C16);
 
 #pragma unroll
@@ -681,7 +691,7 @@ torch::Tensor w8a8_of16_bias_weight_asym(torch::Tensor input,
 
   size_t smem_max = std::max((CTA_M * CTA_K + CTA_N * CTA_K) * sizeof(int8_t) * K_STAGE, CTA_M * CTA_N * sizeof(half));
 
-  auto kernel_func = GemmInt8SharedRegPipelineV2<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kFloat16, K_STAGE, true, true>;
+  auto kernel_func = GemmInt8SharedRegPipelineV2<__half, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kFloat16, K_STAGE, true, true>;
 
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
@@ -754,7 +764,7 @@ torch::Tensor w8a8_of16_bias_weight_sym(torch::Tensor input,
 
   size_t smem_max = std::max((CTA_M * CTA_K + CTA_N * CTA_K) * sizeof(int8_t) * K_STAGE, CTA_M * CTA_N * sizeof(half));
 
-  auto kernel_func = GemmInt8SharedRegPipelineV2<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kFloat16, K_STAGE, true, false>;
+  auto kernel_func = GemmInt8SharedRegPipelineV2<__half, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kFloat16, K_STAGE, true, false>;
 
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
@@ -815,7 +825,7 @@ torch::Tensor w8a8_o32(torch::Tensor input,
 
   // std::cout<<"smem_max: "<<smem_max / 1024<<"kB"<<std::endl;
 
-  auto kernel_func = GemmInt8SharedRegPipelineV2<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kInt32, K_STAGE, false, false>;
+  auto kernel_func = GemmInt8SharedRegPipelineV2<__half, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kInt32, K_STAGE, false, false>;
 
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
@@ -830,6 +840,315 @@ torch::Tensor w8a8_o32(torch::Tensor input,
     nullptr,
     nullptr,
     nullptr,
+    nullptr,
+    nullptr,
+    M, N, K);
+
+  return output;
+}
+
+
+// ============================================================================
+// Phase 25: bf16 host launchers (instantiate GemmInt8SharedRegPipelineV2 with
+// OutT = __nv_bfloat16). Four shape combinations cover (with/without) bias
+// crossed with (asymmetric/symmetric) weight quant. All other template
+// parameters mirror the corresponding fp16 launcher above 1:1.
+// ============================================================================
+
+torch::Tensor w8a8_obf16_bias_weight_asym(torch::Tensor input,
+                      torch::Tensor weight,
+                      torch::Tensor bias,
+                      torch::Tensor scale_input,
+                      torch::Tensor scale_weight,
+                      torch::Tensor sum_input,
+                      torch::Tensor zp_weight)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(bias);
+  CHECK_CUDA(scale_input);
+  CHECK_CUDA(scale_weight);
+  CHECK_CUDA(sum_input);
+  CHECK_CUDA(zp_weight);
+
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(weight);
+  CHECK_CONTIGUOUS(bias);
+  CHECK_CONTIGUOUS(scale_input);
+  CHECK_CONTIGUOUS(scale_weight);
+  CHECK_CONTIGUOUS(sum_input);
+  CHECK_CONTIGUOUS(zp_weight);
+
+  CHECK_DTYPE(input, torch::kInt8);
+  CHECK_DTYPE(weight, torch::kInt8);
+  CHECK_DTYPE(bias, torch::kBFloat16);
+  CHECK_DTYPE(scale_input, torch::kBFloat16);
+  CHECK_DTYPE(scale_weight, torch::kBFloat16);
+  CHECK_DTYPE(sum_input, torch::kBFloat16);
+  CHECK_DTYPE(zp_weight, torch::kInt16);
+
+  const int M = input.size(0);
+  const int N = weight.size(0);
+  const int K = input.size(1);
+
+  CHECK_SHAPE(input, M, K);
+  CHECK_SHAPE(weight, N, K);
+  CHECK_SHAPE(bias, N);
+  CHECK_SHAPE(scale_input, M);
+  CHECK_SHAPE(scale_weight, N);
+  CHECK_SHAPE(sum_input, M);
+  CHECK_SHAPE(zp_weight, N);
+
+  at::Tensor output = torch::empty({input.size(0), weight.size(0)}, input.options().dtype(torch::kBFloat16));
+
+  const int CTA_M = 128;
+  const int CTA_N = 128;
+  const int CTA_K = 64;
+  constexpr int WARP_M = 128;
+  constexpr int WARP_N = 32;
+  constexpr int CTA_STRIDE = 1;
+  constexpr int K_STAGE = 3;
+
+  assert(M % CTA_M == 0);
+  assert(N % CTA_N == 0);
+  assert(K % CTA_K == 0);
+
+  size_t smem_max = std::max((CTA_M * CTA_K + CTA_N * CTA_K) * sizeof(int8_t) * K_STAGE, CTA_M * CTA_N * sizeof(__nv_bfloat16));
+
+  auto kernel_func = GemmInt8SharedRegPipelineV2<__nv_bfloat16, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kFloat16, K_STAGE, true, true>;
+
+  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+
+  dim3 grid(CTA_STRIDE, M / CTA_M, div_ceil(N / CTA_N, CTA_STRIDE));
+  dim3 block(32, (CTA_M / WARP_M) * (CTA_N / WARP_N));
+
+  kernel_func<<<grid, block, smem_max>>>(
+    input.data_ptr<int8_t>(),
+    weight.data_ptr<int8_t>(),
+    reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+    nullptr,
+    reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()),
+    reinterpret_cast<__nv_bfloat16*>(scale_input.data_ptr()),
+    reinterpret_cast<__nv_bfloat16*>(scale_weight.data_ptr()),
+    reinterpret_cast<__nv_bfloat16*>(sum_input.data_ptr()),
+    zp_weight.data_ptr<int16_t>(),
+    M, N, K);
+
+  return output;
+}
+
+
+torch::Tensor w8a8_obf16_bias_weight_sym(torch::Tensor input,
+                      torch::Tensor weight,
+                      torch::Tensor bias,
+                      torch::Tensor scale_input,
+                      torch::Tensor scale_weight)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(bias);
+  CHECK_CUDA(scale_input);
+  CHECK_CUDA(scale_weight);
+
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(weight);
+  CHECK_CONTIGUOUS(bias);
+  CHECK_CONTIGUOUS(scale_input);
+  CHECK_CONTIGUOUS(scale_weight);
+
+  CHECK_DTYPE(input, torch::kInt8);
+  CHECK_DTYPE(weight, torch::kInt8);
+  CHECK_DTYPE(bias, torch::kBFloat16);
+  CHECK_DTYPE(scale_input, torch::kBFloat16);
+  CHECK_DTYPE(scale_weight, torch::kBFloat16);
+
+  const int M = input.size(0);
+  const int N = weight.size(0);
+  const int K = input.size(1);
+
+  CHECK_SHAPE(input, M, K);
+  CHECK_SHAPE(weight, N, K);
+  CHECK_SHAPE(bias, N);
+  CHECK_SHAPE(scale_input, M);
+  CHECK_SHAPE(scale_weight, N);
+
+  at::Tensor output = torch::empty({input.size(0), weight.size(0)}, input.options().dtype(torch::kBFloat16));
+
+  const int CTA_M = 128;
+  const int CTA_N = 128;
+  const int CTA_K = 64;
+  constexpr int WARP_M = 128;
+  constexpr int WARP_N = 32;
+  constexpr int CTA_STRIDE = 1;
+  constexpr int K_STAGE = 3;
+
+  assert(M % CTA_M == 0);
+  assert(N % CTA_N == 0);
+  assert(K % CTA_K == 0);
+
+  size_t smem_max = std::max((CTA_M * CTA_K + CTA_N * CTA_K) * sizeof(int8_t) * K_STAGE, CTA_M * CTA_N * sizeof(__nv_bfloat16));
+
+  auto kernel_func = GemmInt8SharedRegPipelineV2<__nv_bfloat16, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kFloat16, K_STAGE, true, false>;
+
+  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+
+  dim3 grid(CTA_STRIDE, M / CTA_M, div_ceil(N / CTA_N, CTA_STRIDE));
+  dim3 block(32, (CTA_M / WARP_M) * (CTA_N / WARP_N));
+
+  kernel_func<<<grid, block, smem_max>>>(
+    input.data_ptr<int8_t>(),
+    weight.data_ptr<int8_t>(),
+    reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+    nullptr,
+    reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()),
+    reinterpret_cast<__nv_bfloat16*>(scale_input.data_ptr()),
+    reinterpret_cast<__nv_bfloat16*>(scale_weight.data_ptr()),
+    nullptr,
+    nullptr,
+    M, N, K);
+
+  return output;
+}
+
+
+torch::Tensor w8a8_obf16_nobias_weight_asym(torch::Tensor input,
+                      torch::Tensor weight,
+                      torch::Tensor scale_input,
+                      torch::Tensor scale_weight,
+                      torch::Tensor sum_input,
+                      torch::Tensor zp_weight)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(scale_input);
+  CHECK_CUDA(scale_weight);
+  CHECK_CUDA(sum_input);
+  CHECK_CUDA(zp_weight);
+
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(weight);
+  CHECK_CONTIGUOUS(scale_input);
+  CHECK_CONTIGUOUS(scale_weight);
+  CHECK_CONTIGUOUS(sum_input);
+  CHECK_CONTIGUOUS(zp_weight);
+
+  CHECK_DTYPE(input, torch::kInt8);
+  CHECK_DTYPE(weight, torch::kInt8);
+  CHECK_DTYPE(scale_input, torch::kBFloat16);
+  CHECK_DTYPE(scale_weight, torch::kBFloat16);
+  CHECK_DTYPE(sum_input, torch::kBFloat16);
+  CHECK_DTYPE(zp_weight, torch::kInt16);
+
+  const int M = input.size(0);
+  const int N = weight.size(0);
+  const int K = input.size(1);
+
+  CHECK_SHAPE(input, M, K);
+  CHECK_SHAPE(weight, N, K);
+  CHECK_SHAPE(scale_input, M);
+  CHECK_SHAPE(scale_weight, N);
+  CHECK_SHAPE(sum_input, M);
+  CHECK_SHAPE(zp_weight, N);
+
+  at::Tensor output = torch::empty({input.size(0), weight.size(0)}, input.options().dtype(torch::kBFloat16));
+
+  const int CTA_M = 128;
+  const int CTA_N = 128;
+  const int CTA_K = 64;
+  constexpr int WARP_M = 128;
+  constexpr int WARP_N = 32;
+  constexpr int CTA_STRIDE = 1;
+  constexpr int K_STAGE = 3;
+
+  assert(M % CTA_M == 0);
+  assert(N % CTA_N == 0);
+  assert(K % CTA_K == 0);
+
+  size_t smem_max = std::max((CTA_M * CTA_K + CTA_N * CTA_K) * sizeof(int8_t) * K_STAGE, CTA_M * CTA_N * sizeof(__nv_bfloat16));
+
+  auto kernel_func = GemmInt8SharedRegPipelineV2<__nv_bfloat16, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kFloat16, K_STAGE, false, true>;
+
+  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+
+  dim3 grid(CTA_STRIDE, M / CTA_M, div_ceil(N / CTA_N, CTA_STRIDE));
+  dim3 block(32, (CTA_M / WARP_M) * (CTA_N / WARP_N));
+
+  kernel_func<<<grid, block, smem_max>>>(
+    input.data_ptr<int8_t>(),
+    weight.data_ptr<int8_t>(),
+    reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+    nullptr,
+    nullptr,
+    reinterpret_cast<__nv_bfloat16*>(scale_input.data_ptr()),
+    reinterpret_cast<__nv_bfloat16*>(scale_weight.data_ptr()),
+    reinterpret_cast<__nv_bfloat16*>(sum_input.data_ptr()),
+    zp_weight.data_ptr<int16_t>(),
+    M, N, K);
+
+  return output;
+}
+
+
+torch::Tensor w8a8_obf16_nobias_weight_sym(torch::Tensor input,
+                      torch::Tensor weight,
+                      torch::Tensor scale_input,
+                      torch::Tensor scale_weight)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(scale_input);
+  CHECK_CUDA(scale_weight);
+
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(weight);
+  CHECK_CONTIGUOUS(scale_input);
+  CHECK_CONTIGUOUS(scale_weight);
+
+  CHECK_DTYPE(input, torch::kInt8);
+  CHECK_DTYPE(weight, torch::kInt8);
+  CHECK_DTYPE(scale_input, torch::kBFloat16);
+  CHECK_DTYPE(scale_weight, torch::kBFloat16);
+
+  const int M = input.size(0);
+  const int N = weight.size(0);
+  const int K = input.size(1);
+
+  CHECK_SHAPE(input, M, K);
+  CHECK_SHAPE(weight, N, K);
+  CHECK_SHAPE(scale_input, M);
+  CHECK_SHAPE(scale_weight, N);
+
+  at::Tensor output = torch::empty({input.size(0), weight.size(0)}, input.options().dtype(torch::kBFloat16));
+
+  const int CTA_M = 128;
+  const int CTA_N = 128;
+  const int CTA_K = 64;
+  constexpr int WARP_M = 128;
+  constexpr int WARP_N = 32;
+  constexpr int CTA_STRIDE = 1;
+  constexpr int K_STAGE = 3;
+
+  assert(M % CTA_M == 0);
+  assert(N % CTA_N == 0);
+  assert(K % CTA_K == 0);
+
+  size_t smem_max = std::max((CTA_M * CTA_K + CTA_N * CTA_K) * sizeof(int8_t) * K_STAGE, CTA_M * CTA_N * sizeof(__nv_bfloat16));
+
+  auto kernel_func = GemmInt8SharedRegPipelineV2<__nv_bfloat16, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, CTA_STRIDE, OutputDtype::kFloat16, K_STAGE, false, false>;
+
+  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+
+  dim3 grid(CTA_STRIDE, M / CTA_M, div_ceil(N / CTA_N, CTA_STRIDE));
+  dim3 block(32, (CTA_M / WARP_M) * (CTA_N / WARP_N));
+
+  kernel_func<<<grid, block, smem_max>>>(
+    input.data_ptr<int8_t>(),
+    weight.data_ptr<int8_t>(),
+    reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+    nullptr,
+    nullptr,
+    reinterpret_cast<__nv_bfloat16*>(scale_input.data_ptr()),
+    reinterpret_cast<__nv_bfloat16*>(scale_weight.data_ptr()),
     nullptr,
     nullptr,
     M, N, K);

@@ -1439,8 +1439,12 @@ Add     none (csrc/dtype_traits.cuh exists from Phase 24c; extended
 Modify  csrc/dtype_traits.cuh
         csrc/w8a8/w8a8_gemm.cu
         csrc/pybind.cpp
-Verify  qwan_extension.bench_w8a8_bf16: max_rel < 5e-3 vs ViDiT-Q-style
+Verify  qwan_extension.bench_w8a8_bf16: max_rel < 1e-2 vs ViDiT-Q-style
         bf16 reference (mirror of Phase 24b bench in bf16 domain).
+        Looser bound vs Phase 24b's 5e-3 reflects bf16's 7-bit mantissa:
+        the final fp32->bf16 cast produces ~1 ULP per output element,
+        which at LingBot-VA output magnitudes (10-500) gives worst-case
+        rel error around 7e-3; 1e-2 keeps a ~30% margin.
         The fp16 launcher from Phase 24b still passes (regression check).
         Single-shape wall-clock vs torch.nn.functional.linear bf16 ratio
         recorded in the bench output.

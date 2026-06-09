@@ -41,6 +41,38 @@ torch::Tensor w8a8_of16_bias_weight_asym(
     torch::Tensor zp_weight
 );
 
+// Phase 25 bf16 instantiations of the same kernel via OutT template.
+torch::Tensor w8a8_obf16_bias_weight_asym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight,
+    torch::Tensor sum_input,
+    torch::Tensor zp_weight
+);
+torch::Tensor w8a8_obf16_bias_weight_sym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight
+);
+torch::Tensor w8a8_obf16_nobias_weight_asym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight,
+    torch::Tensor sum_input,
+    torch::Tensor zp_weight
+);
+torch::Tensor w8a8_obf16_nobias_weight_sym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight
+);
+
 // fused/fused.cu (verbatim port of ViDiT-Q quant_sum + bf16 extension)
 torch::Tensor quant_sum(
     torch::Tensor &input,
@@ -130,4 +162,44 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("input"),
           py::arg("sum_output"),
           py::arg("scaling"));
+
+    // Phase 25: bf16-output W8A8 launchers. Same kernel, OutT=__nv_bfloat16.
+    m.def("w8a8_obf16_bias_weight_asym",
+          &w8a8_obf16_bias_weight_asym,
+          "W8A8 GEMM with bf16 output, asym weight, with bias.\n"
+          "Mirrors w8a8_of16_bias_weight_asym in bf16 domain.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("bias"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"),
+          py::arg("sum_input"),
+          py::arg("zp_weight"));
+
+    m.def("w8a8_obf16_bias_weight_sym",
+          &w8a8_obf16_bias_weight_sym,
+          "W8A8 GEMM with bf16 output, sym weight, with bias.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("bias"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"));
+
+    m.def("w8a8_obf16_nobias_weight_asym",
+          &w8a8_obf16_nobias_weight_asym,
+          "W8A8 GEMM with bf16 output, asym weight, no bias.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"),
+          py::arg("sum_input"),
+          py::arg("zp_weight"));
+
+    m.def("w8a8_obf16_nobias_weight_sym",
+          &w8a8_obf16_nobias_weight_sym,
+          "W8A8 GEMM with bf16 output, sym weight, no bias.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"));
 }
