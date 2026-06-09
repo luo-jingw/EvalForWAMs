@@ -3,7 +3,7 @@
 
 Implements the loader contract:
 
-    load_quant_model(wam_model_path, variant_args, device, dtype) -> nn.Module
+    load_quant_model(wan_model_path, variant_args, device, dtype) -> nn.Module
 
 variant_args schema (yaml form, OmegaConf-loaded by the server then handed
 in as a plain dict):
@@ -60,7 +60,7 @@ _WEIGHT_BITS_TO_CLS: dict[int, type[QuantWanLinearBase]] = {
 
 
 def load_quant_model(
-    wam_model_path: str,
+    wan_model_path: str,
     variant_args: dict[str, Any],
     device: torch.device,
     dtype: torch.dtype,
@@ -74,16 +74,25 @@ def load_quant_model(
 
     layer_cfg = OmegaConf.load(layer_config_path)
     weight_bits = int(layer_cfg.weight_bits)
+    # Phase 26a-2: W4A8 path is being rebuilt against the ViDiT-Q QServe
+    # port; the old scratch W4A8 wrapper is incompatible with the
+    # post-24d asym int_weights schema. Phase 28 restores W4A8.
+    if weight_bits == 4:
+        raise NotImplementedError(
+            "W4A8 path is being rebuilt; not available between Phase 26a "
+            "and Phase 28. Run a W8A8 config instead, or wait for "
+            "Phase 28's w4a8_obf16_* launchers."
+        )
     if weight_bits not in _WEIGHT_BITS_TO_CLS:
         raise ValueError(f"weight_bits must be 8 or 4, got {weight_bits}")
     quant_linear_cls = _WEIGHT_BITS_TO_CLS[weight_bits]
 
     logger.info(
-        f"loading FP transformer from {wam_model_path} "
+        f"loading FP transformer from {wan_model_path} "
         f"(dtype={dtype}, device={device}, weight_bits={weight_bits})"
     )
     model = load_transformer(
-        wam_model_path,
+        wan_model_path,
         torch_dtype=dtype,
         torch_device=device,
         attn_mode="torch",

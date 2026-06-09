@@ -15,6 +15,11 @@ from qwan_extension._C import (
     w4a8_gemm_bf16,
     quant_sum,
     quant_sum_bf16,
+    w8a8_of16_bias_weight_asym,
+    w8a8_obf16_bias_weight_asym,
+    w8a8_obf16_bias_weight_sym,
+    w8a8_obf16_nobias_weight_asym,
+    w8a8_obf16_nobias_weight_sym,
 )
 
 __all__ = [
@@ -24,4 +29,9 @@ __all__ = [
     "w4a8_gemm_bf16",
     "quant_sum",
     "quant_sum_bf16",
+    "w8a8_of16_bias_weight_asym",
+    "w8a8_obf16_bias_weight_asym",
+    "w8a8_obf16_bias_weight_sym",
+    "w8a8_obf16_nobias_weight_asym",
+    "w8a8_obf16_nobias_weight_sym",
 ]

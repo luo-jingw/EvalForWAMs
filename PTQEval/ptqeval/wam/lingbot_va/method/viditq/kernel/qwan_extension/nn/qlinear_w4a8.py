@@ -1,10 +1,16 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 """W4A8 kernel-backed Linear.
 
+Status (Phase 26a-2): scratch sym path retained for source compatibility;
+Phase 26b deletes this file. Phase 28 will rebuild W4A8 against the
+ViDiT-Q QServe port (w4a8_obf16_* launchers). Loader raises before
+reaching this class during 26a; check_qlinear still exercises it via
+direct from_fp_linear -> forward.
+
 Weight: per-channel symmetric INT4 (qmax=7), packed two nibbles per int8
 byte (low nibble -> col 2c, high nibble -> col 2c+1, both signed).
-Activation: per-token symmetric INT8 (qmax=127), computed online by
-qwan_extension.act_quant_bf16.
+Activation: per-token symmetric INT8 (qmax=127); sum_x emitted by
+act_quant_bf16_with_sum is accepted but ignored by the scratch sym GEMM.
 """
 from __future__ import annotations
 
@@ -44,6 +50,7 @@ class QuantWanLinearW4A8(QuantWanLinearBase):
         self,
         x_int8: torch.Tensor,
         scale_x_bf16: torch.Tensor,
+        sum_x_bf16: torch.Tensor,  # ignored: scratch GEMM is sym, no asym term
     ) -> torch.Tensor:
         return w4a8_gemm_bf16(
             x_int8,
