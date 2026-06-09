@@ -4,6 +4,8 @@
 
 // act_quant_bf16.cu
 std::tuple<torch::Tensor, torch::Tensor> act_quant_bf16(torch::Tensor x_bf16);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+    act_quant_bf16_with_sum(torch::Tensor x_bf16);
 
 // w8a8_gemm_bf16.cu
 torch::Tensor w8a8_gemm_bf16(
@@ -93,6 +95,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &act_quant_bf16,
           "Per-token symmetric BF16 -> INT8 activation quant.\n"
           "Input: x_bf16 [N, K]. Output: (x_int8 [N, K], scale_x_bf16 [N]).",
+          py::arg("x_bf16"));
+
+    m.def("act_quant_bf16_with_sum",
+          &act_quant_bf16_with_sum,
+          "Per-token sym quant + fused post-quant sum_x (Phase 26a-1).\n"
+          "Input:  x_bf16 [N, K].\n"
+          "Output: (x_int8 [N, K], scale_x_bf16 [N], sum_x_bf16 [N]).\n"
+          "sum_x[n] = scale_x[n] * sum_k(x_int8[n, k]) cast bf16.\n"
+          "Same algorithm as ViDiT-Q QuantKernel<bf16, _, kPostQuant>;\n"
+          "grid-stride structure handles arbitrary K (no <=8192 cap).",
           py::arg("x_bf16"));
 
     m.def("w8a8_gemm_bf16",

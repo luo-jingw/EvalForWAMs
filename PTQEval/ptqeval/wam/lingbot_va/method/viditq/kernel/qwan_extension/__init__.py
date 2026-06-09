@@ -10,6 +10,7 @@ import torch  # noqa: F401
 
 from qwan_extension._C import (
     act_quant_bf16,
+    act_quant_bf16_with_sum,
     w8a8_gemm_bf16,
     w4a8_gemm_bf16,
     quant_sum,
@@ -18,6 +19,7 @@ from qwan_extension._C import (
 
 __all__ = [
     "act_quant_bf16",
+    "act_quant_bf16_with_sum",
     "w8a8_gemm_bf16",
     "w4a8_gemm_bf16",
     "quant_sum",
