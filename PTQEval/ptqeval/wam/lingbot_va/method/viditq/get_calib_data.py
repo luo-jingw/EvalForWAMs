@@ -54,7 +54,28 @@ PERIODIC_DUMP_INTERVAL: int = 100   # hook invocations between safety dumps
 class _CalibState:
     def __init__(self, out_path: str) -> None:
         self.out_path = out_path
-        self.absmax: dict[str, torch.Tensor] = {}      # bf16 CPU
+        # Load existing dump if present so sequential calib runs across
+        # multiple tasks accumulate via running max instead of overwriting.
+        # Safe with single-server sequential invocation (e.g. a bash loop
+        # over SELECTED_15_TASKS); NOT safe with pool-mode parallel runs
+        # (multiple servers writing same path = race condition).
+        if os.path.exists(out_path):
+            try:
+                self.absmax: dict[str, torch.Tensor] = torch.load(
+                    out_path, weights_only=True, map_location="cpu"
+                )
+                logger.info(
+                    f"calib resume: loaded existing dump ({len(self.absmax)} layers) "
+                    f"from {out_path}; new stats will be max-merged in place."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"calib resume: failed to load existing dump from {out_path} "
+                    f"({e}); starting fresh."
+                )
+                self.absmax = {}
+        else:
+            self.absmax = {}
         self.call_count = 0
         self.handles: list[torch.utils.hooks.RemovableHandle] = []
 

@@ -30,7 +30,7 @@ from ptqeval.wam.lingbot_va.method.viditq.quarot import (
     random_sign_vector,
     rotate_weight,
 )
-from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_channel_mask
+from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_smooth_scale
 
 
 def _per_channel_asym_quant_w(w_f32: torch.Tensor):
@@ -69,20 +69,25 @@ def _kernel_dequant_ref(
     return y_2d.reshape(*x_preprocessed.shape[:-1], out_features).to(torch.bfloat16)
 
 
-def _build_wrapper(W_preprocessed: torch.Tensor, bias_bf16, device,
+def _build_wrapper(W_preprocessed_f32: torch.Tensor, bias_bf16, device,
                    smooth_mask=None, quarot_sign=None) -> QuantWanLinearW8A8:
-    """Build a QuantWanLinearW8A8 by feeding the preprocessed weight to
-    from_fp_linear (so int_weight, scale_weight, zp_weight are derived
-    from the PTQ-time-preprocessed W). Then install the matching runtime
-    buffers."""
-    out_f, in_f = W_preprocessed.shape
+    """Build a QuantWanLinearW8A8 by directly quantizing W_preprocessed_f32
+    (fp32) -- matching ptq.py exactly. Going through nn.Linear.weight
+    would force a bf16 cast that smooths over the fine-grained values
+    introduced by SmoothQuant rescale / QuaRoT rotation, producing a
+    different int_weight than ptq.py would emit. We replicate ptq.py's
+    code path here so the wrapper-vs-ref test isolates the FORWARD
+    plumbing, not the PTQ-time precision."""
+    out_f, in_f = W_preprocessed_f32.shape
     has_bias = bias_bf16 is not None
-    fp_proxy = nn.Linear(in_f, out_f, bias=has_bias).to(device).to(torch.bfloat16)
-    with torch.no_grad():
-        fp_proxy.weight.copy_(W_preprocessed.to(torch.bfloat16))
-        if has_bias:
-            fp_proxy.bias.copy_(bias_bf16)
-    mod = QuantWanLinearW8A8.from_fp_linear(fp_proxy).to(device)
+
+    mod = QuantWanLinearW8A8(in_f, out_f, has_bias=has_bias).to(device)
+    w_int, scale_eff, zp = _per_channel_asym_quant_w(W_preprocessed_f32)
+    mod.int_weight = w_int.to(torch.int8).to(device).contiguous()
+    mod.scale_weight = scale_eff.to(torch.bfloat16).to(device).contiguous()
+    mod.zp_weight = zp.to(torch.int16).to(device).contiguous()
+    if has_bias:
+        mod.bias = bias_bf16.to(device).contiguous()
     if smooth_mask is not None:
         mod.act_channel_div = smooth_mask.to(device, torch.bfloat16).contiguous()
     if quarot_sign is not None:
@@ -113,7 +118,7 @@ def _check_one(name: str, variant: str,
         # Synthetic act_absmax: take from the actual x (worst-case proxy).
         act_absmax = x.reshape(-1, in_features).abs().amax(dim=0).to(torch.float32)
         weight_absmax = fp.weight.detach().to(torch.float32).abs().amax(dim=0)
-        smooth_mask = compute_channel_mask(weight_absmax, act_absmax, alpha=0.99)
+        smooth_mask = compute_smooth_scale(weight_absmax, act_absmax, alpha=0.99)
     if "quarot" in variant or variant == "viditq":
         quarot_sign = random_sign_vector(in_features, seed=seed + 100).to(device)
 

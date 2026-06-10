@@ -208,7 +208,7 @@ def compute_int_state_dict(
     first, then rotate, then quant.
     """
     from ptqeval.wam.lingbot_va.method.viditq.quarot import random_sign_vector
-    from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_channel_mask
+    from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_smooth_scale
 
     if smooth_quant_enabled and calib_data is None:
         raise ValueError(
@@ -241,7 +241,17 @@ def compute_int_state_dict(
                 weight_absmax = (
                     module.weight.detach().to(torch.float32).abs().amax(dim=0)
                 )
-                smooth_mask = compute_channel_mask(
+                # smooth_quant.compute_smooth_scale returns the canonical
+                # SmoothQuant s in fp32 [C_in]. The runtime buffer in
+                # base.py is named act_channel_div precisely because s
+                # acts as a divisor on x. Bug history: an earlier draft
+                # used the inverted upstream channel_mask formula here,
+                # which preserves the unquantized round-trip but flips
+                # the post-quant effect -- it AMPLIFIES outlier
+                # activations instead of suppressing them. compute_
+                # smooth_scale's name + docstring exist to make the
+                # convention unambiguous.
+                smooth_mask = compute_smooth_scale(
                     weight_absmax, act_absmax, smooth_alpha
                 )
 
