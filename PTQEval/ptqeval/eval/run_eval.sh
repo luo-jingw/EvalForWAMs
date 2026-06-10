@@ -38,6 +38,7 @@ WAM_MODEL_PATH="${WAM_MODEL_PATH:-/home/arash/EvalForWAMs/models/lingbot-va-post
 ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/home/arash/EvalForWAMs/RoboTwin}"
 VARIANT="${VARIANT:-}"
 VARIANT_ARGS="${VARIANT_ARGS:-}"
+CALIBRATE_OUT="${CALIBRATE_OUT:-}"
 SERVER_ENV="${SERVER_ENV:-lingbot-jw}"
 CLIENT_ENV="${CLIENT_ENV:-RoboTwin-jw}"
 
