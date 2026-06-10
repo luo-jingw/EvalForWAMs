@@ -11,10 +11,20 @@ state_dict keys (Phase 26a-2, asym per-channel weight schema):
     scale_weight bf16  [C_out]
     zp_weight    int16 [C_out]
     bias         bf16  [C_out]               (omitted when has_bias=False)
+
+Optional Part VI preprocessing buffers (default empty -> no-op):
+    quarot_sign  int8  [C_in]                (Phase 37 QuaRoT sign vector;
+                                              triggers Hadamard rotation
+                                              of x before quant)
+    act_channel_div bf16 [C_in]              (Phase 36 SmoothQuant
+                                              channel_mask; triggers per-
+                                              channel division of x
+                                              before rotation/quant)
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -68,6 +78,17 @@ class QuantWanLinearBase(nn.Module, ABC):
             # Register as None so state_dict does not contain a 'bias' key.
             self.bias = None
 
+        # Part VI optional preprocessing tensors. Default: None -> forward
+        # path skips them. Loader.install_preprocessing_buffer() registers
+        # them as proper buffers after load_state_dict, ONLY for layers
+        # whose ckpt actually contains the matching key. This keeps
+        # state_dict size unchanged for Phase 27 baseline ckpts and avoids
+        # the size-mismatch error that would arise from registering an
+        # empty placeholder buffer (load_state_dict strict=False still
+        # raises on shape mismatch, only ignores missing keys).
+        self.act_channel_div: Optional[torch.Tensor] = None
+        self.quarot_sign: Optional[torch.Tensor] = None
+
     @staticmethod
     @abstractmethod
     def _packed_in_features(in_features: int) -> int: ...
@@ -89,11 +110,33 @@ class QuantWanLinearBase(nn.Module, ABC):
     _CTA_M: int = 128
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: bf16 with last-dim == in_features. Returns bf16 [..., out_features]."""
+        """x: bf16 with last-dim == in_features. Returns bf16 [..., out_features].
+
+        Optional Part VI preprocessing runs in this order BEFORE quant:
+          1. SmoothQuant: x <- x / act_channel_div  (per-channel division)
+          2. QuaRoT:      x <- (x * quarot_sign) @ H / sqrt(C_in)
+        Both no-op when the corresponding buffer is empty (Phase 27 ckpt).
+        Order matches ViDiT-Q viditq_quant_layer.py:62-63 (smooth before
+        rotation). M-padding for CTA_M alignment happens AFTER the
+        preprocessing so the padded rows do not contaminate the
+        preprocessing statistics.
+        """
         if x.dtype != torch.bfloat16:
             x = x.to(torch.bfloat16)
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.in_features).contiguous()
+
+        # Part VI preprocessing (no-op when buffers are absent).
+        if self.act_channel_div is not None:
+            x_2d = x_2d / self.act_channel_div
+        if self.quarot_sign is not None:
+            # Lazy import: quarot lives in ptqeval (the method package),
+            # while base.py lives in qwan_extension (the kernel package).
+            # Top-level import would create a cycle at module load time
+            # because loader.py in ptqeval imports from qwan_extension.nn.
+            from ptqeval.wam.lingbot_va.method.viditq.quarot import apply_input_rotation
+            x_2d = apply_input_rotation(x_2d, self.quarot_sign).contiguous()
+
         M = x_2d.shape[0]
         M_pad = (M + self._CTA_M - 1) // self._CTA_M * self._CTA_M
         if M_pad != M:

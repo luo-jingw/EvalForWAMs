@@ -8,6 +8,18 @@ DynamicQuantizer asym path, lines 130-156). For weight_bits=4 the weight
 is further packed two nibbles per byte (low nibble -> col 2c, high
 nibble -> col 2c+1, both signed).
 
+Phase 37 extension (--quarot): when layer_config.quarot is true, each
+target Linear gets a per-Linear random sign vector s in {+-1}^C_in
+(seed = quarot_seed_base + layer_index for determinism). The weight is
+rotated W_rot = (W * s) @ H / sqrt(C_in) via the structured Hadamard
+in quarot.py BEFORE per-channel asym quant. The sign vector is emitted
+as quarot_sign in the state_dict so the runtime wrapper can apply the
+matching rotation to its activation input. Math identity (orthogonal H):
+   y = x @ W.T == (x_rot) @ (W_rot).T   (un-quantized round-trip),
+so the rotation is loss-free when nothing is quantized; the benefit
+shows up after quantization because the rotation decorrelates outliers
+and lets per-channel scales fit a tighter range.
+
 Per output channel c, with weight W[c, :] (length C_in):
     x_max = max(W[c, :], 0)                              # clamp_min to 0
     x_min = min(W[c, :], 0)                              # clamp_max to 0
@@ -21,11 +33,13 @@ verified). Plan section 18.2's written formula has a typo; the formula
 implemented here is from ViDiT-Q upstream directly and is the
 authoritative one.
 
-Output: flat torch state_dict via torch.save. 4 keys per quantized layer:
+Output: flat torch state_dict via torch.save. Up to 5 keys per quantized
+layer (Phase 37+):
     <module_name>.int_weight     int8  [C_out, C_in] or [C_out, C_in/2]
     <module_name>.scale_weight   bf16  [C_out]
     <module_name>.zp_weight      int16 [C_out]
     <module_name>.bias           bf16  [C_out]   (omitted if absent)
+    <module_name>.quarot_sign    int8  [C_in]    (only when --quarot)
 
 CLI:
     python -m ptqeval.wam.lingbot_va.method.viditq.ptq \\
@@ -61,6 +75,7 @@ class IntLayerEntry:
     scale_weight: torch.Tensor    # bf16 [C_out]
     zp_weight: torch.Tensor       # int16 [C_out]
     bias: Optional[torch.Tensor]  # bf16 [C_out] or None
+    quarot_sign: Optional[torch.Tensor] = None  # int8 [C_in] or None
 
 
 def _per_channel_asym_quant(
@@ -115,19 +130,36 @@ def _pack_int4_two_per_byte(w_int4: torch.Tensor) -> torch.Tensor:
     return packed_u.to(torch.uint8).view(torch.int8).contiguous()
 
 
-def _quantize_one(linear: nn.Linear, weight_bits: int) -> IntLayerEntry:
-    """Pure-tensor asym quantize of a single nn.Linear. Bias copied as bf16."""
+def _quantize_one(
+    linear: nn.Linear,
+    weight_bits: int,
+    quarot_sign: Optional[torch.Tensor] = None,
+) -> IntLayerEntry:
+    """Pure-tensor asym quantize of a single nn.Linear. Bias copied as bf16.
+
+    If quarot_sign is provided ([C_in] int8 in {+-1}), the weight is
+    rotated via Phase 37 QuaRoT (W_rot = (W * sign) @ H / sqrt(C_in))
+    BEFORE per-channel asym quant. The sign vector is stored alongside
+    the quantized tensors so the runtime wrapper can rotate its input
+    by the same transform.
+    """
+    from ptqeval.wam.lingbot_va.method.viditq.quarot import rotate_weight
+
     w_f32 = linear.weight.detach().to(torch.float32)
+    if quarot_sign is not None:
+        w_f32 = rotate_weight(w_f32, quarot_sign.to(w_f32.device))
     int_w, scale_w, zp_w = _per_channel_asym_quant(w_f32, weight_bits)
     if weight_bits == 4:
         int_w = _pack_int4_two_per_byte(int_w)
     bias = (linear.bias.detach().to(torch.bfloat16).contiguous()
             if linear.bias is not None else None)
+    quarot_out = quarot_sign.detach().to(torch.int8).contiguous() if quarot_sign is not None else None
     return IntLayerEntry(
         int_weight=int_w.contiguous(),
         scale_weight=scale_w.contiguous(),
         zp_weight=zp_w.contiguous(),
         bias=bias,
+        quarot_sign=quarot_out,
     )
 
 
@@ -135,18 +167,36 @@ def compute_int_state_dict(
     model: nn.Module,
     remain_fp_regex: str,
     weight_bits: int,
+    quarot_enabled: bool = False,
+    quarot_seed_base: int = 0,
 ) -> dict[str, IntLayerEntry]:
     """Walk model. For every nn.Linear whose full name does NOT match
-    remain_fp_regex, compute its IntLayerEntry."""
+    remain_fp_regex, compute its IntLayerEntry.
+
+    Phase 37: when quarot_enabled, each target Linear gets a per-layer
+    Bernoulli ±1 sign vector (seed = quarot_seed_base + layer_index, in
+    iteration order of named_modules) used to rotate its weight before
+    quant. The same sign vector is shipped in the IntLayerEntry so the
+    runtime wrapper can rotate activations matching this PTQ choice.
+    """
+    from ptqeval.wam.lingbot_va.method.viditq.quarot import random_sign_vector
+
     pattern = re.compile(remain_fp_regex)
     entries: dict[str, IntLayerEntry] = {}
+    layer_index = 0
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
         if pattern.search(name):
             logger.debug(f"skip FP-kept {name}")
             continue
-        entries[name] = _quantize_one(module, weight_bits)
+        quarot_sign = None
+        if quarot_enabled:
+            quarot_sign = random_sign_vector(
+                module.in_features, seed=quarot_seed_base + layer_index
+            )
+        entries[name] = _quantize_one(module, weight_bits, quarot_sign=quarot_sign)
+        layer_index += 1
     return entries
 
 
@@ -160,6 +210,8 @@ def _flatten_to_state_dict(
         sd[f"{name}.zp_weight"] = e.zp_weight.cpu()
         if e.bias is not None:
             sd[f"{name}.bias"] = e.bias.cpu()
+        if e.quarot_sign is not None:
+            sd[f"{name}.quarot_sign"] = e.quarot_sign.cpu()
     return sd
 
 
@@ -202,6 +254,10 @@ def main() -> int:
             f"default true); Phase 24d only supports asymmetric quant. Set "
             f"weight_sym: false in the yaml."
         )
+    # Phase 37: optional QuaRoT rotation. Layer config flag drives this so
+    # one ptq.py invocation per variant; CLI does not override config.
+    quarot_enabled = bool(cfg.get("quarot", False))
+    quarot_seed_base = int(cfg.get("quarot_seed_base", 0))
 
     load_dtype = {"bf16": torch.bfloat16,
                   "fp16": torch.float16,
@@ -219,9 +275,16 @@ def main() -> int:
     n_linear_total = sum(1 for _, m in model.named_modules() if isinstance(m, nn.Linear))
     logger.info(f"weight_bits={weight_bits} weight_sym=False (asym per-channel) "
                 f"remain_fp_regex={remain_fp_regex!r}")
+    logger.info(f"quarot={quarot_enabled} seed_base={quarot_seed_base}")
     logger.info(f"total nn.Linear in model: {n_linear_total}")
 
-    entries = compute_int_state_dict(model, remain_fp_regex, weight_bits)
+    entries = compute_int_state_dict(
+        model,
+        remain_fp_regex,
+        weight_bits,
+        quarot_enabled=quarot_enabled,
+        quarot_seed_base=quarot_seed_base,
+    )
     n_quant = len(entries)
     n_kept_fp = n_linear_total - n_quant
     logger.info(f"quantized {n_quant} layers; kept {n_kept_fp} as FP")

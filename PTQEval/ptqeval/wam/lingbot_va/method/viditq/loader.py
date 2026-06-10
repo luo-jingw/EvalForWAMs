@@ -113,19 +113,56 @@ def load_quant_model(
     # (e.g. cross-attn attn2) are not present as kernel buffers in the
     # model. Filter to keys that match an existing model buffer so the
     # extra ptq entries are silently skipped.
+    #
+    # Phase 37+: PTQ output may include optional preprocessing tensors
+    # (.quarot_sign, .act_channel_div) for target layers. These are NOT
+    # in model_keys because base.py does not register placeholders for
+    # them (would trigger size mismatch on load); instead loader installs
+    # them as proper buffers post-load, only on layers that have them.
     model_keys = set(model.state_dict().keys())
-    filtered_sd = {k: v for k, v in raw_sd.items() if k in model_keys}
-    skipped = len(raw_sd) - len(filtered_sd)
+    PREPROCESSING_SUFFIXES = (".quarot_sign", ".act_channel_div")
 
-    _, unexpected = model.load_state_dict(filtered_sd, strict=False)
+    main_sd = {}
+    preprocessing_sd = {}
+    skipped = 0
+    for k, v in raw_sd.items():
+        if any(k.endswith(suf) for suf in PREPROCESSING_SUFFIXES):
+            # Buffer goes through install_preprocessing_buffer below; keep
+            # only entries whose owning Linear module exists in our model
+            # (drops e.g. cross-attn preprocessing entries that PTQ would
+            # have emitted because the regex permits them but the kernel
+            # block does not swap them).
+            module_name = k.rsplit(".", 1)[0]
+            try:
+                model.get_submodule(module_name)
+                preprocessing_sd[k] = v
+            except AttributeError:
+                skipped += 1
+            continue
+        if k in model_keys:
+            main_sd[k] = v
+        else:
+            skipped += 1
+
+    _, unexpected = model.load_state_dict(main_sd, strict=False)
     if unexpected:
         raise RuntimeError(
             f"unexpected keys in int_weights state_dict after filtering: "
             f"{len(unexpected)} (first 5: {unexpected[:5]})"
         )
+
+    # Now register Phase 37+ preprocessing buffers on the matching Linears.
+    # Done AFTER load_state_dict so the buffer's size is set from the ckpt
+    # tensor and is consistent with the per-layer in_features.
+    for k, v in preprocessing_sd.items():
+        module_name, _, buffer_name = k.rpartition(".")
+        sub = model.get_submodule(module_name)
+        sub.register_buffer(buffer_name, v.to(device).contiguous(), persistent=True)
+
     logger.info(
-        f"int_weights load: applied {len(filtered_sd)} tensors, "
-        f"skipped {skipped} non-target quantized entries (e.g. cross-attn)."
+        f"int_weights load: applied {len(main_sd)} core tensors, "
+        f"{len(preprocessing_sd)} preprocessing tensors "
+        f"(quarot_sign / act_channel_div), skipped {skipped} non-target entries."
     )
 
     model.to(device).eval().requires_grad_(False)

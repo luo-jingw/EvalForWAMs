@@ -1,0 +1,20 @@
+# Layer/precision config for ViDiT-Q W8A8 + QuaRoT (kernel path, Phase 37+).
+# Per-channel ASYMMETRIC INT8 weight quant (matches Phase 24d), per-token
+# symmetric dynamic INT8 activation (matches Phase 26a-1). The PTQ pass
+# additionally rotates each target Linear's weight by W_rot = (W * s) @ H
+# / sqrt(C_in) where s is a per-Linear Bernoulli {+-1} vector with seed
+# quarot_seed_base + layer_index. The matching rotation is applied to
+# activations at runtime via QuantWanLinearW8A8.forward (see base.py).
+# Storage cost: int8 [C_in] sign vector per target Linear (~1 MB total).
+
+remain_fp_regex: "patch_embedding_mlp|action_embedder|proj_out|action_proj_out|condition_embedder|condition_embedder_action|scale_shift_table|time_proj"
+
+weight_bits: 8
+weight_sym: false
+act_bits: 8
+act_sym: true
+weight_pack: int8
+
+# Phase 37 QuaRoT switches.
+quarot: true
+quarot_seed_base: 0    # pinned so PTQ output is byte-identical across runs

@@ -1,0 +1,4 @@
+# Runtime args for --variant viditq, W8A8 + QuaRoT path (Phase 37).
+# Consumed by ptqeval.wam.lingbot_va.method.viditq.loader.load_quant_model.
+layer_config: /home/arash/EvalForWAMs/PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/w8a8_quarot.yaml
+int_weights_ckpt: /home/arash/EvalForWAMs/results/viditq_w8a8_quarot/calib/int_weights.pth
