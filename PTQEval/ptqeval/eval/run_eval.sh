@@ -39,6 +39,10 @@ ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/home/arash/EvalForWAMs/RoboTwin}"
 VARIANT="${VARIANT:-}"
 VARIANT_ARGS="${VARIANT_ARGS:-}"
 CALIBRATE_OUT="${CALIBRATE_OUT:-}"
+# Phase 31 v2: TASK_LIST_NAME picks which list in tasks.py to iterate.
+# Default SELECTED_15_TASKS (production eval). CALIB_TASKS_ALL covers
+# all 50 RoboTwin tasks for broader calibration coverage.
+TASK_LIST_NAME="${TASK_LIST_NAME:-SELECTED_15_TASKS}"
 SERVER_ENV="${SERVER_ENV:-lingbot-jw}"
 CLIENT_ENV="${CLIENT_ENV:-RoboTwin-jw}"
 
@@ -56,12 +60,12 @@ fi
 PERF_LOG_DIR="${PERF_LOG_DIR:-${SAVE_ROOT}/perf}"
 mkdir -p "$SAVE_ROOT" "$PERF_LOG_DIR"
 
-# ---- SELECTED_TASKS via tasks.py ----
+# ---- SELECTED_TASKS via tasks.py (TASK_LIST_NAME selects which list) ----
 read -r -a SELECTED_TASKS <<< "$(
-    python -c "from ptqeval.wam.${WAM_NAME}.tasks import SELECTED_15_TASKS as t; print(' '.join(t))"
+    python -c "from ptqeval.wam.${WAM_NAME}.tasks import ${TASK_LIST_NAME} as t; print(' '.join(t))"
 )"
 if [ "${#SELECTED_TASKS[@]}" -eq 0 ]; then
-    echo "[run_eval.sh] failed to load SELECTED_15_TASKS from ptqeval.wam.${WAM_NAME}.tasks" >&2
+    echo "[run_eval.sh] failed to load ${TASK_LIST_NAME} from ptqeval.wam.${WAM_NAME}.tasks" >&2
     exit 1
 fi
 

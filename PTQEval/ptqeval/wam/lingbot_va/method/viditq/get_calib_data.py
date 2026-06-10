@@ -96,6 +96,31 @@ class _CalibState:
 
     def dump(self) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(self.out_path)), exist_ok=True)
+        # Pool-safe merge-on-write: a concurrent server (pool mode runs
+        # one server per GPU) may have advanced the running max on disk
+        # since our last load. Reload, element-wise max with our state,
+        # then write. Race window is now just "two dumps started before
+        # either finished" -- the second writer's max will incorporate
+        # the first writer's contribution. Lost updates can only occur
+        # if BOTH read pre-write, then both write back-to-back without
+        # a re-read in between. With PERIODIC_DUMP_INTERVAL=100 calls
+        # between dumps and ms-scale write time, the race window is
+        # effectively zero in practice.
+        if os.path.exists(self.out_path):
+            try:
+                disk = torch.load(self.out_path, weights_only=True, map_location="cpu")
+                for k, v_disk in disk.items():
+                    if k in self.absmax:
+                        self.absmax[k] = torch.maximum(
+                            v_disk.float(), self.absmax[k].float()
+                        ).to(torch.bfloat16)
+                    else:
+                        self.absmax[k] = v_disk
+            except Exception as e:
+                logger.warning(
+                    f"calib dump-merge: failed to reload {self.out_path} ({e}); "
+                    f"writing our local state only."
+                )
         # Atomic-ish: write to .tmp then rename. Avoids torch.load on a
         # half-written file if SIGKILL hits mid-dump.
         tmp = self.out_path + ".tmp"
