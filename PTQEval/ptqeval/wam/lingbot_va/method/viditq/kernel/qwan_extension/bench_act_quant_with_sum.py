@@ -10,7 +10,7 @@ including shapes that the original ViDiT-Q port could not handle
     (256, 14336)   LingBot-VA ffn down_proj activation (the shape that
                    forced this extension; ViDiT-Q kernel asserts on it)
 
-Reference: same fp32-domain formula as bench_quant_sum.py, recast for
+Reference: fp32-domain formula matching ViDiT-Q QuantKernel, recast for
 the (x_int8, scale_x, sum_x) tuple. The expected fast-math + bf16 noise
 floor is 1e-1 max_rel (mirrors Phase 24c bench bf16 tol).
 """

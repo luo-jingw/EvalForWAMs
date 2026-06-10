@@ -40,7 +40,6 @@ import ptqeval.wam.lingbot_va  # noqa: F401
 
 from qwan_extension.nn import (  # noqa: E402
     QuantWanLinearBase,
-    QuantWanLinearW4A8,
     QuantWanLinearW8A8,
 )
 from wan_va.modules.utils import load_transformer  # noqa: E402
@@ -55,7 +54,6 @@ logger = logging.getLogger("ptqeval.wam.lingbot_va.method.viditq.loader")
 
 _WEIGHT_BITS_TO_CLS: dict[int, type[QuantWanLinearBase]] = {
     8: QuantWanLinearW8A8,
-    4: QuantWanLinearW4A8,
 }
 
 
@@ -74,17 +72,14 @@ def load_quant_model(
 
     layer_cfg = OmegaConf.load(layer_config_path)
     weight_bits = int(layer_cfg.weight_bits)
-    # Phase 26a-2: W4A8 path is being rebuilt against the ViDiT-Q QServe
-    # port; the old scratch W4A8 wrapper is incompatible with the
-    # post-24d asym int_weights schema. Phase 28 restores W4A8.
-    if weight_bits == 4:
-        raise NotImplementedError(
-            "W4A8 path is being rebuilt; not available between Phase 26a "
-            "and Phase 28. Run a W8A8 config instead, or wait for "
-            "Phase 28's w4a8_obf16_* launchers."
-        )
+    # Phase 26b: scratch W4A8 path removed. Phase 28 restores W4A8 via
+    # the ViDiT-Q QServe port (w4a8_obf16_* launchers + a rebuilt
+    # qlinear_w4a8 wrapper).
     if weight_bits not in _WEIGHT_BITS_TO_CLS:
-        raise ValueError(f"weight_bits must be 8 or 4, got {weight_bits}")
+        raise ValueError(
+            f"weight_bits={weight_bits} not supported; only 8 is wired up "
+            f"between Phase 26b and Phase 28."
+        )
     quant_linear_cls = _WEIGHT_BITS_TO_CLS[weight_bits]
 
     logger.info(

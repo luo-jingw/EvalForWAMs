@@ -1,10 +1,11 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-"""Phase 19 verify script.
+"""Block-level numerical check.
 
 Builds a small WanTransformerBlock (dim/ffn small enough to fit easily),
-clones it, wraps the clone with QuantWanTransformerBlockWithCudaKernel for
-both W8A8 and W4A8, runs forward on fake activations against the FP
-reference, and checks output shape + max abs error < 0.1.
+clones it, wraps the clone with QuantWanTransformerBlockWithCudaKernel
+for W8A8, runs forward on fake activations against the FP reference, and
+checks output shape + max abs error < tol. Phase 28 reinstates the W4A8
+block case once QuantWanLinearW4A8 is rebuilt.
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import sys
 
 import torch
 
-from qwan_extension.nn import QuantWanLinearW4A8, QuantWanLinearW8A8
+from qwan_extension.nn import QuantWanLinearW8A8
 from wan_va.modules.model import WanTransformerBlock
 
 from ptqeval.wam.lingbot_va.method.viditq.block import (
@@ -89,12 +90,10 @@ def main() -> int:
     # already validated by check_qlinear at max_abs ~4e-3.
     tols = {
         "W8A8 block": 0.3,    # asym scratch+kernel, see note above
-        "W4A8 block": 0.1,    # sym scratch path, unchanged from Phase 19
     }
 
     results = [
         _check_one("W8A8 block", QuantWanLinearW8A8, tols["W8A8 block"], device, dtype),
-        _check_one("W4A8 block", QuantWanLinearW4A8, tols["W4A8 block"], device, dtype),
     ]
     return 0 if all(results) else 1
 

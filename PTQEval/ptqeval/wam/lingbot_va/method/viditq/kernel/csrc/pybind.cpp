@@ -7,24 +7,6 @@ std::tuple<torch::Tensor, torch::Tensor> act_quant_bf16(torch::Tensor x_bf16);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
     act_quant_bf16_with_sum(torch::Tensor x_bf16);
 
-// w8a8_gemm_bf16.cu
-torch::Tensor w8a8_gemm_bf16(
-    torch::Tensor x_int8,
-    torch::Tensor scale_x_bf16,
-    torch::Tensor w_int8,
-    torch::Tensor scale_w_bf16,
-    c10::optional<torch::Tensor> bias_bf16
-);
-
-// w4a8_gemm_bf16.cu
-torch::Tensor w4a8_gemm_bf16(
-    torch::Tensor x_int8,
-    torch::Tensor scale_x_bf16,
-    torch::Tensor w_int4_packed,
-    torch::Tensor scale_w_bf16,
-    c10::optional<torch::Tensor> bias_bf16
-);
-
 // toy_mma_int8.cu
 void toy_mma_int8_gemm(
     torch::Tensor a,
@@ -75,21 +57,9 @@ torch::Tensor w8a8_obf16_nobias_weight_sym(
     torch::Tensor scale_weight
 );
 
-// fused/fused.cu (verbatim port of ViDiT-Q quant_sum + bf16 extension)
-torch::Tensor quant_sum(
-    torch::Tensor &input,
-    torch::Tensor &sum_output,
-    torch::Tensor &scaling
-);
-torch::Tensor quant_sum_bf16(
-    torch::Tensor &input,
-    torch::Tensor &sum_output,
-    torch::Tensor &scaling
-);
-
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "qwan_extension: BF16-native int8/int4 GEMM kernels for LingBot-VA.";
+    m.doc() = "qwan_extension: BF16-native int8 GEMM kernels for LingBot-VA.";
 
     m.def("act_quant_bf16",
           &act_quant_bf16,
@@ -106,28 +76,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Same algorithm as ViDiT-Q QuantKernel<bf16, _, kPostQuant>;\n"
           "grid-stride structure handles arbitrary K (no <=8192 cap).",
           py::arg("x_bf16"));
-
-    m.def("w8a8_gemm_bf16",
-          &w8a8_gemm_bf16,
-          "W8A8 INT8 GEMM with BF16 scales, returns BF16.\n"
-          "y[N, M] = sum_k(x_int8[n, k] * w_int8[m, k])"
-          " * scale_x_bf16[n] * scale_w_bf16[m] + bias_bf16[m].",
-          py::arg("x_int8"),
-          py::arg("scale_x_bf16"),
-          py::arg("w_int8"),
-          py::arg("scale_w_bf16"),
-          py::arg("bias_bf16") = c10::nullopt);
-
-    m.def("w4a8_gemm_bf16",
-          &w4a8_gemm_bf16,
-          "W4A8 packed-INT4 weight x INT8 activation GEMM, returns BF16.\n"
-          "w_int4_packed is [M, K/2] int8 with low nibble=col 2c, high "
-          "nibble=col 2c+1, both sign-extended.",
-          py::arg("x_int8"),
-          py::arg("scale_x_bf16"),
-          py::arg("w_int4_packed"),
-          py::arg("scale_w_bf16"),
-          py::arg("bias_bf16") = c10::nullopt);
 
     m.def("toy_mma_int8_gemm",
           &toy_mma_int8_gemm,
@@ -155,25 +103,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("scale_weight"),
           py::arg("sum_input"),
           py::arg("zp_weight"));
-
-    m.def("quant_sum",
-          &quant_sum,
-          "ViDiT-Q fp16 per-token symmetric quant with fused post-quant\n"
-          "row-sum. input [..., H] fp16; writes int8 output, fills\n"
-          "scaling [tokens] fp16 with max(|x|)/127 and sum_output [tokens]\n"
-          "fp16 with sum_k(scaling[m] * x_int8[m,k]). H <= 8192, must be\n"
-          "%128 (or %256 if H > 4096).",
-          py::arg("input"),
-          py::arg("sum_output"),
-          py::arg("scaling"));
-
-    m.def("quant_sum_bf16",
-          &quant_sum_bf16,
-          "bf16 instantiation of QuantKernel (Phase 24c extension).\n"
-          "Same semantics as quant_sum but consumes/produces bf16.",
-          py::arg("input"),
-          py::arg("sum_output"),
-          py::arg("scaling"));
 
     // Phase 25: bf16-output W8A8 launchers. Same kernel, OutT=__nv_bfloat16.
     m.def("w8a8_obf16_bias_weight_asym",

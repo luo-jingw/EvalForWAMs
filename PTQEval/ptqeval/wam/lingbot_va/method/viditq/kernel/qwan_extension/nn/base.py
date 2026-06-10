@@ -1,10 +1,10 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 """Common base for kernel-backed quantized Linear modules.
 
-Subclasses (qlinear_w8a8, qlinear_w4a8) specify the weight bit width and
-the GEMM kernel to call in forward. State (int_weight, scale_weight,
+Subclasses (currently only qlinear_w8a8) specify the weight bit width
+and the GEMM kernel to call in forward. State (int_weight, scale_weight,
 zp_weight, bias) is registered as buffers here so state_dict serialization
-is uniform.
+is uniform. Phase 28 will add qlinear_w4a8 as a second subclass.
 
 state_dict keys (Phase 26a-2, asym per-channel weight schema):
     int_weight   int8  [C_out, C_in_pack]   (C_in or C_in/2)
