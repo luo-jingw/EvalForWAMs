@@ -1853,3 +1853,357 @@ Verify  toy_mma_int8_gemm test passes (zero error vs Python int32 ref).
   Section 24.
 - Phase 24a target paths updated to PTQEval-relative; Phase 24b-30
   paths shifted accordingly.
+
+
+===============================================================================
+PART V  Static Activation Quantization  (ViDiT-Q calibrated act path)
+===============================================================================
+
+28 PROBLEM DEFINITION
+-------------------------------------------------------------------------------
+28.1 Current state (post Phase 27)
+- Phases 24a-30 reproduce ViDiT-Q's W8A8 GEMM kernel + asymmetric
+  per-channel weight quant. Activation quantization uses our
+  DynamicQuantizer-equivalent path (act_quant_bf16_with_sum): per-token
+  scale recomputed every forward call from the current activation
+  amax. NO calibration data is read.
+- ViDiT-Q's default W8A8 image-diffusion config (see
+  ViDiT-Q/examples/pixart/configs/*.yaml and quant_utils/qdiff/base/
+  base_quantizer.py StaticQuantizer) computes per-layer per-channel
+  activation scales OFFLINE from a calibration pass on real prompts
+  and persists them; runtime quant only consumes the stored scale.
+  Optionally a SmoothQuant-style alpha (default alpha=0.99) is applied
+  on attn/ff layers for outlier suppression.
+
+28.2 Problem
+- Our W8A8 path is not a faithful ViDiT-Q reproduction on the activation
+  side; it cherry-picks the simpler dynamic option from ViDiT-Q's
+  available quantizers. Phase 27 SR losses on long-horizon tasks may
+  partly reflect this simplification rather than a fundamental
+  limitation of int8 quantization.
+
+28.3 Goal
+- Add a static activation quant path so a "fully faithful" ViDiT-Q
+  W8A8 reference exists alongside the dynamic baseline.
+- Three-way comparison (bf16 / viditq_w8a8_dynamic / viditq_w8a8_static)
+  isolates whether calibration recovers SR on the long-horizon tasks
+  observed to degrade in Phase 27.
+- SmoothQuant alpha smoothing kept optional, phased after the
+  calibration baseline lands.
+
+28.4 Non-goals
+- No new kernel work; reuse existing W8A8 / W4A8 GEMM unchanged. Only
+  the activation quant step (act_quant_bf16_with_sum) gains a static
+  variant.
+- No re-PTQ of weights; weight scales unchanged from Phase 24d.
+- No automated calibration data selection; use a fixed N-episode-per-
+  task sample from RoboTwin selected-15 trajectories.
+
+
+29 IMPLEMENTATION PHASES  (Part V; numbered to extend past Phase 30)
+-------------------------------------------------------------------------------
+Phase 31: Calibration data collection
+Target  Hook the 180 runtime-active Linears (attn1.* + ffn.* in 30
+        blocks). Run a small RoboTwin sample (e.g. 2 episodes per task
+        across selected-15) through the bf16 server with hooks
+        recording per-call per-channel input absmax. Save
+        results/viditq_w8a8_static/calib_data.pth with schema
+        {layer_name: tensor[N_callsite, C]}.
+Add     PTQEval/ptqeval/wam/lingbot_va/method/viditq/get_calib_data.py
+Verify  calib_data.pth has 180 layer keys; per-layer C matches the
+        FP Linear's in_features.
+
+Phase 32: Static activation scale derivation
+Target  Read calib_data.pth; for each layer compute static scale =
+        max over calibration callsites of per-token-group absmax,
+        divided by 127. Store
+        results/viditq_w8a8_static/calib/act_scales.pth as
+        {layer_name: tensor[group_dim], dtype=bf16}.
+Add     PTQEval/ptqeval/wam/lingbot_va/method/viditq/derive_act_scales.py
+Verify  act_scales.pth has 180 entries with matching shapes; scales
+        finite and > 1e-8.
+
+Phase 33: Static activation kernel variant + wrapper integration
+Target  Add act_quant_bf16_with_sum_static kernel variant that
+        consumes an external pre-stored scale (skips Phase 1 amax
+        reduction; Phase 2 quant + Phase 3 sum reduction unchanged).
+        Extend QuantWanLinearW8A8 with a per-instance act_scale_static
+        buffer (bf16); forward() dispatches between dynamic and
+        static via a class-level flag set at construction.
+        Loader populates act_scale_static buffers from act_scales.pth
+        when variant_args specifies static mode.
+Add     configs/runtime_args_w8a8_static.yaml (new variant config)
+Modify  csrc/act_quant_bf16.cu (new launcher act_quant_bf16_with_sum_static)
+        csrc/pybind.cpp
+        qwan_extension/__init__.py
+        qwan_extension/nn/base.py
+        qwan_extension/nn/qlinear_w8a8.py
+        ptqeval/wam/lingbot_va/method/viditq/loader.py
+Verify  bench_act_quant_with_sum_static passes (vs Python ref with
+        provided scale). check_qlinear with static mode passes.
+        Smoke (adjust_bottle, test_num=1, --variant viditq with
+        runtime_args_w8a8_static.yaml) completes.
+
+Phase 34: W8A8 static eval (mirrors Phase 27)
+Target  Run 15-task pool eval using runtime_args_w8a8_static.yaml.
+Verify  results/viditq_w8a8_static/summary/summary.csv has 15 rows.
+        mean_total_ms within Phase 27 dynamic range (small change
+        expected since act quant kernel work is similar).
+
+Phase 35: 3-way cross-checkpoint comparison
+Target  Run ptqeval.eval.calc_cross_ckpt with three variants
+        (bf16, viditq_w8a8_dynamic = Phase 27 results,
+         viditq_w8a8_static  = Phase 34 results) and emit
+        report.md showing whether calibration recovers SR on the
+        long-horizon tasks (put_bottles_dustbin, place_can_basket)
+        where the dynamic baseline degraded.
+Verify  cross_summary.csv has 15 rows x 3 variants. Report section
+        "Notable SR Deltas" updated to compare static vs dynamic.
+
+Phase 36 (moved to Part VI as the SmoothQuant entry; see section 32 below).
+        SmoothQuant alpha smoothing was promoted from "optional" to a
+        Part VI mandatory phase once the audit found that Parts I-V on
+        their own only reproduce the upstream BASELINE PTQ pipeline,
+        not the paper-namesake "ViDiT-Q" method (SmoothQuant + QuaRoT).
+
+
+30 ACCEPTANCE  (Part V)
+-------------------------------------------------------------------------------
+- calib_data.pth + act_scales.pth exist for the 180 runtime-active
+  Linears.
+- runtime_args_w8a8_static.yaml drives a working smoke + 15-task pool
+  eval.
+- 3-way cross_summary.csv joins bf16 + viditq_w8a8_dynamic +
+  viditq_w8a8_static on task_name.
+- Report quantifies whether calibration recovers SR on the long-
+  horizon tasks observed to degrade in Phase 27 (put_bottles_dustbin
+  -24pp, place_can_basket -16pp).
+- Part V does NOT block Part III Phase 28-29 (W4A8 rebuild + eval);
+  the two parts can proceed in parallel.
+
+
+===============================================================================
+PART VI  Faithful ViDiT-Q Method Reproduction               [HIGH PRIORITY]
+         (SmoothQuant + QuaRoT — the paper-namesake "ViDiT" method)
+===============================================================================
+
+31 PROBLEM DEFINITION
+-------------------------------------------------------------------------------
+31.1 Current state (post Phase 35; gap surfaced by post-Phase-26b audit)
+- Parts I-V reproduce ViDiT-Q's BASELINE PTQ pipeline only:
+  per-channel asymmetric weight + per-token symmetric activation
+  (dynamic in Phase 27, static in Phase 34), naive max-based scale,
+  regex-based FP exclusion. This corresponds to upstream's plain
+  config.yaml / examples/pixart/configs/config.yaml — the file
+  WITHOUT any smooth_quant / quarot / viditq block.
+- The paper-namesake "ViDiT" method is a third upstream
+  QuantizedLinear variant (quant_utils/qdiff/viditq/
+  viditq_quant_layer.py:8-74) that stacks two PTQ-time
+  preprocessing transforms BEFORE per-channel asym weight quant:
+    a) SmoothQuant alpha-blending (quant_utils/qdiff/smooth_quant/
+       sq_quant_layer.py:24-33) — per-input-channel
+       channel_mask = |W|.max(out)^alpha / act_absmax^(1-alpha);
+       weight multiplied by mask, activation divided by mask, so
+       quant-difficulty migrates from outlier-channel activations to
+       weights where per-channel scales absorb the imbalance.
+       Default alpha = 0.99 for image-DiT (upstream pixart config).
+    b) QuaRoT data-independent Hadamard rotation (quant_utils/qdiff/
+       quarot/quarot_quant_layer.py:28-51, quarot_utils.py) — fixed
+       random Hadamard H per Linear, weight rotated as W @ H once
+       at PTQ time, activation rotated as x @ H at runtime; the
+       rotation decorrelates outliers so per-channel scales fit
+       better.
+  Both alone are opt-in upstream; combined they are activated in
+  the published w4a8_mixed_precision.yaml configs and are the
+  algorithm the paper is named for.
+
+31.2 Problem
+- Without SmoothQuant + QuaRoT we cannot truthfully claim ViDiT-Q
+  reproduction. Phase 27/34 numbers benchmark our W8A8 pipeline
+  against bf16, NOT the actual ViDiT method against bf16.
+- The long-horizon RoboTwin tasks where Phase 27 lost SR
+  (put_bottles_dustbin -24pp, place_can_basket -16pp) are exactly
+  the regime where SmoothQuant outlier suppression + QuaRoT
+  rotation are designed to help. Without them we cannot tell
+  whether the SR loss is intrinsic to int8 weights or symptomatic
+  of the simpler quantizer choice.
+- Mixed-precision per-layer bit allocation is a fourth upstream
+  feature (mixed_precision_quantizer.py) that is also unreproduced;
+  it is the natural follow-up for any layer Phase 39 identifies as
+  uniquely sensitive.
+
+31.3 Goal
+- Add QuaRoT, SmoothQuant, and the combined ViDiT method as
+  drop-in PTQ-time preprocessing transforms applied BEFORE the
+  existing Phase 24d per-channel asym weight quant + Phase 26a-1
+  per-token sym act quant. No new GEMM kernel work: weight stays
+  int8 per-channel asym, activation stays per-token sym; only the
+  W and x values seen by those existing quant paths change.
+- N-way cross-checkpoint comparison
+  (bf16 / w8a8_dynamic / w8a8_static / w8a8_smooth / w8a8_quarot /
+   w8a8_viditq, plus optional mixed-precision row) isolating each
+  contribution and explicitly answering whether the headline
+  method recovers Phase 27's long-horizon SR loss.
+
+31.4 Non-goals
+- W4A4 (atom kernel), QuantizedAttentionMap (softmax(QK^T) quant),
+  per-timestep scale recalibration, and AdaRound-style learned
+  rounding are left out. All are opt-in upstream and orthogonal to
+  the headline method.
+
+
+32 IMPLEMENTATION PHASES  (Part VI; numbered to extend past Phase 35)
+-------------------------------------------------------------------------------
+Dependency note: Phase 36 (SmoothQuant) and Phase 38 (combined ViDiT)
+both consume Part V Phase 31's per-channel activation absmax stats.
+Phase 37 (QuaRoT) is data-independent and can land in any order. The
+combined method (Phase 38) requires both Phase 36 and Phase 37.
+
+Phase 36: SmoothQuant alpha port
+Target  Port quant_utils/qdiff/smooth_quant/sq_quant_layer.py:24-33
+        to a PTQ-time preprocessing step. For each target Linear:
+          read per-input-channel act_absmax from Phase 31 calib data
+          channel_mask = (|W|.amax(0) ^ alpha)
+                       / (act_absmax       ^ (1 - alpha))
+        Multiply weight by channel_mask along in-dim BEFORE Phase
+        24d's per-channel asym quant; store channel_mask per
+        Linear so the runtime wrapper can divide x by channel_mask
+        before act_quant_bf16_with_sum.
+        alpha = 0.99 default (ViDiT-Q image-DiT). Configurable via
+        layer_config.smooth_alpha.
+Add     PTQEval/ptqeval/wam/lingbot_va/method/viditq/smooth_quant.py
+        configs/w8a8_smooth.yaml
+        configs/runtime_args_w8a8_smooth.yaml
+Modify  qwan_extension/nn/base.py
+          register act_channel_div buffer (bf16 [in_features])
+          forward divides x by act_channel_div before
+          act_quant_bf16_with_sum (no-op when buffer absent / all 1)
+        ptqeval/wam/lingbot_va/method/viditq/ptq.py
+          --smooth_quant flag; consumes calib_data.pth + alpha;
+          emits act_channel_div alongside int_weight/scale_weight/
+          zp_weight; weight rescaled before per-channel asym quant
+        loader.py
+          loads channel_mask entries into act_channel_div buffer
+Verify  bench: dequant_python_ref(W_scaled, channel_mask) ==
+        kernel_path(W_scaled int8 + x / channel_mask quant + GEMM)
+        within bf16 noise floor on a representative shape.
+        Smoke adjust_bottle with runtime_args_w8a8_smooth.yaml SR
+        > 0.5 (sanity, not full eval). 15-task pool eval to
+        results/viditq_w8a8_smooth/ once smoke green.
+
+Phase 37: QuaRoT Hadamard rotation port
+Target  Port quant_utils/qdiff/quarot/quarot_quant_layer.py:28-51
+        + quarot_utils.py to a PTQ-time preprocessing step. For
+        each target Linear:
+          H = random_hadamard(in_features)   # orthogonal, +-1/sqrt(d)
+          W_rot = W @ H                       # in-dim rotation
+        Stash H per Linear so runtime wrapper rotates input
+        x_rot = x @ H before quant. Phase 24d asym quant applied
+        to W_rot, not W.
+        Data-independent: no calibration needed. RNG seed pinned in
+        config for reproducibility.
+Add     PTQEval/ptqeval/wam/lingbot_va/method/viditq/quarot.py
+          random_hadamard(d, seed) helper + apply_to_state_dict()
+        configs/w8a8_quarot.yaml
+        configs/runtime_args_w8a8_quarot.yaml
+Modify  qwan_extension/nn/base.py
+          register hadamard buffer (bf16 [in_features, in_features])
+          forward computes x_rot = x @ hadamard before quant
+          (no-op when buffer absent)
+        ptq.py
+          --quarot flag; emits hadamard per layer; weight rotated
+          before per-channel asym quant
+        loader.py
+          loads hadamard entries
+Verify  bench: dequant_python_ref(W_rot, H) ==
+        kernel_path(W_rot int8 + (x @ H) quant + GEMM) within bf16
+        noise floor. Smoke adjust_bottle SR > 0.5. 15-task pool
+        eval to results/viditq_w8a8_quarot/.
+Risk    Per-Linear H @ x adds an extra matmul per forward; budget
+        ~1 ms / call extra on RTX A6000 (in=14336 worst case).
+        If memory becomes the bottleneck on H storage (per-Linear
+        in_features^2 bf16 buffer: 14336^2*2 = 410 MB on the
+        widest Linear alone), fall back to structured Hadamard
+        (recursive Kronecker) per quarot_utils.py.
+
+Phase 38: ViDiT combined (SmoothQuant + QuaRoT) — paper-namesake method
+Target  Compose Phase 36 + 37 in one PTQ pass and one runtime
+        wrapper config. Order matches viditq_quant_layer.py:40-50
+        and :62-63 exactly:
+          PTQ-time:    W_eff = (W * channel_mask) @ H
+          runtime:     x_eff = (x / channel_mask) @ H
+        before Phase 24d / Phase 26a-1 quant. Runtime stores BOTH
+        act_channel_div AND hadamard per Linear.
+Add     configs/w8a8_viditq.yaml
+        configs/runtime_args_w8a8_viditq.yaml
+Modify  ptq.py            (compose --smooth_quant + --quarot)
+        smooth_quant.py + quarot.py   (no change; reused as helpers)
+        loader.py         (loads both buffers when present)
+Verify  bench: dequant_python_ref(W_eff) == kernel_path(W_eff int8
+        + ((x / channel_mask) @ H) quant + GEMM) within bf16 noise.
+        Smoke adjust_bottle SR > 0.5. 15-task pool eval to
+        results/viditq_w8a8_viditq/. THIS is the run that ought to
+        be cited as "ViDiT-Q W8A8 reproduction".
+
+Phase 39: N-way cross-checkpoint comparison
+Target  Run ptqeval.eval.calc_cross_ckpt with all available
+        variants (at minimum):
+          bf16                    Part I baseline
+          w8a8_dynamic            Phase 27 (current production)
+          w8a8_static             Phase 34
+          w8a8_smooth             Phase 36
+          w8a8_quarot             Phase 37
+          w8a8_viditq             Phase 38   <-- paper-namesake method
+        plus Phase 29 W4A8 if landed, Phase 40 mixed if landed.
+        Report extensions:
+          - Per-variant headline row in Variants section
+          - Contribution attribution table: for each long-horizon
+            task, decompose Phase 27 SR delta into smooth-only,
+            quarot-only, viditq combined deltas
+          - Pareto front (SR vs peak-alloc, SR vs total-ms) with
+            every variant plotted
+Verify  cross_summary.csv has 15 rows x >=6 variant columns.
+        Report explicitly answers: does ViDiT-Q method recover
+        put_bottles_dustbin / place_can_basket SR loss observed in
+        Phase 27?
+
+Phase 40 (optional, follow-up): Mixed-precision per-layer bit allocation
+Target  Port quant_utils/qdiff/base/mixed_precision_quantizer.py +
+        quant_model.py's layer_name_regex dispatch. Two sub-tasks:
+          a) Sensitivity scoring: per-Linear,
+             score = || (W @ x) - dequant(quant_w8(W) @ quant_a8(x)) ||_F
+             over calib data; emit per-Linear sensitivity ranking.
+          b) Bit assignment: highest-K%-sensitive layers stay W8;
+             rest downgrade to W4. K% sweep over [10, 30, 50] to
+             trade SR vs memory.
+        Combine with ViDiT method from Phase 38 (mixed-precision is
+        orthogonal to outlier suppression and stacks).
+Add     PTQEval/ptqeval/wam/lingbot_va/method/viditq/mixed_precision.py
+        configs/w4a8_mixed.yaml
+        configs/runtime_args_w4a8_mixed_viditq.yaml
+Modify  block.py    (per-Linear quant_linear_cls instead of single)
+        loader.py   (per-layer dispatch from layer_bit_map)
+        ptq.py      (emit int4 / int8 per layer based on map)
+Verify  Sensitivity ranking matches qualitative expectation
+        (down_proj most sensitive). 15-task pool eval to
+        results/viditq_w4a8_mixed_viditq/. cross_summary 7-way.
+
+
+33 ACCEPTANCE  (Part VI)
+-------------------------------------------------------------------------------
+- SmoothQuant, QuaRoT, and the combined ViDiT method are
+  implemented as drop-in PTQ-time preprocessing transforms on top
+  of the Phase 24d per-channel asym weight + Phase 26a-1 per-token
+  sym act baseline. No new GEMM kernel work.
+- act_channel_div and hadamard buffers serialize through state_dict
+  and round-trip through loader; runtime forward is a no-op when
+  the buffers are absent (back-compat with Phase 27 / 34 ckpts).
+- 15-task pool eval exists for w8a8_smooth, w8a8_quarot, and
+  w8a8_viditq variants under results/viditq_w8a8_{smooth,quarot,
+  viditq}/.
+- N-way (>=6) cross_summary.csv joins all available variants on
+  task_name; report explicitly addresses whether the combined
+  ViDiT method recovers Phase 27 long-horizon SR loss, supporting
+  or refuting the "int8 weights are intrinsic ceiling" hypothesis.
+- Reproduction claim updated: "ViDiT-Q reproduction" now refers to
+  the Phase 38 viditq variant, not Phase 27 dynamic baseline.
