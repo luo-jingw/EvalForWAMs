@@ -75,7 +75,9 @@ class IntLayerEntry:
     scale_weight: torch.Tensor    # bf16 [C_out]
     zp_weight: torch.Tensor       # int16 [C_out]
     bias: Optional[torch.Tensor]  # bf16 [C_out] or None
-    quarot_sign: Optional[torch.Tensor] = None  # int8 [C_in] or None
+    quarot_sign: Optional[torch.Tensor] = None       # int8 [C_in] or None
+    act_channel_div: Optional[torch.Tensor] = None   # bf16 [C_in] (SmoothQuant
+                                                     #   channel_mask) or None
 
 
 def _per_channel_asym_quant(
@@ -133,19 +135,31 @@ def _pack_int4_two_per_byte(w_int4: torch.Tensor) -> torch.Tensor:
 def _quantize_one(
     linear: nn.Linear,
     weight_bits: int,
+    smooth_channel_mask: Optional[torch.Tensor] = None,
     quarot_sign: Optional[torch.Tensor] = None,
 ) -> IntLayerEntry:
     """Pure-tensor asym quantize of a single nn.Linear. Bias copied as bf16.
 
-    If quarot_sign is provided ([C_in] int8 in {+-1}), the weight is
-    rotated via Phase 37 QuaRoT (W_rot = (W * sign) @ H / sqrt(C_in))
-    BEFORE per-channel asym quant. The sign vector is stored alongside
-    the quantized tensors so the runtime wrapper can rotate its input
-    by the same transform.
+    Optional preprocessing stages, in order:
+      1. SmoothQuant (Phase 36):  W <- W * channel_mask[None, :]
+      2. QuaRoT      (Phase 37):  W <- (W * sign) @ H / sqrt(C_in)
+    Then per-channel asym quant on the final W. The matching runtime
+    inverses (x / channel_mask, then (x * sign) @ H / sqrt(C_in)) are
+    applied in base.py forward.
+
+    Both preprocessing stages preserve the unquantized result exactly:
+      y = x @ W.T == (x / mask) @ (W * mask).T
+                  == (x_rot)    @ (W_rot).T   [H orthogonal]
+    The benefit shows up after quantization (post-Phase-24d): outliers
+    are redistributed across channels, letting per-channel scales fit a
+    tighter range.
     """
     from ptqeval.wam.lingbot_va.method.viditq.quarot import rotate_weight
 
     w_f32 = linear.weight.detach().to(torch.float32)
+    if smooth_channel_mask is not None:
+        # channel_mask multiplies the input axis (C_in is dim=1 of W).
+        w_f32 = w_f32 * smooth_channel_mask.to(w_f32.device, torch.float32).unsqueeze(0)
     if quarot_sign is not None:
         w_f32 = rotate_weight(w_f32, quarot_sign.to(w_f32.device))
     int_w, scale_w, zp_w = _per_channel_asym_quant(w_f32, weight_bits)
@@ -153,13 +167,17 @@ def _quantize_one(
         int_w = _pack_int4_two_per_byte(int_w)
     bias = (linear.bias.detach().to(torch.bfloat16).contiguous()
             if linear.bias is not None else None)
-    quarot_out = quarot_sign.detach().to(torch.int8).contiguous() if quarot_sign is not None else None
+    quarot_out = (quarot_sign.detach().to(torch.int8).contiguous()
+                  if quarot_sign is not None else None)
+    smooth_out = (smooth_channel_mask.detach().to(torch.bfloat16).contiguous()
+                  if smooth_channel_mask is not None else None)
     return IntLayerEntry(
         int_weight=int_w.contiguous(),
         scale_weight=scale_w.contiguous(),
         zp_weight=zp_w.contiguous(),
         bias=bias,
         quarot_sign=quarot_out,
+        act_channel_div=smooth_out,
     )
 
 
@@ -169,34 +187,84 @@ def compute_int_state_dict(
     weight_bits: int,
     quarot_enabled: bool = False,
     quarot_seed_base: int = 0,
+    smooth_quant_enabled: bool = False,
+    smooth_alpha: float = 0.99,
+    calib_data: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict[str, IntLayerEntry]:
     """Walk model. For every nn.Linear whose full name does NOT match
     remain_fp_regex, compute its IntLayerEntry.
 
+    Phase 36: when smooth_quant_enabled, requires calib_data dict mapping
+    full module name -> per-input-channel act_absmax tensor. Computes
+    channel_mask per target Linear via smooth_quant.compute_channel_mask
+    and applies the matching weight rescale.
+
     Phase 37: when quarot_enabled, each target Linear gets a per-layer
     Bernoulli ±1 sign vector (seed = quarot_seed_base + layer_index, in
-    iteration order of named_modules) used to rotate its weight before
-    quant. The same sign vector is shipped in the IntLayerEntry so the
-    runtime wrapper can rotate activations matching this PTQ choice.
+    iteration order of named_modules) used to rotate its weight.
+
+    Phase 38: setting BOTH flags reproduces the paper-namesake "ViDiT"
+    method. Order matches viditq_quant_layer.py:47-48 exactly: smooth
+    first, then rotate, then quant.
     """
     from ptqeval.wam.lingbot_va.method.viditq.quarot import random_sign_vector
+    from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_channel_mask
+
+    if smooth_quant_enabled and calib_data is None:
+        raise ValueError(
+            "smooth_quant_enabled requires calib_data; load via Phase 31 "
+            "calib_data.pth and pass dict[layer_name -> [C_in] absmax]."
+        )
 
     pattern = re.compile(remain_fp_regex)
     entries: dict[str, IntLayerEntry] = {}
     layer_index = 0
+    missing_calib: list[str] = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
         if pattern.search(name):
             logger.debug(f"skip FP-kept {name}")
             continue
+
+        smooth_mask = None
+        if smooth_quant_enabled:
+            if name not in calib_data:
+                # PTQ quantizes more Linears than the kernel block swaps
+                # (e.g. cross-attn). Calib data only covers the 180
+                # block-swapped targets. Skip smooth_quant on layers
+                # without calib stats; their weights still get the
+                # standard per-channel asym quant.
+                missing_calib.append(name)
+            else:
+                act_absmax = calib_data[name].to(module.weight.device, torch.float32)
+                weight_absmax = (
+                    module.weight.detach().to(torch.float32).abs().amax(dim=0)
+                )
+                smooth_mask = compute_channel_mask(
+                    weight_absmax, act_absmax, smooth_alpha
+                )
+
         quarot_sign = None
         if quarot_enabled:
             quarot_sign = random_sign_vector(
                 module.in_features, seed=quarot_seed_base + layer_index
             )
-        entries[name] = _quantize_one(module, weight_bits, quarot_sign=quarot_sign)
+
+        entries[name] = _quantize_one(
+            module,
+            weight_bits,
+            smooth_channel_mask=smooth_mask,
+            quarot_sign=quarot_sign,
+        )
         layer_index += 1
+
+    if missing_calib:
+        logger.info(
+            f"smooth_quant: {len(missing_calib)} layers had no calib entry "
+            f"(quantized without SmoothQuant; e.g. cross-attn). First 3: "
+            f"{missing_calib[:3]}"
+        )
     return entries
 
 
@@ -212,6 +280,8 @@ def _flatten_to_state_dict(
             sd[f"{name}.bias"] = e.bias.cpu()
         if e.quarot_sign is not None:
             sd[f"{name}.quarot_sign"] = e.quarot_sign.cpu()
+        if e.act_channel_div is not None:
+            sd[f"{name}.act_channel_div"] = e.act_channel_div.cpu()
     return sd
 
 
@@ -254,10 +324,26 @@ def main() -> int:
             f"default true); Phase 24d only supports asymmetric quant. Set "
             f"weight_sym: false in the yaml."
         )
-    # Phase 37: optional QuaRoT rotation. Layer config flag drives this so
-    # one ptq.py invocation per variant; CLI does not override config.
+    # Phase 36/37/38: optional preprocessing. Config drives the variant
+    # (one ptq.py invocation per variant); CLI does not override config.
     quarot_enabled = bool(cfg.get("quarot", False))
     quarot_seed_base = int(cfg.get("quarot_seed_base", 0))
+    smooth_quant_enabled = bool(cfg.get("smooth_quant", False))
+    smooth_alpha = float(cfg.get("smooth_alpha", 0.99))
+    calib_data_path = cfg.get("calib_data_path", None)
+    calib_data = None
+    if smooth_quant_enabled:
+        if not calib_data_path:
+            raise ValueError(
+                f"layer_config {args.layer_config} has smooth_quant=true but "
+                f"no calib_data_path; run Phase 31 calibration first."
+            )
+        calib_data = torch.load(str(calib_data_path), weights_only=True)
+        if not isinstance(calib_data, dict):
+            raise ValueError(
+                f"calib_data_path {calib_data_path} did not load a dict; "
+                f"Phase 31 dump should be dict[layer_name -> [C_in] tensor]."
+            )
 
     load_dtype = {"bf16": torch.bfloat16,
                   "fp16": torch.float16,
@@ -275,7 +361,12 @@ def main() -> int:
     n_linear_total = sum(1 for _, m in model.named_modules() if isinstance(m, nn.Linear))
     logger.info(f"weight_bits={weight_bits} weight_sym=False (asym per-channel) "
                 f"remain_fp_regex={remain_fp_regex!r}")
-    logger.info(f"quarot={quarot_enabled} seed_base={quarot_seed_base}")
+    logger.info(
+        f"smooth_quant={smooth_quant_enabled} alpha={smooth_alpha} "
+        f"quarot={quarot_enabled} seed_base={quarot_seed_base}"
+    )
+    if smooth_quant_enabled:
+        logger.info(f"calib_data: {calib_data_path} ({len(calib_data)} layers)")
     logger.info(f"total nn.Linear in model: {n_linear_total}")
 
     entries = compute_int_state_dict(
@@ -284,6 +375,9 @@ def main() -> int:
         weight_bits,
         quarot_enabled=quarot_enabled,
         quarot_seed_base=quarot_seed_base,
+        smooth_quant_enabled=smooth_quant_enabled,
+        smooth_alpha=smooth_alpha,
+        calib_data=calib_data,
     )
     n_quant = len(entries)
     n_kept_fp = n_linear_total - n_quant

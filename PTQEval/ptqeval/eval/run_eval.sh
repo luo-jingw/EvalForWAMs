@@ -191,6 +191,11 @@ start_server() {
             variant_args_cli="$variant_args_cli --variant_args $VARIANT_ARGS"
         fi
     fi
+    # Phase 31: forward CALIBRATE_OUT through to server.py if set.
+    local calibrate_cli=""
+    if [ -n "$CALIBRATE_OUT" ]; then
+        calibrate_cli="--calibrate_out $CALIBRATE_OUT"
+    fi
 
     conda activate "$SERVER_ENV"
     (
@@ -208,6 +213,7 @@ start_server() {
             --perf_task_name "$task_name" \
             --model_path "$WAM_MODEL_PATH" \
             $variant_args_cli \
+            $calibrate_cli \
             > "$server_log" 2>&1 &
         echo $! > "${server_log}.pid"
     )

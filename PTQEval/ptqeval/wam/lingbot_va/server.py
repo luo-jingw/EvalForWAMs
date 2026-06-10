@@ -145,6 +145,17 @@ class VA_Server:
                                                     eval_mode=True,
                                                     )
 
+            # Phase 31: optional calibration data capture. Hooks ride on
+            # the bf16 model (variant is None); attaching them in a
+            # quantized variant is supported too (the wrapper exposes the
+            # original FP linear's input), but the default workflow runs
+            # this in bf16. The captured per-channel absmax feeds Phase 36
+            # (SmoothQuant) and Phase 32 (static activation scales).
+            calibrate_out: Optional[str] = getattr(job_config, 'calibrate_out', None)
+            if calibrate_out:
+                from ptqeval.wam.lingbot_va.method.viditq.get_calib_data import install_calib_hooks
+                self._calib_state = install_calib_hooks(self.transformer, calibrate_out)
+
             self.env_type = job_config.env_type
             self.streaming_vae_half = None
             if self.env_type == 'robotwin_tshape':
@@ -765,6 +776,8 @@ def run(args):
         config.variant = args.variant
     if args.variant_args is not None:
         config.variant_args = args.variant_args
+    if args.calibrate_out is not None:
+        config.calibrate_out = args.calibrate_out
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -837,6 +850,16 @@ def main():
         default=None,
         help='path to a yaml file with method-specific args; loaded via '
              'OmegaConf and passed to load_quant_model as a plain dict.'
+    )
+    parser.add_argument(
+        "--calibrate_out",
+        type=str,
+        default=None,
+        help='Phase 31: if set, install per-channel input absmax hooks on '
+             'the 180 target Linears and dump to this path on exit '
+             '(atexit + SIGTERM + periodic safety dumps every 100 calls). '
+             'Best run against the bf16 path (--variant unset) so the '
+             'captured stats match an unquantized forward.'
     )
     args = parser.parse_args()
     run(args)

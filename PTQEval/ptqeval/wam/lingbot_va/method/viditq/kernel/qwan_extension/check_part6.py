@@ -1,0 +1,182 @@
+# Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+"""Part VI numerical check: SmoothQuant + QuaRoT + ViDiT combined plumbing.
+
+For each of four variants (baseline / smooth / quarot / viditq combined)
+and each WAN shape, this validates that the W8A8 kernel wrapper -- when
+fed a preprocessed weight and the matching preprocessing buffers --
+produces the same output (within bf16 kernel noise) as a dequant-then-
+matmul reference that applies the SAME preprocessing in fp32. This is
+the plumbing test (does base.py correctly route act_channel_div /
+quarot_sign into the forward path?). It is NOT a quant-noise quality
+test: random Gaussian weights are an unfair distribution for SmoothQuant
+and QuaRoT (whose benefit only shows on outlier-heavy real model
+weights); informational vs-FP errors are reported but not pass/fail-gated.
+
+Tolerance is the same kernel-error band (~5e-2) used by check_qlinear.
+"""
+from __future__ import annotations
+
+import sys
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from qwan_extension import act_quant_bf16_with_sum
+from qwan_extension.nn import QuantWanLinearW8A8
+
+from ptqeval.wam.lingbot_va.method.viditq.quarot import (
+    apply_input_rotation,
+    random_sign_vector,
+    rotate_weight,
+)
+from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_channel_mask
+
+
+def _per_channel_asym_quant_w(w_f32: torch.Tensor):
+    x_max = w_f32.amax(dim=1).clamp_min(0.0)
+    x_min = w_f32.amin(dim=1).clamp_max(0.0)
+    delta = ((x_max - x_min) / 255.0).clamp_min(1e-8)
+    zero_point = torch.round(x_min / delta) + 128.0
+    scale_eff = delta.to(torch.bfloat16).to(torch.float32)
+    w_int = (torch.round(w_f32 / scale_eff.unsqueeze(1)) - zero_point.unsqueeze(1)).clamp(-128, 127)
+    return w_int, scale_eff, zero_point
+
+
+def _kernel_dequant_ref(
+    x_preprocessed: torch.Tensor,
+    w_preprocessed_f32: torch.Tensor,
+    bias_bf16,
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    """fp32 dequant-then-matmul reference for the preprocessed (W, x) pair.
+    Caller is responsible for applying the activation-side smooth /
+    rotation BEFORE handing x_preprocessed in."""
+    w_int, scale_w_eff, zero_point = _per_channel_asym_quant_w(w_preprocessed_f32)
+
+    x_bf16 = x_preprocessed.to(torch.bfloat16).reshape(-1, in_features).contiguous()
+    x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum(x_bf16)
+    sx = scale_x_bf16.to(torch.float32)
+    sa = sum_x_bf16.to(torch.float32)
+    zp = zero_point
+
+    y_2d = (x_int8.to(torch.float32) @ w_int.T)
+    y_2d = y_2d * sx.unsqueeze(1) * scale_w_eff.unsqueeze(0)
+    y_2d = y_2d + sa.unsqueeze(1) * zp.unsqueeze(0) * scale_w_eff.unsqueeze(0)
+    if bias_bf16 is not None:
+        y_2d = y_2d + bias_bf16.to(torch.float32).unsqueeze(0)
+    return y_2d.reshape(*x_preprocessed.shape[:-1], out_features).to(torch.bfloat16)
+
+
+def _build_wrapper(W_preprocessed: torch.Tensor, bias_bf16, device,
+                   smooth_mask=None, quarot_sign=None) -> QuantWanLinearW8A8:
+    """Build a QuantWanLinearW8A8 by feeding the preprocessed weight to
+    from_fp_linear (so int_weight, scale_weight, zp_weight are derived
+    from the PTQ-time-preprocessed W). Then install the matching runtime
+    buffers."""
+    out_f, in_f = W_preprocessed.shape
+    has_bias = bias_bf16 is not None
+    fp_proxy = nn.Linear(in_f, out_f, bias=has_bias).to(device).to(torch.bfloat16)
+    with torch.no_grad():
+        fp_proxy.weight.copy_(W_preprocessed.to(torch.bfloat16))
+        if has_bias:
+            fp_proxy.bias.copy_(bias_bf16)
+    mod = QuantWanLinearW8A8.from_fp_linear(fp_proxy).to(device)
+    if smooth_mask is not None:
+        mod.act_channel_div = smooth_mask.to(device, torch.bfloat16).contiguous()
+    if quarot_sign is not None:
+        mod.quarot_sign = quarot_sign.to(device, torch.int8).contiguous()
+    return mod
+
+
+def _check_one(name: str, variant: str,
+               in_features: int, out_features: int,
+               batch: int, seq: int, has_bias: bool, tol: float,
+               device: torch.device, seed: int = 0) -> bool:
+    g = torch.Generator(device=device).manual_seed(seed)
+    fp = nn.Linear(in_features, out_features, bias=has_bias).to(device).to(torch.bfloat16)
+    with torch.no_grad():
+        w_init = (torch.randn((out_features, in_features), device=device, generator=g) * 0.05).to(torch.bfloat16)
+        fp.weight.copy_(w_init)
+        if has_bias:
+            b_init = (torch.randn((out_features,), device=device, generator=g) * 0.1).to(torch.bfloat16)
+            fp.bias.copy_(b_init)
+    x = (torch.randn((batch, seq, in_features), device=device, generator=g) * 0.5).to(torch.bfloat16)
+
+    bias_bf16 = fp.bias.detach().to(torch.bfloat16) if has_bias else None
+    y_fp = F.linear(x, fp.weight, fp.bias).to(torch.bfloat16)
+
+    smooth_mask = None
+    quarot_sign = None
+    if "smooth" in variant or variant == "viditq":
+        # Synthetic act_absmax: take from the actual x (worst-case proxy).
+        act_absmax = x.reshape(-1, in_features).abs().amax(dim=0).to(torch.float32)
+        weight_absmax = fp.weight.detach().to(torch.float32).abs().amax(dim=0)
+        smooth_mask = compute_channel_mask(weight_absmax, act_absmax, alpha=0.99)
+    if "quarot" in variant or variant == "viditq":
+        quarot_sign = random_sign_vector(in_features, seed=seed + 100).to(device)
+
+    # Apply PTQ-side preprocessing to W (smooth, then rotate; matches ptq.py).
+    W_pre = fp.weight.detach().to(torch.float32)
+    if smooth_mask is not None:
+        W_pre = W_pre * smooth_mask.to(device, torch.float32).unsqueeze(0)
+    if quarot_sign is not None:
+        W_pre = rotate_weight(W_pre, quarot_sign)
+
+    # Apply runtime-side preprocessing to x (smooth, then rotate; matches
+    # base.py forward order). The reference receives this preprocessed x.
+    x_pre = x.to(torch.bfloat16)
+    if smooth_mask is not None:
+        x_pre = x_pre / smooth_mask.to(device, torch.bfloat16)
+    if quarot_sign is not None:
+        x_pre = apply_input_rotation(x_pre, quarot_sign).contiguous()
+
+    y_ref = _kernel_dequant_ref(x_pre, W_pre, bias_bf16, out_features, in_features)
+
+    # Wrapper output: install preprocessing buffers, hand it raw x; the
+    # forward path inside base.py applies smooth+rotate before quant.
+    mod = _build_wrapper(W_pre, bias_bf16, device, smooth_mask, quarot_sign)
+    y_wrap = mod(x)
+
+    err_vs_ref = (y_wrap.float() - y_ref.float()).abs().max().item()
+    err_vs_fp = (y_wrap.float() - y_fp.float()).abs().max().item()
+    ok = err_vs_ref < tol
+    flag = "OK" if ok else "FAIL"
+    print(f"  {variant:<10} {name:<32}  vs_ref={err_vs_ref:.3e}  vs_fp={err_vs_fp:.3e}  "
+          f"(tol={tol:.0e})  {flag}")
+    return ok
+
+
+def main() -> int:
+    if not torch.cuda.is_available():
+        print("CUDA unavailable.", file=sys.stderr)
+        return 2
+    device = torch.device("cuda:0")
+
+    shapes = [
+        ("attn  3072->3072   bias=True",  3072,  3072, 2, 256, True,  5e-2),
+        ("attn  3072->3072   bias=False", 3072,  3072, 2, 256, False, 5e-2),
+        ("ffn   3072->14336  bias=True",  3072, 14336, 1, 128, True,  5e-2),
+        ("ffn   14336->3072  bias=True",  14336, 3072, 1, 128, True,  5e-2),
+    ]
+    # Variants:
+    #   baseline: no preprocessing -- regression test against Phase 26a-2.
+    #   smooth:   SmoothQuant only (Phase 36).
+    #   quarot:   QuaRoT only (Phase 37; covered by check_part6, supersedes
+    #             the earlier standalone check_quarot.py).
+    #   viditq:   SmoothQuant + QuaRoT composed (Phase 38; paper method).
+    variants = ["baseline", "smooth", "quarot", "viditq"]
+
+    all_ok = True
+    for variant in variants:
+        print(f"\n=== {variant} ===")
+        for shape in shapes:
+            ok = _check_one(shape[0], variant, *shape[1:], device)
+            all_ok = all_ok and ok
+    print(f"\n{'PASS' if all_ok else 'FAIL'}")
+    return 0 if all_ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
