@@ -153,10 +153,15 @@ def load_quant_model(
 
     # Now register Phase 37+ preprocessing buffers on the matching Linears.
     # Done AFTER load_state_dict so the buffer's size is set from the ckpt
-    # tensor and is consistent with the per-layer in_features.
+    # tensor and is consistent with the per-layer in_features. base.py
+    # pre-seeds these names as `self.foo = None` so the forward path can
+    # branch on `is not None`; delete that placeholder before
+    # register_buffer to avoid "attribute already exists".
     for k, v in preprocessing_sd.items():
         module_name, _, buffer_name = k.rpartition(".")
         sub = model.get_submodule(module_name)
+        if hasattr(sub, buffer_name) and buffer_name not in sub._buffers:
+            delattr(sub, buffer_name)
         sub.register_buffer(buffer_name, v.to(device).contiguous(), persistent=True)
 
     logger.info(
