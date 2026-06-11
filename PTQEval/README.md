@@ -18,7 +18,7 @@ PTQEval/
     eval/                           WAM/method/benchmark-agnostic
       perf_probe.py                 PerfProbe class (CUDA Event + peak mem -> JSONL)
       aggregator.py                 perf JSONL + RoboTwin res.json -> summary.{csv,json}
-      run_eval.sh                   orchestrator (smoke / single / pool)
+      run_eval.py                   orchestrator (smoke / single / pool)
       monitor.sh                    watch-friendly dashboard
     wam/<wam>/                      one directory per WAM
       __init__.py                   sets LINGBOT_VA_PATH on sys.path (for lingbot_va)
@@ -56,13 +56,13 @@ pip install --no-build-isolation -e \
 # Smoke (bf16 baseline; 1 task, 1 episode, GPU 4)
 SAVE_ROOT=/home/arash/EvalForWAMs/results/smoke_bf16 \
 ROBOTWIN_ROOT=/home/arash/EvalForWAMs/RoboTwin \
-  bash /home/arash/EvalForWAMs/PTQEval/ptqeval/eval/run_eval.sh \
+  python -m ptqeval.eval.run_eval \
     --mode smoke --task_name adjust_bottle --test_num 1 --gpu_id 4
 
 # Pool (15 tasks, 25 episodes, all usable GPUs)
 SAVE_ROOT=/home/arash/EvalForWAMs/results/bf16 \
 ROBOTWIN_ROOT=/home/arash/EvalForWAMs/RoboTwin \
-  bash /home/arash/EvalForWAMs/PTQEval/ptqeval/eval/run_eval.sh \
+  python -m ptqeval.eval.run_eval \
     --mode pool --min_free_mb 40000
 
 # Quant variant (viditq W8A8 example)
@@ -70,8 +70,14 @@ SAVE_ROOT=/home/arash/EvalForWAMs/results/viditq_w8a8_kernel \
 ROBOTWIN_ROOT=/home/arash/EvalForWAMs/RoboTwin \
 VARIANT=viditq \
 VARIANT_ARGS=/home/arash/EvalForWAMs/PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8.yaml \
-  bash /home/arash/EvalForWAMs/PTQEval/ptqeval/eval/run_eval.sh \
+  python -m ptqeval.eval.run_eval \
     --mode pool
+
+# Calibration data collection (Phase 31; 50 task x 5 ep on bf16)
+TASK_LIST_NAME=CALIB_TASKS_ALL \
+CALIBRATE_OUT=/home/arash/EvalForWAMs/results/calib_data/calib_data.pth \
+SAVE_ROOT=/home/arash/EvalForWAMs/results/calib_capture \
+  python -m ptqeval.eval.run_eval --mode pool --test_num 5
 
 # Aggregate
 python -m ptqeval.eval.aggregator \
@@ -84,7 +90,7 @@ SAVE_ROOT=/home/arash/EvalForWAMs/results/bf16 \
   watch -n 1 bash /home/arash/EvalForWAMs/PTQEval/ptqeval/eval/monitor.sh
 ```
 
-## Env vars consumed by run_eval.sh
+## Env vars consumed by run_eval.py
 
 | Var | Default | Purpose |
 |---|---|---|
@@ -128,11 +134,11 @@ PTQEval/ptqeval/wam/<new_wam>/
   server.py         FORK of new WAM's upstream server; insert probe stages + variant dispatch
   eval_client.py    FORK of corresponding upstream client
   tasks.py          SELECTED_15_TASKS + EVAL_STEP_LIMIT
-  launchers/        bash launchers (optional; run_eval.sh subsumes them)
+  launchers/        bash launchers (optional; run_eval.py subsumes them)
   method/<m>/...    per (new_wam, method) pair; mirror existing pattern
 ```
 
-Set `WAM_NAME=<new_wam>` (and updated `WAM_MODEL_PATH`) when invoking `run_eval.sh`.
+Set `WAM_NAME=<new_wam>` (and updated `WAM_MODEL_PATH`) when invoking `run_eval.py`.
 
 ## Principles (see plan.txt Section 0)
 
