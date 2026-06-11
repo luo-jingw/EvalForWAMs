@@ -49,14 +49,24 @@ def _kernel_dequant_ref(
     bias_bf16,
     out_features: int,
     in_features: int,
+    act_scale_static=None,
 ) -> torch.Tensor:
     """fp32 dequant-then-matmul reference for the preprocessed (W, x) pair.
     Caller is responsible for applying the activation-side smooth /
-    rotation BEFORE handing x_preprocessed in."""
+    rotation BEFORE handing x_preprocessed in.
+
+    When act_scale_static is provided, drives the static act-quant kernel
+    (skips runtime amax) so the wrapper-vs-ref comparison covers Phase
+    33's static path too."""
     w_int, scale_w_eff, zero_point = _per_channel_asym_quant_w(w_preprocessed_f32)
 
     x_bf16 = x_preprocessed.to(torch.bfloat16).reshape(-1, in_features).contiguous()
-    x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum(x_bf16)
+    if act_scale_static is not None:
+        from qwan_extension import act_quant_bf16_with_sum_static
+        scale_in = act_scale_static.to(x_bf16.device, torch.bfloat16).reshape(1).contiguous()
+        x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum_static(x_bf16, scale_in)
+    else:
+        x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum(x_bf16)
     sx = scale_x_bf16.to(torch.float32)
     sa = sum_x_bf16.to(torch.float32)
     zp = zero_point
@@ -70,7 +80,8 @@ def _kernel_dequant_ref(
 
 
 def _build_wrapper(W_preprocessed_f32: torch.Tensor, bias_bf16, device,
-                   smooth_mask=None, quarot_sign=None) -> QuantWanLinearW8A8:
+                   smooth_mask=None, quarot_sign=None,
+                   act_scale_static=None) -> QuantWanLinearW8A8:
     """Build a QuantWanLinearW8A8 by directly quantizing W_preprocessed_f32
     (fp32) -- matching ptq.py exactly. Going through nn.Linear.weight
     would force a bf16 cast that smooths over the fine-grained values
@@ -92,6 +103,8 @@ def _build_wrapper(W_preprocessed_f32: torch.Tensor, bias_bf16, device,
         mod.act_channel_div = smooth_mask.to(device, torch.bfloat16).contiguous()
     if quarot_sign is not None:
         mod.quarot_sign = quarot_sign.to(device, torch.int8).contiguous()
+    if act_scale_static is not None:
+        mod.act_scale_static = act_scale_static.to(device, torch.bfloat16).reshape(1).contiguous()
     return mod
 
 
@@ -114,13 +127,26 @@ def _check_one(name: str, variant: str,
 
     smooth_mask = None
     quarot_sign = None
-    if "smooth" in variant or variant == "viditq":
+    act_scale_static = None
+    use_smooth = "smooth" in variant or "viditq" in variant
+    use_quarot = "quarot" in variant or "viditq" in variant
+    use_static = "static" in variant or variant == "viditq_static"
+    if use_smooth:
         # Synthetic act_absmax: take from the actual x (worst-case proxy).
         act_absmax = x.reshape(-1, in_features).abs().amax(dim=0).to(torch.float32)
         weight_absmax = fp.weight.detach().to(torch.float32).abs().amax(dim=0)
         smooth_mask = compute_smooth_scale(weight_absmax, act_absmax, alpha=0.99)
-    if "quarot" in variant or variant == "viditq":
+    if use_quarot:
         quarot_sign = random_sign_vector(in_features, seed=seed + 100).to(device)
+    if use_static:
+        # Match ptq.py: derive per-layer scalar from post-smooth absmax
+        # (or raw absmax when smooth is off).
+        act_absmax_for_static = x.reshape(-1, in_features).abs().amax(dim=0).to(torch.float32)
+        if smooth_mask is not None:
+            post = act_absmax_for_static / smooth_mask.to(act_absmax_for_static.device)
+        else:
+            post = act_absmax_for_static
+        act_scale_static = (post.amax() / 127.0).reshape(1)
 
     # Apply PTQ-side preprocessing to W (smooth, then rotate; matches ptq.py).
     W_pre = fp.weight.detach().to(torch.float32)
@@ -137,11 +163,13 @@ def _check_one(name: str, variant: str,
     if quarot_sign is not None:
         x_pre = apply_input_rotation(x_pre, quarot_sign).contiguous()
 
-    y_ref = _kernel_dequant_ref(x_pre, W_pre, bias_bf16, out_features, in_features)
+    y_ref = _kernel_dequant_ref(x_pre, W_pre, bias_bf16, out_features, in_features,
+                                 act_scale_static=act_scale_static)
 
     # Wrapper output: install preprocessing buffers, hand it raw x; the
     # forward path inside base.py applies smooth+rotate before quant.
-    mod = _build_wrapper(W_pre, bias_bf16, device, smooth_mask, quarot_sign)
+    mod = _build_wrapper(W_pre, bias_bf16, device, smooth_mask, quarot_sign,
+                          act_scale_static=act_scale_static)
     y_wrap = mod(x)
 
     err_vs_ref = (y_wrap.float() - y_ref.float()).abs().max().item()
@@ -166,12 +194,14 @@ def main() -> int:
         ("ffn   14336->3072  bias=True",  14336, 3072, 1, 128, True,  5e-2),
     ]
     # Variants:
-    #   baseline: no preprocessing -- regression test against Phase 26a-2.
-    #   smooth:   SmoothQuant only (Phase 36).
-    #   quarot:   QuaRoT only (Phase 37; covered by check_part6, supersedes
-    #             the earlier standalone check_quarot.py).
-    #   viditq:   SmoothQuant + QuaRoT composed (Phase 38; paper method).
-    variants = ["baseline", "smooth", "quarot", "viditq"]
+    #   baseline:      no preprocessing -- regression test against Phase 26a-2.
+    #   smooth:        SmoothQuant only (Phase 36).
+    #   quarot:        QuaRoT only (Phase 37; supersedes check_quarot.py).
+    #   viditq:        SmoothQuant + QuaRoT (Phase 38; dynamic act).
+    #   static:        bare static activation only (Phase 33).
+    #   viditq_static: SmoothQuant + QuaRoT + static activation (Phase 33;
+    #                  the paper-faithful "ViDiT-Q" W8A8 method).
+    variants = ["baseline", "smooth", "quarot", "viditq", "static", "viditq_static"]
 
     all_ok = True
     for variant in variants:

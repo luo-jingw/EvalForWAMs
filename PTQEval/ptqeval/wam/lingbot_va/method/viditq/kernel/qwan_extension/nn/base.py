@@ -12,14 +12,18 @@ state_dict keys (Phase 26a-2, asym per-channel weight schema):
     zp_weight    int16 [C_out]
     bias         bf16  [C_out]               (omitted when has_bias=False)
 
-Optional Part VI preprocessing buffers (default empty -> no-op):
-    quarot_sign  int8  [C_in]                (Phase 37 QuaRoT sign vector;
+Optional Part VI preprocessing buffers (default None -> no-op):
+    quarot_sign      int8  [C_in]            (Phase 37 QuaRoT sign vector;
                                               triggers Hadamard rotation
                                               of x before quant)
-    act_channel_div bf16 [C_in]              (Phase 36 SmoothQuant
+    act_channel_div  bf16  [C_in]            (Phase 36 SmoothQuant
                                               channel_mask; triggers per-
                                               channel division of x
                                               before rotation/quant)
+    act_scale_static bf16  [1]               (Phase 33 static activation
+                                              scale; routes act quant to
+                                              the static kernel variant
+                                              which skips runtime amax)
 """
 from __future__ import annotations
 
@@ -88,6 +92,7 @@ class QuantWanLinearBase(nn.Module, ABC):
         # raises on shape mismatch, only ignores missing keys).
         self.act_channel_div: Optional[torch.Tensor] = None
         self.quarot_sign: Optional[torch.Tensor] = None
+        self.act_scale_static: Optional[torch.Tensor] = None
 
     @staticmethod
     @abstractmethod
@@ -142,8 +147,17 @@ class QuantWanLinearBase(nn.Module, ABC):
         if M_pad != M:
             x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, M_pad - M))
 
-        from qwan_extension import act_quant_bf16_with_sum  # local import: avoids cycles
-        x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum(x_2d)
+        # Phase 33: static act quant when calibrated scale buffer is present;
+        # else dynamic per-token amax. Both return the same (x_int8, scale_x,
+        # sum_x) triple so the downstream W8A8 GEMM is unchanged.
+        if self.act_scale_static is not None:
+            from qwan_extension import act_quant_bf16_with_sum_static
+            x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum_static(
+                x_2d, self.act_scale_static
+            )
+        else:
+            from qwan_extension import act_quant_bf16_with_sum  # local: avoids cycles
+            x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum(x_2d)
         y_2d = self._gemm(x_int8, scale_x_bf16, sum_x_bf16)
 
         if M_pad != M:

@@ -78,6 +78,10 @@ class IntLayerEntry:
     quarot_sign: Optional[torch.Tensor] = None       # int8 [C_in] or None
     act_channel_div: Optional[torch.Tensor] = None   # bf16 [C_in] (SmoothQuant
                                                      #   channel_mask) or None
+    act_scale_static: Optional[torch.Tensor] = None  # bf16 [1] (Phase 33
+                                                     #   per-layer scalar
+                                                     #   for static act
+                                                     #   quant) or None
 
 
 def _per_channel_asym_quant(
@@ -189,6 +193,7 @@ def compute_int_state_dict(
     quarot_seed_base: int = 0,
     smooth_quant_enabled: bool = False,
     smooth_alpha: float = 0.99,
+    static_act_enabled: bool = False,
     calib_data: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict[str, IntLayerEntry]:
     """Walk model. For every nn.Linear whose full name does NOT match
@@ -206,14 +211,22 @@ def compute_int_state_dict(
     Phase 38: setting BOTH flags reproduces the paper-namesake "ViDiT"
     method. Order matches viditq_quant_layer.py:47-48 exactly: smooth
     first, then rotate, then quant.
+
+    Phase 33: when static_act_enabled, derive a per-layer scalar from
+    calib_data and emit as act_scale_static buffer. base.py forward
+    routes to act_quant_bf16_with_sum_static (skips runtime amax).
+    When stacked with smooth_quant, the static scale is computed on the
+    POST-smooth distribution (act_absmax / channel_mask) so it bounds
+    what x_smooth actually sees at runtime.
     """
     from ptqeval.wam.lingbot_va.method.viditq.quarot import random_sign_vector
     from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_smooth_scale
 
-    if smooth_quant_enabled and calib_data is None:
+    if (smooth_quant_enabled or static_act_enabled) and calib_data is None:
         raise ValueError(
-            "smooth_quant_enabled requires calib_data; load via Phase 31 "
-            "calib_data.pth and pass dict[layer_name -> [C_in] absmax]."
+            "smooth_quant_enabled / static_act_enabled require calib_data; "
+            "load via Phase 31 calib_data.pth and pass dict[layer_name -> "
+            "[C_in] absmax]."
         )
 
     pattern = re.compile(remain_fp_regex)
@@ -261,12 +274,28 @@ def compute_int_state_dict(
                 module.in_features, seed=quarot_seed_base + layer_index
             )
 
+        # Phase 33: per-layer static activation scale. Derive from calib
+        # data, accounting for smooth_quant rescale if it ran first.
+        # QuaRoT is orthogonal so its post-rotation max equals the pre-
+        # rotation max (in expectation; rotation redistributes outliers
+        # rather than amplifying them), so we don't compensate for it.
+        act_scale_static = None
+        if static_act_enabled and name in calib_data:
+            act_absmax = calib_data[name].to(torch.float32)
+            if smooth_mask is not None:
+                # post-smooth distribution: x_smooth = x / channel_mask
+                post = act_absmax / smooth_mask.to(act_absmax.device)
+            else:
+                post = act_absmax
+            act_scale_static = (post.amax() / 127.0).to(torch.bfloat16).reshape(1)
+
         entries[name] = _quantize_one(
             module,
             weight_bits,
             smooth_channel_mask=smooth_mask,
             quarot_sign=quarot_sign,
         )
+        entries[name].act_scale_static = act_scale_static
         layer_index += 1
 
     if missing_calib:
@@ -292,6 +321,8 @@ def _flatten_to_state_dict(
             sd[f"{name}.quarot_sign"] = e.quarot_sign.cpu()
         if e.act_channel_div is not None:
             sd[f"{name}.act_channel_div"] = e.act_channel_div.cpu()
+        if e.act_scale_static is not None:
+            sd[f"{name}.act_scale_static"] = e.act_scale_static.cpu()
     return sd
 
 
@@ -334,19 +365,21 @@ def main() -> int:
             f"default true); Phase 24d only supports asymmetric quant. Set "
             f"weight_sym: false in the yaml."
         )
-    # Phase 36/37/38: optional preprocessing. Config drives the variant
+    # Phase 33/36/37/38: optional preprocessing. Config drives the variant
     # (one ptq.py invocation per variant); CLI does not override config.
     quarot_enabled = bool(cfg.get("quarot", False))
     quarot_seed_base = int(cfg.get("quarot_seed_base", 0))
     smooth_quant_enabled = bool(cfg.get("smooth_quant", False))
     smooth_alpha = float(cfg.get("smooth_alpha", 0.99))
+    static_act_enabled = bool(cfg.get("static_act", False))
     calib_data_path = cfg.get("calib_data_path", None)
     calib_data = None
-    if smooth_quant_enabled:
+    if smooth_quant_enabled or static_act_enabled:
         if not calib_data_path:
             raise ValueError(
-                f"layer_config {args.layer_config} has smooth_quant=true but "
-                f"no calib_data_path; run Phase 31 calibration first."
+                f"layer_config {args.layer_config} requires calib_data_path "
+                f"(smooth_quant={smooth_quant_enabled} static_act="
+                f"{static_act_enabled}); run Phase 31 calibration first."
             )
         calib_data = torch.load(str(calib_data_path), weights_only=True)
         if not isinstance(calib_data, dict):
@@ -373,9 +406,10 @@ def main() -> int:
                 f"remain_fp_regex={remain_fp_regex!r}")
     logger.info(
         f"smooth_quant={smooth_quant_enabled} alpha={smooth_alpha} "
-        f"quarot={quarot_enabled} seed_base={quarot_seed_base}"
+        f"quarot={quarot_enabled} seed_base={quarot_seed_base} "
+        f"static_act={static_act_enabled}"
     )
-    if smooth_quant_enabled:
+    if calib_data is not None:
         logger.info(f"calib_data: {calib_data_path} ({len(calib_data)} layers)")
     logger.info(f"total nn.Linear in model: {n_linear_total}")
 
@@ -387,6 +421,7 @@ def main() -> int:
         quarot_seed_base=quarot_seed_base,
         smooth_quant_enabled=smooth_quant_enabled,
         smooth_alpha=smooth_alpha,
+        static_act_enabled=static_act_enabled,
         calib_data=calib_data,
     )
     n_quant = len(entries)

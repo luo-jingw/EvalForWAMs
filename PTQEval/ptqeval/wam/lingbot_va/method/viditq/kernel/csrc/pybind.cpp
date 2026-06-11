@@ -6,6 +6,8 @@
 std::tuple<torch::Tensor, torch::Tensor> act_quant_bf16(torch::Tensor x_bf16);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
     act_quant_bf16_with_sum(torch::Tensor x_bf16);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+    act_quant_bf16_with_sum_static(torch::Tensor x_bf16, torch::Tensor scale_in);
 
 // toy_mma_int8.cu
 void toy_mma_int8_gemm(
@@ -76,6 +78,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Same algorithm as ViDiT-Q QuantKernel<bf16, _, kPostQuant>;\n"
           "grid-stride structure handles arbitrary K (no <=8192 cap).",
           py::arg("x_bf16"));
+
+    m.def("act_quant_bf16_with_sum_static",
+          &act_quant_bf16_with_sum_static,
+          "Phase 33 static variant. Same as act_quant_bf16_with_sum but\n"
+          "skips amax reduction; reads a pre-computed scalar scale from\n"
+          "scale_in[0] (bf16). scale_x[N] is still filled with the scalar\n"
+          "so downstream W8A8 GEMM consumes the same per-row scale[M]\n"
+          "interface as the dynamic variant.\n"
+          "Input:  x_bf16 [N, K], scale_in [1] bf16.\n"
+          "Output: (x_int8 [N, K], scale_x_bf16 [N], sum_x_bf16 [N]).",
+          py::arg("x_bf16"), py::arg("scale_in"));
 
     m.def("toy_mma_int8_gemm",
           &toy_mma_int8_gemm,
