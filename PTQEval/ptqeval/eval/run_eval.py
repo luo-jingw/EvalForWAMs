@@ -470,6 +470,16 @@ def run_pool(cfg: Config) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    # Line-buffer stdout/stderr so progress prints appear in the redirected
+    # nohup log file in real time. Default Python buffering is block-mode
+    # (4KB) when stdout is a file, which hides progress for orchestrator
+    # runs that print a few lines per task transition.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
     cfg = parse_args()
     install_signal_handlers()
     try:
