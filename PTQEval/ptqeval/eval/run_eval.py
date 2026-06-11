@@ -268,27 +268,74 @@ def launch_in_session(bash_cmd: str, log_path: Path) -> subprocess.Popen:
     )
 
 
-def kill_session(pid: int, timeout: float = 5.0) -> None:
-    """SIGTERM the process group; escalate to SIGKILL after timeout."""
-    try:
-        pgid = os.getpgid(pid)
-    except ProcessLookupError:
-        return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    start = time.time()
-    while time.time() - start < timeout:
+def _find_descendants(root_pid: int) -> list[int]:
+    """Walk /proc to find every descendant of root_pid via PPID chain.
+
+    Needed because torch.distributed.run creates its worker process in a
+    fresh POSIX session (setsid), so os.killpg(launcher_pid) does NOT
+    reach the worker. The descendant walk catches that case.
+    """
+    parent_map: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
         try:
-            os.killpg(pgid, 0)
+            with open(f"/proc/{entry}/stat") as f:
+                stat = f.read()
+            # comm field is in parens and may contain spaces;
+            # PPID is the 4th field after the closing paren.
+            comm_close = stat.rindex(")")
+            ppid = int(stat[comm_close + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        parent_map.setdefault(ppid, []).append(int(entry))
+
+    out: list[int] = []
+    stack = [root_pid]
+    seen: set[int] = set()
+    while stack:
+        cur = stack.pop()
+        for child in parent_map.get(cur, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            out.append(child)
+            stack.append(child)
+    return out
+
+
+def kill_session(pid: int, timeout: float = 5.0) -> None:
+    """SIGTERM the process and all its descendants; SIGKILL survivors
+    after `timeout`. Descendants found via /proc walking so we catch
+    torch.distributed.run workers that setsid into their own group."""
+    # Snapshot the tree BEFORE killing (otherwise reaping the parent
+    # would orphan grandchildren and we'd lose their PIDs).
+    targets = [pid] + _find_descendants(pid)
+
+    for p in targets:
+        try:
+            os.kill(p, signal.SIGTERM)
         except ProcessLookupError:
+            pass
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        alive: list[int] = []
+        for p in targets:
+            try:
+                os.kill(p, 0)
+                alive.append(p)
+            except ProcessLookupError:
+                pass
+        if not alive:
             return
         time.sleep(0.2)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+
+    for p in targets:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def start_server(cfg: Config, gpu: int, port: int, master_port: int,
