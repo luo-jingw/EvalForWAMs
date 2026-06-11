@@ -15,6 +15,9 @@ Process lifecycle:
 All configuration is via --xxx CLI args (no env vars). Required: --mode
 and --save_root. Defaults exist for everything else; see --help.
 
+Calibration data collection is a peer pipeline (collect_calib.py +
+derive_calib_and_ptq.py); run_eval no longer carries calibration plumbing.
+
 Examples:
   python -m ptqeval.eval.run_eval \\
       --mode smoke \\
