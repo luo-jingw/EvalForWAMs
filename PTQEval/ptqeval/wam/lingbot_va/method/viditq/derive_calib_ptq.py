@@ -166,26 +166,35 @@ _CHUNK_RE = re.compile(r"obs_data_(\d+)\.pt$")
 
 def _replay_episode(server: "VA_Server", ep_dir: Path) -> int:
     """Drive server.infer over every saved obs chunk in ep_dir. Returns
-    number of chunks driven (== number of _infer transformer denoising
-    loops fired, ~30 hook firings per target Linear per chunk).
+    number of _infer calls fired (each runs the full diffusion denoising
+    loop -> ~20 transformer forwards = ~20 hook firings per target
+    Linear per chunk).
 
-    We only replay `_infer` calls (not `_compute_kv_cache`). Implication:
-      - LingBot-VA's transformer keeps a named KV cache (cache_name='pos')
-        across chunks in live eval, populated by compute_kv_cache between
-        chunks. We don't have the (obs, action) tuples in the right
-        post-processed format to reconstruct that path here, so each
-        replayed chunk runs with frame_st_id == 0 (cache empty / partial).
-      - For statistical calibration (per-channel input absmax) this is
-        adequate: each chunk's 30-step denoising loop fires hooks on
-        all 180 target Linears, contributing tens of thousands of samples
-        per layer. Per-channel absmax converges fast and is dominated by
-        magnitude, not cache-state continuity.
-      - If a future faithfulness check shows derive-produced calib
-        diverging materially from live-hook calib (results/calib_data/
-        calib_data.pth from the in-line hook path), we extend this loop
-        to also call infer({'compute_kv_cache': True, 'state': ...,
-        'obs': ...}) and reconstruct the action state via postprocess +
-        preprocess round-trip (~50 extra lines).
+    Replay strategy: reset + 1-frame _infer per chunk. Rationale:
+      - obs_data_*.pt was saved in `_compute_kv_cache` (server.py:641)
+        where the streaming VAE state was ALREADY primed by prior
+        chunks. Feeding 4-frame chunks into `_infer` on FRESH VAE state
+        shape-mismatches inside AutoencoderKLWan.avg_shortcut (expects
+        post-downsample temporal dim 2 but receives 4).
+      - `_infer` only consumes obs when frame_st_id == 0 (server.py:509-
+        510); subsequent calls ignore obs entirely. To get hook coverage
+        on multiple saved chunks we must reset() between them so each
+        chunk replays as a fresh frame_st_id=0 inference, with single-
+        frame obs to satisfy fresh-VAE shape.
+      - Single-frame init matches what eval_client sends on the very
+        first infer call (eval_client.py:561 `first_obs = format_obs(
+        observation, prompt)` is a single dict, not a list).
+      - Diffusion runs the full denoising loop per call (~20 transformer
+        forwards), so per-channel absmax converges fast. 4-frame temporal
+        diversity within a chunk is lost, but 75 ep * ~10 chunks gives
+        ~750 _infer calls * ~20 forwards each = ~15k transformer forwards
+        of hook coverage -- ample for per-channel running max.
+
+    KV cache + frame_st_id continuity from the live flow is NOT
+    reconstructed (would require feeding the post-processed action state
+    into `_compute_kv_cache` between chunks). Calibration only needs
+    per-channel input absmax, which is determined by activation
+    magnitude distribution -- robust to cache-state perturbation.
     """
     chunks = sorted(
         (int(_CHUNK_RE.search(p.name).group(1)), p)
@@ -196,18 +205,20 @@ def _replay_episode(server: "VA_Server", ep_dir: Path) -> int:
 
     first = torch.load(chunks[0][1], weights_only=False, map_location="cpu")
     prompt = first[0]["task"]
-    # reset clears KV cache + sets frame_st_id back to 0; server-managed
-    # state evolves naturally across the following infer calls.
-    server.infer({"reset": True, "prompt": prompt, "save_visualization": False})
 
+    n_calls = 0
     for _, chunk_path in chunks:
         obs_list = torch.load(chunk_path, weights_only=False, map_location="cpu")
+        # Fresh reset between chunks -> VAE/KV cache empty -> single-frame
+        # obs is the only shape that _encode_obs handles in this state.
+        server.infer({"reset": True, "prompt": prompt, "save_visualization": False})
         server.infer({
-            "obs": obs_list,
+            "obs": [obs_list[0]],
             "prompt": prompt,
             "save_visualization": False,
         })
-    return len(chunks)
+        n_calls += 1
+    return n_calls
 
 
 # ---------------------------------------------------------------------------
