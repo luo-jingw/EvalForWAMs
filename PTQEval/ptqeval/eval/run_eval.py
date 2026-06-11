@@ -25,12 +25,6 @@ Examples:
       --save_root /home/arash/EvalForWAMs/results/bf16
 
   python -m ptqeval.eval.run_eval \\
-      --mode pool --test_num 5 \\
-      --task_list_name CALIB_TASKS_ALL \\
-      --calibrate_out /home/arash/EvalForWAMs/results/calib_data/calib_data.pth \\
-      --save_root /home/arash/EvalForWAMs/results/calib_capture
-
-  python -m ptqeval.eval.run_eval \\
       --mode pool \\
       --variant viditq \\
       --variant_args .../runtime_args_w8a8_viditq.yaml \\
@@ -74,7 +68,6 @@ class Config:
     robotwin_root: str
     variant: str
     variant_args: str
-    calibrate_out: str
     task_list_name: str
     task_config: str
     server_env: str
@@ -132,8 +125,6 @@ def parse_args() -> Config:
                         "Empty -> bf16 baseline.")
     p.add_argument("--variant_args", type=Path, default=None,
                    help="Runtime args yaml (layer_config + int_weights_ckpt).")
-    p.add_argument("--calibrate_out", type=Path, default=None,
-                   help="Phase 31 calib: dump per-channel input absmax here.")
 
     # --- task list ---
     p.add_argument("--task_list_name", default="SELECTED_15_TASKS",
@@ -170,7 +161,6 @@ def parse_args() -> Config:
         robotwin_root=str(args.robotwin_root),
         variant=args.variant,
         variant_args=str(args.variant_args) if args.variant_args else "",
-        calibrate_out=str(args.calibrate_out) if args.calibrate_out else "",
         task_list_name=args.task_list_name,
         task_config=args.task_config,
         server_env=args.server_env,
@@ -352,8 +342,6 @@ def start_server(cfg: Config, gpu: int, port: int, master_port: int,
         extra.append(f"--variant {cfg.variant}")
         if cfg.variant_args:
             extra.append(f"--variant_args {cfg.variant_args}")
-    if cfg.calibrate_out:
-        extra.append(f"--calibrate_out {cfg.calibrate_out}")
     extra_cli = " ".join(extra)
 
     cmd = (
