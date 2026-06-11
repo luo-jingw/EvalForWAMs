@@ -165,8 +165,28 @@ _CHUNK_RE = re.compile(r"obs_data_(\d+)\.pt$")
 
 
 def _replay_episode(server: "VA_Server", ep_dir: Path) -> int:
-    """Drive server.infer over every chunk in ep_dir. Returns number of
-    chunks driven (== number of times hooks fired per Linear)."""
+    """Drive server.infer over every saved obs chunk in ep_dir. Returns
+    number of chunks driven (== number of _infer transformer denoising
+    loops fired, ~30 hook firings per target Linear per chunk).
+
+    We only replay `_infer` calls (not `_compute_kv_cache`). Implication:
+      - LingBot-VA's transformer keeps a named KV cache (cache_name='pos')
+        across chunks in live eval, populated by compute_kv_cache between
+        chunks. We don't have the (obs, action) tuples in the right
+        post-processed format to reconstruct that path here, so each
+        replayed chunk runs with frame_st_id == 0 (cache empty / partial).
+      - For statistical calibration (per-channel input absmax) this is
+        adequate: each chunk's 30-step denoising loop fires hooks on
+        all 180 target Linears, contributing tens of thousands of samples
+        per layer. Per-channel absmax converges fast and is dominated by
+        magnitude, not cache-state continuity.
+      - If a future faithfulness check shows derive-produced calib
+        diverging materially from live-hook calib (results/calib_data/
+        calib_data.pth from the in-line hook path), we extend this loop
+        to also call infer({'compute_kv_cache': True, 'state': ...,
+        'obs': ...}) and reconstruct the action state via postprocess +
+        preprocess round-trip (~50 extra lines).
+    """
     chunks = sorted(
         (int(_CHUNK_RE.search(p.name).group(1)), p)
         for p in ep_dir.glob("obs_data_*.pt")
@@ -176,15 +196,12 @@ def _replay_episode(server: "VA_Server", ep_dir: Path) -> int:
 
     first = torch.load(chunks[0][1], weights_only=False, map_location="cpu")
     prompt = first[0]["task"]
-
+    # reset clears KV cache + sets frame_st_id back to 0; server-managed
+    # state evolves naturally across the following infer calls.
     server.infer({"reset": True, "prompt": prompt, "save_visualization": False})
 
-    # Force fresh init_latent computation each chunk by resetting
-    # frame_st_id (server._infer treats frame_st_id == 0 as the first
-    # chunk and re-encodes obs via VAE).
     for _, chunk_path in chunks:
         obs_list = torch.load(chunk_path, weights_only=False, map_location="cpu")
-        server.frame_st_id = 0
         server.infer({
             "obs": obs_list,
             "prompt": prompt,
