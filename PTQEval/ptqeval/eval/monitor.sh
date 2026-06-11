@@ -66,6 +66,28 @@ nvidia-smi --query-gpu=index,memory.used,memory.total,memory.free,utilization.gp
     --format=csv,noheader,nounits 2>/dev/null | \
     awk -F', *' '{printf "%-3s  %6s / %-6s   %-8s   %s\n", $1, $2, $3, $4, $5}'
 
+# ---- DONE summary (from res.json; survives logs/ cleanup) ----
+RES_GLOB="${SAVE_ROOT}/stseed-10000/metrics/*/res.json"
+n_done=$(ls $RES_GLOB 2>/dev/null | wc -l)
+printf "\nDONE (res.json): %s task(s)" "$n_done"
+if [ "$n_done" -gt 0 ]; then
+    sr_summary=$(for f in $RES_GLOB; do
+        task=$(basename "$(dirname "$f")")
+        python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    s=int(d.get('succ_num',0)); t=int(d.get('total_num',0))
+    pct=f'{s/t*100:.0f}%' if t else '-'
+    print(f'  {sys.argv[2]:<28} {s}/{t} ({pct})')
+except Exception as e:
+    print(f'  {sys.argv[2]:<28} (res.json parse error: {e})')
+" "$f" "$task" 2>/dev/null
+    done | sort)
+    printf "\n%s" "$sr_summary"
+fi
+printf "\n"
+
 # ---- pick latest log dir ----
 LATEST_DIR="$(ls -td "${SAVE_ROOT}"/logs/*/ 2>/dev/null | head -1)"
 if [ -z "$LATEST_DIR" ]; then
