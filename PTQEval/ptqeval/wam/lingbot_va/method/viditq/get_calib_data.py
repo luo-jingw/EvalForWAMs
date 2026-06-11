@@ -25,6 +25,7 @@ the Part V plan.
 from __future__ import annotations
 
 import atexit
+import fcntl
 import logging
 import os
 import signal
@@ -96,36 +97,39 @@ class _CalibState:
 
     def dump(self) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(self.out_path)), exist_ok=True)
-        # Pool-safe merge-on-write: a concurrent server (pool mode runs
-        # one server per GPU) may have advanced the running max on disk
-        # since our last load. Reload, element-wise max with our state,
-        # then write. Race window is now just "two dumps started before
-        # either finished" -- the second writer's max will incorporate
-        # the first writer's contribution. Lost updates can only occur
-        # if BOTH read pre-write, then both write back-to-back without
-        # a re-read in between. With PERIODIC_DUMP_INTERVAL=100 calls
-        # between dumps and ms-scale write time, the race window is
-        # effectively zero in practice.
-        if os.path.exists(self.out_path):
-            try:
-                disk = torch.load(self.out_path, weights_only=True, map_location="cpu")
-                for k, v_disk in disk.items():
-                    if k in self.absmax:
-                        self.absmax[k] = torch.maximum(
-                            v_disk.float(), self.absmax[k].float()
-                        ).to(torch.bfloat16)
-                    else:
-                        self.absmax[k] = v_disk
-            except Exception as e:
-                logger.warning(
-                    f"calib dump-merge: failed to reload {self.out_path} ({e}); "
-                    f"writing our local state only."
-                )
-        # Atomic-ish: write to .tmp then rename. Avoids torch.load on a
-        # half-written file if SIGKILL hits mid-dump.
-        tmp = self.out_path + ".tmp"
-        torch.save(self.absmax, tmp)
-        os.replace(tmp, self.out_path)
+        # Pool-safe merge-on-write. Concurrent servers (pool mode runs one
+        # server per GPU, all hooking the same out_path) must serialize
+        # the read-modify-write so updates don't get lost. Two pieces:
+        #   1. fcntl.flock(LOCK_EX) on a lockfile -- POSIX advisory lock
+        #      held for the whole load->merge->save->rename critical
+        #      section. Blocks other processes during their own dump.
+        #   2. Per-PID tmp filename. Without this, all writers race on
+        #      the same `.tmp` path: writer A's os.replace can rename
+        #      A's tmp to final, then writer B's os.replace finds B's
+        #      tmp gone (race window: A wrote tmp, A rename, B wrote
+        #      tmp, A rename completed, B's rename target vanished).
+        #      With per-PID tmp this is impossible.
+        lock_path = self.out_path + ".lock"
+        with open(lock_path, "w") as lockf:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            if os.path.exists(self.out_path):
+                try:
+                    disk = torch.load(self.out_path, weights_only=True, map_location="cpu")
+                    for k, v_disk in disk.items():
+                        if k in self.absmax:
+                            self.absmax[k] = torch.maximum(
+                                v_disk.float(), self.absmax[k].float()
+                            ).to(torch.bfloat16)
+                        else:
+                            self.absmax[k] = v_disk
+                except Exception as e:
+                    logger.warning(
+                        f"calib dump-merge: failed to reload {self.out_path} ({e}); "
+                        f"writing our local state only."
+                    )
+            tmp = self.out_path + f".tmp.{os.getpid()}"
+            torch.save(self.absmax, tmp)
+            os.replace(tmp, self.out_path)
         logger.info(
             f"calib dump (call_count={self.call_count}, layers={len(self.absmax)}) "
             f"-> {self.out_path}"
