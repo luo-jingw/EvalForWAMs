@@ -47,7 +47,15 @@ os.environ.setdefault("MASTER_PORT", "29577")
 import torch
 
 # Triggers ptqeval.wam.lingbot_va package init (adds lingbot-va to sys.path).
-import ptqeval.wam.lingbot_va  # noqa: F401
+import ptqeval.wam.lingbot_va as _lingbot_va_pkg  # noqa: F401
+# server.py imports {distributed, configs, modules, utils} as if they were
+# top-level packages; those live under lingbot-va/wan_va/. Replicate the
+# sys.path insertion server.py does so our in-process construction can
+# resolve `from distributed.util import init_distributed` etc.
+_WAN_VA_DIR = os.path.join(_lingbot_va_pkg.LINGBOT_VA_PATH, "wan_va")
+if _WAN_VA_DIR not in sys.path:
+    sys.path.insert(0, _WAN_VA_DIR)
+
 from ptqeval.wam.lingbot_va.tasks import SELECTED_15_TASKS
 from ptqeval.wam.lingbot_va.method.viditq.get_calib_data import install_calib_hooks
 
