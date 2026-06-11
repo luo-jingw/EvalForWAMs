@@ -1,29 +1,40 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-"""WAM RoboTwin eval orchestrator. Replaces run_eval.sh.
+"""WAM RoboTwin eval orchestrator.
 
 Modes:
   smoke  -- 1 GPU, 1 task, test_num=1; sanity check.
   single -- 1 GPU, sequential over task list (or one task via --task_name).
   pool   -- N GPUs, worker queue; one server per task per GPU.
 
-Process lifecycle fix vs run_eval.sh:
+Process lifecycle:
   Each server is launched in a NEW POSIX session (subprocess.Popen with
   start_new_session=True). When the task finishes, os.killpg(pid, SIGTERM)
-  takes down the whole launcher + torch.distributed.run + worker tree.
-  The bash version only killed the launcher PID, leaking the
-  torch.distributed.run grandchild on GPU; the leaked process kept the
-  model resident in VRAM, blocking the next pool worker from acquiring
-  the GPU until OOM-style failure cascaded.
+  takes down the whole launcher + torch.distributed.run + worker tree
+  (no zombie servers on GPU).
 
-Env vars (same names as the bash version):
-  WAM_NAME, WAM_MODEL_PATH, ROBOTWIN_ROOT, SAVE_ROOT, PERF_LOG_DIR,
-  VARIANT, VARIANT_ARGS, CALIBRATE_OUT, TASK_LIST_NAME,
-  SERVER_ENV, CLIENT_ENV, MIN_FREE_MB, GPU_WAIT_TIMEOUT, GPU_POLL_INTERVAL.
+All configuration is via --xxx CLI args (no env vars). Required: --mode
+and --save_root. Defaults exist for everything else; see --help.
 
-Invocation:
-  python -m ptqeval.eval.run_eval --mode pool --test_num 5
-  python -m ptqeval.eval.run_eval --mode smoke
-  python -m ptqeval.eval.run_eval --mode single --task_name adjust_bottle
+Examples:
+  python -m ptqeval.eval.run_eval \\
+      --mode smoke \\
+      --save_root /home/arash/EvalForWAMs/results/smoke_bf16
+
+  python -m ptqeval.eval.run_eval \\
+      --mode pool --test_num 25 \\
+      --save_root /home/arash/EvalForWAMs/results/bf16
+
+  python -m ptqeval.eval.run_eval \\
+      --mode pool --test_num 5 \\
+      --task_list_name CALIB_TASKS_ALL \\
+      --calibrate_out /home/arash/EvalForWAMs/results/calib_data/calib_data.pth \\
+      --save_root /home/arash/EvalForWAMs/results/calib_capture
+
+  python -m ptqeval.eval.run_eval \\
+      --mode pool \\
+      --variant viditq \\
+      --variant_args .../runtime_args_w8a8_viditq.yaml \\
+      --save_root /home/arash/EvalForWAMs/results/viditq_w8a8_viditq
 """
 from __future__ import annotations
 
@@ -71,72 +82,94 @@ class Config:
     perf_log_dir: Path
 
 
-def _env_int(name: str, default: int) -> int:
-    v = os.environ.get(name)
-    if v is None or v == "":
-        return default
-    return int(v)
-
-
 def parse_args() -> Config:
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=__doc__.split("\n\n", 1)[0],
-        epilog="Env vars: WAM_NAME, WAM_MODEL_PATH, ROBOTWIN_ROOT, SAVE_ROOT, "
-               "PERF_LOG_DIR, VARIANT, VARIANT_ARGS, CALIBRATE_OUT, "
-               "TASK_LIST_NAME (default SELECTED_15_TASKS), SERVER_ENV, "
-               "CLIENT_ENV, MIN_FREE_MB, GPU_WAIT_TIMEOUT, GPU_POLL_INTERVAL.",
+        description=__doc__,
     )
+
+    # --- mode + per-task ---
     p.add_argument("--mode", choices=["smoke", "single", "pool"], required=True)
-    p.add_argument("--task_name", help="smoke / single. Default adjust_bottle for smoke.")
-    p.add_argument("--test_num", type=int, help="Episodes per task. Smoke=1, single/pool=25.")
-    p.add_argument("--gpu_id", type=int, default=0)
+    p.add_argument("--task_name",
+                   help="smoke / single only. Default adjust_bottle for smoke.")
+    p.add_argument("--test_num", type=int,
+                   help="Episodes per task. Default: 1 for smoke, 25 for single/pool.")
+    p.add_argument("--gpu_id", type=int, default=0,
+                   help="Used by smoke / single.")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--min_free_mb", type=int, default=_env_int("MIN_FREE_MB", 40000))
-    p.add_argument("--gpu_wait_timeout", type=int, default=_env_int("GPU_WAIT_TIMEOUT", 0),
-                   help="0 = wait forever.")
-    p.add_argument("--gpu_poll_interval", type=int, default=_env_int("GPU_POLL_INTERVAL", 30))
+
+    # --- pool / GPU detection ---
+    p.add_argument("--min_free_mb", type=int, default=40000,
+                   help="GPU is usable when free memory >= this (MB).")
+    p.add_argument("--gpu_wait_timeout", type=int, default=0,
+                   help="Seconds to wait for GPU memory before failing; 0 = forever.")
+    p.add_argument("--gpu_poll_interval", type=int, default=30)
     p.add_argument("--rerun_all", action="store_true",
                    help="pool: include all tasks regardless of prior res.json.")
+
+    # --- WAM + RoboTwin paths ---
+    p.add_argument("--wam_name", default="lingbot_va",
+                   help="Picks ptqeval.wam.<wam_name>.*.")
+    p.add_argument("--wam_model_path", type=Path,
+                   default=Path("/home/arash/EvalForWAMs/models/"
+                                "lingbot-va-posttrain-robotwin"),
+                   help="FP checkpoint dir passed to server.py --model_path.")
+    p.add_argument("--robotwin_root", type=Path,
+                   default=Path("/home/arash/EvalForWAMs/RoboTwin"),
+                   help="RoboTwin simulator root.")
+
+    # --- output ---
+    p.add_argument("--save_root", type=Path, required=True,
+                   help="Eval output root (visualization + logs + summary).")
+    p.add_argument("--perf_log_dir", type=Path, default=None,
+                   help="Per-call perf JSONL dir. Default: <save_root>/perf.")
+
+    # --- variant / calibration ---
+    p.add_argument("--variant", default="",
+                   help="Quant method name; resolves to "
+                        "ptqeval.wam.<wam>.method.<variant>.loader. "
+                        "Empty -> bf16 baseline.")
+    p.add_argument("--variant_args", type=Path, default=None,
+                   help="Runtime args yaml (layer_config + int_weights_ckpt).")
+    p.add_argument("--calibrate_out", type=Path, default=None,
+                   help="Phase 31 calib: dump per-channel input absmax here.")
+
+    # --- task list ---
+    p.add_argument("--task_list_name", default="SELECTED_15_TASKS",
+                   help="Attribute in ptqeval.wam.<wam>.tasks to iterate.")
+
+    # --- conda envs ---
+    p.add_argument("--server_env", default="lingbot-jw")
+    p.add_argument("--client_env", default="RoboTwin-jw")
+
     args = p.parse_args()
 
-    wam_name = os.environ.get("WAM_NAME", "lingbot_va")
-    variant = os.environ.get("VARIANT", "")
-    variant_args = os.environ.get("VARIANT_ARGS", "")
-
-    save_root_env = os.environ.get("SAVE_ROOT")
-    if save_root_env:
-        save_root = Path(save_root_env)
-    elif variant and variant_args:
-        tag = Path(variant_args).stem
-        save_root = Path(f"/home/arash/EvalForWAMs/results/{variant}_{tag}")
-    elif variant:
-        save_root = Path(f"/home/arash/EvalForWAMs/results/{variant}")
-    else:
-        save_root = Path("/home/arash/EvalForWAMs/results/bf16")
-
-    perf_log_dir_env = os.environ.get("PERF_LOG_DIR")
-    perf_log_dir = Path(perf_log_dir_env) if perf_log_dir_env else save_root / "perf"
+    save_root = args.save_root
+    perf_log_dir = args.perf_log_dir if args.perf_log_dir else save_root / "perf"
     save_root.mkdir(parents=True, exist_ok=True)
     perf_log_dir.mkdir(parents=True, exist_ok=True)
 
     return Config(
-        mode=args.mode, task_name=args.task_name, test_num=args.test_num,
-        gpu_id=args.gpu_id, seed=args.seed, min_free_mb=args.min_free_mb,
+        mode=args.mode,
+        task_name=args.task_name,
+        test_num=args.test_num,
+        gpu_id=args.gpu_id,
+        seed=args.seed,
+        min_free_mb=args.min_free_mb,
         gpu_wait_timeout=args.gpu_wait_timeout,
-        gpu_poll_interval=args.gpu_poll_interval, rerun_all=args.rerun_all,
-        wam_name=wam_name,
-        wam_model_path=os.environ.get(
-            "WAM_MODEL_PATH",
-            "/home/arash/EvalForWAMs/models/lingbot-va-posttrain-robotwin"),
-        robotwin_root=os.environ.get(
-            "ROBOTWIN_ROOT", "/home/arash/EvalForWAMs/RoboTwin"),
-        variant=variant, variant_args=variant_args,
-        calibrate_out=os.environ.get("CALIBRATE_OUT", ""),
-        task_list_name=os.environ.get("TASK_LIST_NAME", "SELECTED_15_TASKS"),
-        server_env=os.environ.get("SERVER_ENV", "lingbot-jw"),
-        client_env=os.environ.get("CLIENT_ENV", "RoboTwin-jw"),
-        save_root=save_root, perf_log_dir=perf_log_dir,
+        gpu_poll_interval=args.gpu_poll_interval,
+        rerun_all=args.rerun_all,
+        wam_name=args.wam_name,
+        wam_model_path=str(args.wam_model_path),
+        robotwin_root=str(args.robotwin_root),
+        variant=args.variant,
+        variant_args=str(args.variant_args) if args.variant_args else "",
+        calibrate_out=str(args.calibrate_out) if args.calibrate_out else "",
+        task_list_name=args.task_list_name,
+        server_env=args.server_env,
+        client_env=args.client_env,
+        save_root=save_root,
+        perf_log_dir=perf_log_dir,
     )
 
 
