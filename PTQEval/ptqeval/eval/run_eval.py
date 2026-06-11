@@ -99,7 +99,7 @@ def parse_args() -> Config:
     p.add_argument("--seed", type=int, default=0)
 
     # --- pool / GPU detection ---
-    p.add_argument("--min_free_mb", type=int, default=40000,
+    p.add_argument("--min_free_mb", type=int, default=32000,
                    help="GPU is usable when free memory >= this (MB).")
     p.add_argument("--gpu_wait_timeout", type=int, default=0,
                    help="Seconds to wait for GPU memory before failing; 0 = forever.")
@@ -216,9 +216,18 @@ def wait_for_gpu(cfg: Config, gpu: int) -> bool:
             return False
 
 
-def wait_for_port(port: int, timeout: float = 600.0) -> bool:
+def wait_for_port(port: int, timeout: float = 600.0,
+                   proc: Optional[subprocess.Popen] = None) -> bool:
+    """Poll the port; bail out early if the spawned proc has died (saves
+    waiting the full timeout when server crashed on import / model load /
+    OOM)."""
     elapsed = 0.0
     while elapsed < timeout:
+        if proc is not None and proc.poll() is not None:
+            print(f"[wait_for_port] server proc {proc.pid} died early "
+                  f"(rc={proc.returncode}) before port {port} came up",
+                  file=sys.stderr)
+            return False
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=2.0):
                 return True
@@ -464,6 +473,11 @@ def run_pool(cfg: Config) -> None:
     log_dir = cfg.save_root / "logs" / "pool"
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Track per-worker progress so the "queue empty" message at end is
+    # not mistaken for a mid-run abort.
+    worker_done_counts: dict[int, int] = {g: 0 for g in usable[:n_workers]}
+    worker_failed_counts: dict[int, int] = {g: 0 for g in usable[:n_workers]}
+
     def worker(gpu: int) -> None:
         port = 29556 + gpu
         master_port = 29661 + gpu
@@ -471,20 +485,33 @@ def run_pool(cfg: Config) -> None:
             try:
                 task = q.get(block=False)
             except queue.Empty:
-                print(f"[pool worker gpu={gpu}] queue empty, exit")
+                print(f"[pool worker gpu={gpu}] queue drained for this worker "
+                      f"(done={worker_done_counts[gpu]}, "
+                      f"failed={worker_failed_counts[gpu]}); "
+                      f"exiting. Other workers may still be running.")
                 return
             server_log = log_dir / f"server_{gpu}_{task}.log"
             client_log = log_dir / f"client_{gpu}_{task}.log"
-            print(f"[pool worker gpu={gpu}] task={task}")
+            print(f"[pool worker gpu={gpu}] task={task} starting")
             if not wait_for_gpu(cfg, gpu):
+                print(f"[pool worker gpu={gpu}] task={task} SKIPPED: GPU wait failed",
+                      file=sys.stderr)
+                worker_failed_counts[gpu] += 1
                 continue
             sp = start_server(cfg, gpu, port, master_port, task, server_log)
             with _SESSIONS_LOCK:
                 _SESSIONS.add(sp.pid)
             try:
-                if not wait_for_port(port):
+                if not wait_for_port(port, proc=sp):
+                    print(f"[pool worker gpu={gpu}] task={task} SKIPPED: "
+                          f"server failed to come up (see {server_log})",
+                          file=sys.stderr)
+                    worker_failed_counts[gpu] += 1
                     continue
                 run_client_blocking(cfg, gpu, task, port, test_num, client_log)
+                worker_done_counts[gpu] += 1
+                print(f"[pool worker gpu={gpu}] task={task} done "
+                      f"(worker total done={worker_done_counts[gpu]})")
             finally:
                 kill_session(sp.pid)
                 with _SESSIONS_LOCK:
@@ -496,6 +523,15 @@ def run_pool(cfg: Config) -> None:
         t.start()
     for t in threads:
         t.join()
+
+    total_done = sum(worker_done_counts.values())
+    total_failed = sum(worker_failed_counts.values())
+    print(f"[pool] all workers exited. "
+          f"completed {total_done} task(s), failed {total_failed} task(s) "
+          f"out of {len(pending)} queued.")
+    if total_failed:
+        print(f"[pool] per-worker breakdown: done={worker_done_counts}, "
+              f"failed={worker_failed_counts}")
 
 
 # ---------------------------------------------------------------------------
