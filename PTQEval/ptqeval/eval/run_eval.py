@@ -76,6 +76,7 @@ class Config:
     variant_args: str
     calibrate_out: str
     task_list_name: str
+    task_config: str
     server_env: str
     client_env: str
     save_root: Path
@@ -137,6 +138,11 @@ def parse_args() -> Config:
     # --- task list ---
     p.add_argument("--task_list_name", default="SELECTED_15_TASKS",
                    help="Attribute in ptqeval.wam.<wam>.tasks to iterate.")
+    p.add_argument("--task_config", default="demo_clean",
+                   help="RoboTwin task_config yaml stem (demo_clean / "
+                        "demo_randomized). Forwarded to eval_client. "
+                        "demo_randomized adds background / light / table-height "
+                        "randomization -> harder, eval-realistic.")
 
     # --- conda envs ---
     p.add_argument("--server_env", default="lingbot-jw")
@@ -166,6 +172,7 @@ def parse_args() -> Config:
         variant_args=str(args.variant_args) if args.variant_args else "",
         calibrate_out=str(args.calibrate_out) if args.calibrate_out else "",
         task_list_name=args.task_list_name,
+        task_config=args.task_config,
         server_env=args.server_env,
         client_env=args.client_env,
         save_root=save_root,
@@ -383,7 +390,7 @@ def run_client_blocking(cfg: Config, gpu: int, task_name: str, port: int,
         f"    --config {cfg.robotwin_root}/policy/ACT/deploy_policy.yml"
         f"    --overrides"
         f"    --task_name {task_name}"
-        f"    --task_config demo_clean"
+        f"    --task_config {cfg.task_config}"
         f"    --train_config_name 0"
         f"    --model_name 0"
         f"    --ckpt_setting 0"

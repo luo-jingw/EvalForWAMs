@@ -116,6 +116,9 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
      在 PTQEval/。修改 upstream 是反模式；新功能 fork 进 PTQEval。
   5. 任务集：15 个 RoboTwin 任务（1 long + 4 medium-long + 10 short），每任务 25 episode。
   6. P5 commit 风格：每 milestone 单句 commit message（参考 `git log --oneline`）。
+  7. **NO _v2 / _new / 向后兼容路径**：不要 `foo_v2.py / results/calib_data_v2/ /
+     runtime_args_X_new.yaml` 这类后缀化命名。直接复用原路径、覆盖、commit；git
+     是 history。例外仅在用户明确要求并行保留旧产物时。
 
   当前进度状态（git log 是权威 ledger，新 session 先 `git log --oneline -10`）
 
@@ -145,12 +148,27 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
       其余多数持平或反超 bf16；horizon→SR loss 强相关，是后续 mixed-precision
       研究入口
     - Phase 27 cross_summary report.md + plots/ 已生成（results/cross_summary/）
-  - Part V（Static activation quant calibrated path）：**未开始**，plan §28-30 描述。
-    可与 Part III Phase 28-29（W4A8）并行。
-  - **Part VI（Faithful ViDiT-Q Method Reproduction）：未开始，plan §31-33，HIGH PRIORITY**。
-    审计发现 Part I-V 只复现了 ViDiT-Q 仓库的 baseline PTQ pipeline（per-channel asym
-    weight + per-token sym act），论文同名 "ViDiT" 方法（SmoothQuant α + QuaRoT
-    Hadamard rotation）完全未做。Part VI 补这一项，目标：能真正声称 ViDiT-Q 复现。
+  - Part V（Static activation quant calibrated path）：**Phase 31 DONE，32+33 待做**。
+    Phase 31：calib hook（forward_pre_hook 收 per-channel input absmax，
+    fcntl.flock + per-PID tmp 防 pool race），50 task × 5 ep 跑完 →
+    `results/calib_data/calib_data.pth` 1.8 MB / 180 layer / 全非零。
+    Phase 32：derive `act_scales.pth`（per-layer 静态 scale）—— 1 个新 .py 文件。
+    Phase 33：`act_quant_bf16.cu` 加 static launcher（跳 amax reduction）+
+    pybind / `__init__.py` / `base.py` dispatch / `loader.py` buffer + 新 viditq_static
+    config yamls；测试在 check_part6 加 case，不开新文件。
+  - **Part VI（Faithful ViDiT-Q Method Reproduction）：Phase 36/37/38 DONE，验证至 smoke**。
+    完成项：
+    - Phase 36 SmoothQuant（canonical s = a^(1-α)/w^α，α=0.99，PTQ `W*s`、runtime `x/s`）
+    - Phase 37 QuaRoT（structured Hadamard had12/had28 butterfly，per-Linear int8 sign，
+      零矩阵物化）
+    - Phase 38 合体（PTQ：W <- (W*s) @ H；runtime：x <- (x/s) @ H）
+    - check_part6 4 variant plumbing 全 OK；viditq smoke adjust_bottle SR=1/1
+    待做：完整 eval（dynamic + static + 各方法），Phase 39 N-way cross_summary
+  - **基础设施变更（user-side）**：
+    - `run_eval.sh` → `run_eval.py`（616 行；CLI-only `--save_root` 必填；session-based
+      进程清理；early-exit 检测；line-buffered nohup；DONE 总结；新 `--task_config`
+      支持 demo_clean / demo_randomized 切换）
+    - calib hook 加 fcntl.flock + per-PID tmp（pool race-safe）
 
   Part III 余项 + Part V 待办
 
