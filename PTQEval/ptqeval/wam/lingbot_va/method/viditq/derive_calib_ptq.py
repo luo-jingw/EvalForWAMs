@@ -4,21 +4,37 @@ with hooks, then run PTQ to produce int_weights.pth.
 
 Reads the per-episode visualization directories saved by
 collect_calib_videos.py (obs_data_*.pt files under <videos_root>/
-visualization/real/<prompt>_<timestamp>/), filters by task list, spins
-up a single in-process VA_Server (bf16), installs forward_pre_hooks on
-the 180 target Linears, and drives `server.infer(...)` over the saved
-obs chunks. Hooks aggregate per-channel input absmax into calib_data.pth
-via the same get_calib_data._CalibState used by the live-eval path
-(merge-on-write + fcntl.flock for crash safety).
+visualization/real/<prompt>_<timestamp>/), filters by task list, and
+drives replay through one or more bf16 in-process VA_Server workers
+pinned to dedicated GPUs. Per-worker forward_pre_hooks aggregate
+per-channel input absmax into a single calib_data.pth shared across
+workers via fcntl.flock + merge-on-write (get_calib_data._CalibState).
+
+GPU mode (--gpus):
+  auto                Claim every currently-free GPU at start. Run a
+                      background monitor that ALSO claims any GPU that
+                      stays free for --gpu_stable_secs (default 300 =
+                      5 min) -- so the calib opportunistically grows
+                      its worker pool when other users free up GPUs.
+  <list>              Comma-separated explicit GPU ids, e.g. "0,1,2".
+                      No dynamic claim; pool stays at exactly this size.
+
+Each worker is its own subprocess invocation of this script with
+--_worker_mode + a per-process env that pins CUDA_VISIBLE_DEVICES and
+unique torch.distributed MASTER_PORT. Workers pull episodes from a
+file-backed queue (one episode path per line, popped under fcntl.flock).
+This keeps torch out of the orchestrator process and lets the
+orchestrator stay on a tiny stdlib-only footprint.
 
 No RoboTwin simulator involvement at this stage -- pure FP transformer
 forward driven by previously-captured observations.
 
-After hooks dump, invokes ptq.py with the supplied --layer_config so
-PTQ produces the int_weights.pth for any variant (W8A8 dynamic /
-smooth / quarot / viditq / viditq-static). Layer configs read calib_data
-path from the yaml itself; this script writes the calib_data.pth at the
-path declared by the config (or --calib_out override).
+After workers drain the queue, the orchestrator runs ptq.py as a
+subprocess with the supplied --layer_config so PTQ produces the
+int_weights.pth for any variant (W8A8 dynamic / smooth / quarot /
+viditq / viditq-static). Layer configs read calib_data path from the
+yaml itself; this script writes calib_data.pth at the path declared
+by the config (or --calib_out override).
 
 Task subset selection:
   --task_list <name1,name2,...>   comma-separated short names (default:
@@ -29,42 +45,25 @@ Task subset selection:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
-# Force single-GPU non-distributed BEFORE importing torch.distributed.
-os.environ.setdefault("RANK", "0")
-os.environ.setdefault("LOCAL_RANK", "0")
-os.environ.setdefault("WORLD_SIZE", "1")
-os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-os.environ.setdefault("MASTER_PORT", "29577")
-
-import torch
-
-# Triggers ptqeval.wam.lingbot_va package init (adds lingbot-va to sys.path).
-import ptqeval.wam.lingbot_va as _lingbot_va_pkg  # noqa: F401
-# server.py imports {distributed, configs, modules, utils} as if they were
-# top-level packages; those live under lingbot-va/wan_va/. Replicate the
-# sys.path insertion server.py does so our in-process construction can
-# resolve `from distributed.util import init_distributed` etc.
-_WAN_VA_DIR = os.path.join(_lingbot_va_pkg.LINGBOT_VA_PATH, "wan_va")
-if _WAN_VA_DIR not in sys.path:
-    sys.path.insert(0, _WAN_VA_DIR)
-
 from ptqeval.wam.lingbot_va.tasks import SELECTED_15_TASKS
-from ptqeval.wam.lingbot_va.method.viditq.get_calib_data import install_calib_hooks
 
 
 logger = logging.getLogger("derive_calib_ptq")
 
 
 # ---------------------------------------------------------------------------
-# Episode dir enumeration + task filtering
+# Episode dir enumeration + task filtering (no torch needed)
 # ---------------------------------------------------------------------------
 
 # visualization/real/<prompt>_<YYYYMMDD_HHMMSS>/  -- trailing timestamp is
@@ -78,11 +77,10 @@ def _strip_timestamp(dir_name: str) -> str:
 
 def _build_prompt_to_task(save_root: Path) -> dict[str, str]:
     """Walk stseed-*/visualization/<task>/<...>.mp4 to learn prompt->task
-    mapping. The mp4 filename format produced by eval_client.py:
+    mapping. mp4 filename format produced by eval_client.py:
         <test_num_idx>_<prompt_with_spaces_as_underscores>_<succ>.mp4
     Underscoring is reversible because no RoboTwin task prompt in the
-    selected_15/calib_all set contains a literal underscore (verified
-    by inspection of obs_data 'task' fields).
+    selected_15/calib_all set contains a literal underscore.
     """
     pat = re.compile(r"^(\d+)_(.+)_(True|False)$")
     mapping: dict[str, str] = {}
@@ -131,14 +129,81 @@ def _filter_episodes(videos_root: Path, task_list: Optional[list[str]],
 
 
 # ---------------------------------------------------------------------------
-# Server in-process construction
+# GPU probe (orchestrator side; mirrors _pool_runner.gpu_free_mb but stays
+# self-contained so the orchestrator has no cross-script imports beyond
+# tasks.py)
 # ---------------------------------------------------------------------------
 
-def _build_server(model_path: str, save_root: Path) -> "VA_Server":
-    """Construct a bf16 VA_Server in-process with side-effect saves
-    redirected to save_root (so visualization writes during replay do
-    not stomp the calib video corpus)."""
-    # Imports deferred so distributed env vars (set above) are picked up.
+def _gpu_free_mb(gpu: int) -> int:
+    r = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits",
+         "-i", str(gpu)],
+        capture_output=True, text=True, check=False)
+    try:
+        return int(r.stdout.strip())
+    except (ValueError, AttributeError):
+        return -1
+
+
+def _detect_n_gpus() -> int:
+    r = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=False)
+    return len([line for line in r.stdout.splitlines() if line.strip()])
+
+
+# ---------------------------------------------------------------------------
+# File-backed episode queue (stdlib + fcntl, so workers can be separate
+# Python processes without an mp.Manager)
+# ---------------------------------------------------------------------------
+
+def _queue_init(queue_path: Path, ep_dirs: list[Path]) -> None:
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(queue_path, "w") as f:
+        for ep in ep_dirs:
+            f.write(str(ep) + "\n")
+
+
+def _queue_pop(queue_path: Path) -> Optional[str]:
+    """Atomic pop of first line from queue. Returns None on empty."""
+    with open(queue_path, "r+") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        lines = f.read().splitlines()
+        if not lines:
+            return None
+        first = lines[0]
+        f.seek(0)
+        f.truncate()
+        if len(lines) > 1:
+            f.write("\n".join(lines[1:]) + "\n")
+    return first
+
+
+def _queue_remaining(queue_path: Path) -> int:
+    """Approximate remaining-work count (line count). Cheap, no lock."""
+    try:
+        with open(queue_path) as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Worker subprocess: in-process VA_Server replay loop
+# ---------------------------------------------------------------------------
+
+def _build_server(model_path: str, save_root: Path):
+    """Construct a bf16 VA_Server in-process. Side-effect saves
+    (visualization, perf logs) redirected to save_root so they don't
+    stomp the calib video corpus.
+
+    Imports deferred so this only runs in worker subprocess (after
+    CUDA_VISIBLE_DEVICES + RANK/LOCAL_RANK/WORLD_SIZE/MASTER_PORT are
+    set in env by the orchestrator's Popen call)."""
+    import ptqeval.wam.lingbot_va as _lingbot_va_pkg  # noqa: F401
+    _wan_va_dir = os.path.join(_lingbot_va_pkg.LINGBOT_VA_PATH, "wan_va")
+    if _wan_va_dir not in sys.path:
+        sys.path.insert(0, _wan_va_dir)
     from distributed.util import init_distributed
     from ptqeval.wam.lingbot_va.server import VA_Server
     from configs import VA_CONFIGS
@@ -157,45 +222,14 @@ def _build_server(model_path: str, save_root: Path) -> "VA_Server":
     return VA_Server(cfg)
 
 
-# ---------------------------------------------------------------------------
-# Replay
-# ---------------------------------------------------------------------------
-
 _CHUNK_RE = re.compile(r"obs_data_(\d+)\.pt$")
 
 
-def _replay_episode(server: "VA_Server", ep_dir: Path) -> int:
-    """Drive server.infer over every saved obs chunk in ep_dir. Returns
-    number of _infer calls fired (each runs the full diffusion denoising
-    loop -> ~20 transformer forwards = ~20 hook firings per target
-    Linear per chunk).
-
-    Replay strategy: reset + 1-frame _infer per chunk. Rationale:
-      - obs_data_*.pt was saved in `_compute_kv_cache` (server.py:641)
-        where the streaming VAE state was ALREADY primed by prior
-        chunks. Feeding 4-frame chunks into `_infer` on FRESH VAE state
-        shape-mismatches inside AutoencoderKLWan.avg_shortcut (expects
-        post-downsample temporal dim 2 but receives 4).
-      - `_infer` only consumes obs when frame_st_id == 0 (server.py:509-
-        510); subsequent calls ignore obs entirely. To get hook coverage
-        on multiple saved chunks we must reset() between them so each
-        chunk replays as a fresh frame_st_id=0 inference, with single-
-        frame obs to satisfy fresh-VAE shape.
-      - Single-frame init matches what eval_client sends on the very
-        first infer call (eval_client.py:561 `first_obs = format_obs(
-        observation, prompt)` is a single dict, not a list).
-      - Diffusion runs the full denoising loop per call (~20 transformer
-        forwards), so per-channel absmax converges fast. 4-frame temporal
-        diversity within a chunk is lost, but 75 ep * ~10 chunks gives
-        ~750 _infer calls * ~20 forwards each = ~15k transformer forwards
-        of hook coverage -- ample for per-channel running max.
-
-    KV cache + frame_st_id continuity from the live flow is NOT
-    reconstructed (would require feeding the post-processed action state
-    into `_compute_kv_cache` between chunks). Calibration only needs
-    per-channel input absmax, which is determined by activation
-    magnitude distribution -- robust to cache-state perturbation.
-    """
+def _replay_episode(server, ep_dir: Path) -> int:
+    """Drive server.infer over every saved obs chunk in ep_dir using
+    reset + 1-frame _infer per chunk. See module docstring for rationale.
+    Returns number of _infer calls fired."""
+    import torch  # deferred; only worker imports torch
     chunks = sorted(
         (int(_CHUNK_RE.search(p.name).group(1)), p)
         for p in ep_dir.glob("obs_data_*.pt")
@@ -209,8 +243,6 @@ def _replay_episode(server: "VA_Server", ep_dir: Path) -> int:
     n_calls = 0
     for _, chunk_path in chunks:
         obs_list = torch.load(chunk_path, weights_only=False, map_location="cpu")
-        # Fresh reset between chunks -> VAE/KV cache empty -> single-frame
-        # obs is the only shape that _encode_obs handles in this state.
         server.infer({"reset": True, "prompt": prompt, "save_visualization": False})
         server.infer({
             "obs": [obs_list[0]],
@@ -219,6 +251,205 @@ def _replay_episode(server: "VA_Server", ep_dir: Path) -> int:
         })
         n_calls += 1
     return n_calls
+
+
+def _worker_main(args) -> int:
+    """Subprocess entry point. CUDA_VISIBLE_DEVICES + RANK/LOCAL_RANK/
+    WORLD_SIZE/MASTER_PORT come pre-set in env (orchestrator does that
+    via Popen(env=...)). Loop on queue_pop until empty, then exit
+    naturally so install_calib_hooks's atexit dump fires."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s [worker pid={os.getpid()}] %(levelname)s %(message)s",
+    )
+    wlog = logging.getLogger(f"derive_worker_pid{os.getpid()}")
+
+    from ptqeval.wam.lingbot_va.method.viditq.get_calib_data import install_calib_hooks
+
+    wlog.info(f"building bf16 server from {args.model_path} "
+              f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})")
+    server = _build_server(args.model_path, args.replay_save_root)
+
+    wlog.info("installing calib hooks on 180 target Linears")
+    state = install_calib_hooks(server.transformer, str(args.calib_out))
+
+    n_done = 0
+    while True:
+        ep_path = _queue_pop(args._worker_queue_path)
+        if ep_path is None:
+            wlog.info(f"queue drained; exiting after {n_done} episodes")
+            break
+        try:
+            _replay_episode(server, Path(ep_path))
+        except Exception as e:
+            wlog.exception(f"replay failed for {ep_path}: {e}")
+        n_done += 1
+        if n_done % 5 == 0:
+            wlog.info(f"replayed {n_done} episodes")
+
+    state.dump()
+    wlog.info(f"final dump done (replayed {n_done} episodes)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator: multi-GPU spawn + dynamic claim monitor
+# ---------------------------------------------------------------------------
+
+def _spawn_worker_subprocess(gpu_id: int, queue_path: Path, calib_out: Path,
+                              model_path: str, replay_save_root: Path,
+                              skip_ptq_extra_args: dict) -> subprocess.Popen:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env["RANK"] = "0"
+    env["LOCAL_RANK"] = "0"
+    env["WORLD_SIZE"] = "1"
+    env["MASTER_ADDR"] = "127.0.0.1"
+    # Unique port per worker so concurrent distributed inits do not clash.
+    env["MASTER_PORT"] = str(29577 + gpu_id)
+    worker_save_root = replay_save_root / f"gpu{gpu_id}"
+    cmd = [
+        sys.executable, "-m", "ptqeval.wam.lingbot_va.method.viditq.derive_calib_ptq",
+        "--_worker_mode",
+        "--_worker_queue_path", str(queue_path),
+        "--model_path", model_path,
+        "--calib_out", str(calib_out),
+        "--replay_save_root", str(worker_save_root),
+        # Dummy values for orchestrator-only args (worker ignores these
+        # but argparse still needs them defined; main()'s argparse
+        # accepts them in both modes).
+        "--videos_root", str(Path("/tmp")),
+        "--skip_ptq",
+    ]
+    log_path = worker_save_root / "worker.log"
+    worker_save_root.mkdir(parents=True, exist_ok=True)
+    logf = open(log_path, "w")
+    return subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT,
+                              start_new_session=True, close_fds=True)
+
+
+def _orchestrate(ep_dirs: list[Path], gpus: object, calib_out: Path,
+                  model_path: str, replay_save_root: Path,
+                  min_free_mb: int, stable_secs: float) -> int:
+    """Spawn workers (subprocesses), monitor for newly-free GPUs in
+    'auto' mode, wait for queue to drain. Returns 0 on normal exit."""
+    queue_path = replay_save_root / "ep_queue.txt"
+    _queue_init(queue_path, ep_dirs)
+    logger.info(f"queue initialized with {len(ep_dirs)} episodes at {queue_path}")
+
+    workers: dict[int, subprocess.Popen] = {}
+    workers_lock = threading.Lock()
+    stop_event = threading.Event()
+    n_total_spawned = 0
+
+    def spawn(gpu_id: int) -> None:
+        nonlocal n_total_spawned
+        with workers_lock:
+            if gpu_id in workers and workers[gpu_id].poll() is None:
+                return
+            p = _spawn_worker_subprocess(
+                gpu_id, queue_path, calib_out, model_path, replay_save_root, {})
+            workers[gpu_id] = p
+            n_total_spawned += 1
+            logger.info(
+                f"spawned worker #{n_total_spawned} on GPU {gpu_id} "
+                f"(pid={p.pid}, log={replay_save_root}/gpu{gpu_id}/worker.log)"
+            )
+
+    # Initial pool: claim free GPUs at T=0 (no wait).
+    if gpus == "auto":
+        n_gpus = _detect_n_gpus() or 8
+        for g in range(n_gpus):
+            if _gpu_free_mb(g) >= min_free_mb:
+                spawn(g)
+    else:
+        for g in gpus:
+            spawn(g)
+
+    if not workers:
+        if gpus == "auto":
+            logger.warning(
+                f"no GPU with >= {min_free_mb} MB free at start; "
+                f"monitor will claim as GPUs become available."
+            )
+        else:
+            logger.error(f"no usable GPU in --gpus={gpus}")
+            return 1
+
+    # Dynamic claim monitor (auto only): poll every 30s; track first-free
+    # time per non-claimed GPU; claim after stable_secs of continuous
+    # free-ness. Stops when queue is drained.
+    monitor_thread = None
+    if gpus == "auto":
+        def monitor():
+            first_free_at: dict[int, float] = {}
+            n_gpus = _detect_n_gpus() or 8
+            while not stop_event.is_set():
+                # Stop spawning if queue empty (no more work).
+                if _queue_remaining(queue_path) == 0:
+                    stop_event.wait(30)
+                    continue
+                for g in range(n_gpus):
+                    with workers_lock:
+                        active = (g in workers and workers[g].poll() is None)
+                    if active:
+                        first_free_at.pop(g, None)
+                        continue
+                    mb = _gpu_free_mb(g)
+                    if mb >= min_free_mb:
+                        first_free_at.setdefault(g, time.time())
+                        if time.time() - first_free_at[g] >= stable_secs:
+                            logger.info(
+                                f"monitor: GPU {g} stable free for "
+                                f"{stable_secs:.0f}s, claiming"
+                            )
+                            spawn(g)
+                            first_free_at.pop(g, None)
+                    else:
+                        first_free_at.pop(g, None)
+                stop_event.wait(30)
+
+        monitor_thread = threading.Thread(target=monitor,
+                                            name="gpu-claim-monitor",
+                                            daemon=True)
+        monitor_thread.start()
+
+    # Wait for all live workers; spawn-set may grow during the wait
+    # (monitor can add). Loop until all workers exited.
+    try:
+        while True:
+            with workers_lock:
+                alive = [p for p in workers.values() if p.poll() is None]
+            if not alive:
+                # If queue not drained yet but no workers alive AND
+                # not in auto mode, surface the partial work loss.
+                if _queue_remaining(queue_path) > 0 and gpus != "auto":
+                    logger.warning(
+                        f"all manual-mode workers exited with "
+                        f"{_queue_remaining(queue_path)} episodes left in queue"
+                    )
+                break
+            time.sleep(15)
+    finally:
+        stop_event.set()
+        if monitor_thread:
+            monitor_thread.join(timeout=5)
+        with workers_lock:
+            for gpu_id, p in workers.items():
+                if p.poll() is None:
+                    logger.warning(f"terminating lingering worker gpu={gpu_id} pid={p.pid}")
+                    try:
+                        os.killpg(os.getpgid(p.pid), 15)  # SIGTERM whole session
+                    except ProcessLookupError:
+                        pass
+                    p.wait(timeout=10)
+
+    # Don't unlink queue_path -- keeping it makes a partial-run recoverable
+    # by re-invoking with the same calib_out (queue_pop would just see
+    # whatever wasn't consumed). For the all-drained happy path it's an
+    # empty file that takes 0 bytes.
+    logger.info(f"orchestrator: workers complete, queue remaining={_queue_remaining(queue_path)}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +497,38 @@ def main() -> int:
     p.add_argument(
         "--model_path",
         default="/home/arash/EvalForWAMs/models/lingbot-va-posttrain-robotwin",
-        help="FP bf16 transformer dir (transformer subdir inside).",
+        help="FP bf16 transformer dir.",
     )
     p.add_argument(
         "--replay_save_root", type=Path,
         default=Path("/tmp/derive_calib_replay"),
-        help="Throwaway dir for server's per-call visualization saves "
-             "during replay (kept off the calib video corpus).",
+        help="Throwaway dir for per-worker visualization saves + the "
+             "shared ep_queue.txt file.",
     )
+
+    # Multi-GPU configuration.
+    p.add_argument(
+        "--gpus", default="auto",
+        help='"auto" (default): claim every currently-free GPU at start, '
+             'then dynamically claim any GPU that stays free for '
+             '--gpu_stable_secs. Or "<gpu_id_csv>", e.g. "0,1,2".',
+    )
+    p.add_argument(
+        "--gpu_stable_secs", type=int, default=300,
+        help="In --gpus=auto, how long a non-claimed GPU must stay free "
+             "before the monitor claims it. Default 300 (5 min).",
+    )
+    p.add_argument(
+        "--min_free_mb", type=int, default=32000,
+        help="Threshold for considering a GPU 'free'.",
+    )
+
+    # Worker-only flags (hidden; the orchestrator passes these when
+    # spawning a worker subprocess).
+    p.add_argument("--_worker_mode", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--_worker_queue_path", type=Path, default=None,
+                   help=argparse.SUPPRESS)
+
     args = p.parse_args()
 
     logging.basicConfig(
@@ -281,6 +536,13 @@ def main() -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
+    # ----- Worker mode (subprocess entry) -----
+    if args._worker_mode:
+        if args._worker_queue_path is None:
+            p.error("--_worker_mode requires --_worker_queue_path")
+        return _worker_main(args)
+
+    # ----- Orchestrator mode -----
     if not args.skip_ptq and (args.layer_config is None or args.int_weights_out is None):
         p.error("--layer_config and --int_weights_out required unless --skip_ptq")
 
@@ -297,28 +559,31 @@ def main() -> int:
         return 1
 
     args.calib_out.parent.mkdir(parents=True, exist_ok=True)
-    # Wipe any prior calib so replay produces a fresh aggregation.
     if args.calib_out.exists():
         logger.info(f"removing prior calib at {args.calib_out}")
         args.calib_out.unlink()
 
-    logger.info(f"building bf16 server in-process from {args.model_path}")
-    server = _build_server(args.model_path, args.replay_save_root)
-    logger.info("installing calib hooks on 180 target Linears")
-    state = install_calib_hooks(server.transformer, str(args.calib_out))
+    # Parse --gpus
+    raw = args.gpus.strip().lower()
+    if raw == "auto":
+        gpus_arg: object = "auto"
+        logger.info(
+            f"GPU mode: auto (initial=free-at-start, "
+            f"dynamic-claim after {args.gpu_stable_secs}s stable, "
+            f"min_free={args.min_free_mb} MB)"
+        )
+    else:
+        gpus_arg = [int(g) for g in raw.split(",") if g.strip()]
+        logger.info(f"GPU mode: manual list {gpus_arg}")
 
-    total_chunks = 0
-    for i, ep_dir in enumerate(ep_dirs):
-        n = _replay_episode(server, ep_dir)
-        total_chunks += n
-        if (i + 1) % 10 == 0 or (i + 1) == len(ep_dirs):
-            logger.info(
-                f"replayed {i+1}/{len(ep_dirs)} episodes "
-                f"({total_chunks} chunks total)"
-            )
+    rc = _orchestrate(
+        ep_dirs, gpus_arg, args.calib_out, args.model_path,
+        args.replay_save_root, args.min_free_mb, args.gpu_stable_secs,
+    )
+    if rc != 0:
+        return rc
 
-    state.dump()
-    logger.info(f"final calib dumped to {args.calib_out}")
+    logger.info(f"calib_data.pth ready at {args.calib_out}")
 
     if args.skip_ptq:
         return 0
