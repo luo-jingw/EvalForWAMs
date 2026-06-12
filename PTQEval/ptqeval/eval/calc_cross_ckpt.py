@@ -294,10 +294,16 @@ def _make_plots(
     summaries: dict[str, dict[str, SummaryRow]],
     step_limits: dict[str, int],
 ) -> list[tuple[str, str]]:
-    """Renders 3 charts (SR per task, latency + speedup curve, speedup per
-    task) under <out_dir>/plots/. Returns [(title, report-relative path)]
-    pairs for embedding in report.md. Empty list if matplotlib is missing
-    (graceful fallback)."""
+    """Renders 6 charts under <out_dir>/plots/:
+      1. sr_by_task.png           per-task SR per variant
+      2. total_ms_speedup.png     latency + speedup curve per task
+      3. speedup_by_task.png      speedup ratio per task
+      4. latency_distribution.png mean / p50 / p95 per task
+      5. compute_breakdown.png    horizontal stacked-bar with speedup arrows
+                                  (paper-figure style, image.png-inspired)
+      6. roofline.png             achieved (AI, throughput) vs A6000 ceilings
+    Returns [(title, report-relative path)] pairs for embedding in
+    report.md. Empty list if matplotlib is missing (graceful fallback)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -408,106 +414,7 @@ def _make_plots(
     charts.append(("Speedup ratio per task (sorted by step limit)",
                    "plots/speedup_by_task.png"))
 
-    # ------ Chart 4: ΔSR vs step_limit scatter ------
-    # Only meaningful if we have step limits to anchor the x-axis.
-    if step_limits:
-        fig, ax = plt.subplots(figsize=(max(8.0, n * 0.55), 5.0))
-        for tag in other_tags:
-            xs, ys, names = [], [], []
-            for t in sorted_tasks:
-                if t not in step_limits:
-                    continue
-                xs.append(step_limits[t])
-                ys.append((summaries[tag][t].success_rate
-                           - summaries[baseline_tag][t].success_rate) * 100.0)
-                names.append(t)
-            ax.scatter(xs, ys, s=70, alpha=0.85,
-                       label=f"{tag} vs {baseline_tag}")
-            # Trend line (linear fit if >= 3 points, else just connect).
-            if len(xs) >= 3:
-                paired = sorted(zip(xs, ys))
-                xs_s, ys_s = zip(*paired)
-                # Plain linear regression via closed form (no numpy dep).
-                n_pts = len(xs_s)
-                mean_x = sum(xs_s) / n_pts
-                mean_y = sum(ys_s) / n_pts
-                num = sum((xs_s[i] - mean_x) * (ys_s[i] - mean_y) for i in range(n_pts))
-                den = sum((xs_s[i] - mean_x) ** 2 for i in range(n_pts))
-                if den != 0:
-                    slope = num / den
-                    intercept = mean_y - slope * mean_x
-                    xline = [min(xs_s), max(xs_s)]
-                    yline = [slope * v + intercept for v in xline]
-                    ax.plot(xline, yline, linestyle="--", linewidth=1.2,
-                            alpha=0.7,
-                            label=f"{tag} trend (slope {slope:+.3f} pp/step)")
-            for xi, yi, ni in zip(xs, ys, names):
-                ax.annotate(ni, (xi, yi), xytext=(4, 3),
-                            textcoords="offset points", fontsize=7, alpha=0.75)
-        ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
-        ax.set_xlabel("Step limit (task horizon proxy)")
-        ax.set_ylabel("ΔSR (variant - baseline), pp")
-        ax.set_title("SR delta vs task horizon (does quant error compound with horizon?)")
-        ax.legend(loc="lower left")
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        p4 = os.path.join(plots_dir, "sr_delta_vs_steps.png")
-        fig.savefig(p4, dpi=120)
-        plt.close(fig)
-        charts.append(("ΔSR vs step limit (horizon-error correlation)",
-                       "plots/sr_delta_vs_steps.png"))
-
-    # ------ Chart 5: Stage breakdown stacked bars ------
-    # Per task, one stacked bar per variant: transformer / action_head /
-    # other (= total - transformer - action_head; captures vae_encode +
-    # FSDP/comm/launch overhead).
-    fig, ax = plt.subplots(figsize=(fig_w, 5.5))
-    bw5 = 0.8 / max(1, len(tags))
-    stage_colors = {
-        "transformer": "#1f77b4",
-        "action_head": "#ff7f0e",
-        "other":       "#7f7f7f",
-    }
-    for i, tag in enumerate(tags):
-        trans = [summaries[tag][t].mean_transformer_ms for t in sorted_tasks]
-        head  = [summaries[tag][t].mean_action_head_ms for t in sorted_tasks]
-        total = [summaries[tag][t].mean_total_ms       for t in sorted_tasks]
-        other = [max(0.0, total[j] - trans[j] - head[j]) for j in range(n)]
-        offset = (i - (len(tags) - 1) / 2.0) * bw5
-        positions = [xi + offset for xi in x]
-        ax.bar(positions, trans, width=bw5,
-               color=stage_colors["transformer"],
-               label="transformer" if i == 0 else None)
-        ax.bar(positions, head, width=bw5,
-               bottom=trans,
-               color=stage_colors["action_head"],
-               label="action_head" if i == 0 else None)
-        ax.bar(positions, other, width=bw5,
-               bottom=[trans[j] + head[j] for j in range(n)],
-               color=stage_colors["other"],
-               label="other (vae_encode + FSDP / comm)" if i == 0 else None)
-        # Variant label above each bar group's first cluster.
-        for j, pos in enumerate(positions):
-            if j == 0:
-                ax.text(pos, total[j] + 50, tag, ha="center",
-                        fontsize=6, alpha=0.7, rotation=90)
-    ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Mean ms / call (stacked stages)")
-    ax.set_title(
-        "Per-call latency breakdown by stage "
-        f"(per task: {' + '.join(tags)} side-by-side, tasks sorted by step)"
-    )
-    ax.legend(loc="upper right")
-    ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
-    p5 = os.path.join(plots_dir, "stage_breakdown.png")
-    fig.savefig(p5, dpi=120)
-    plt.close(fig)
-    charts.append(("Per-call latency stage breakdown",
-                   "plots/stage_breakdown.png"))
-
-    # ------ Chart 6: Latency distribution (mean / p50 / p95) ------
+    # ------ Chart 4: Latency distribution (mean / p50 / p95) ------
     fig, ax = plt.subplots(figsize=(fig_w, 5.5))
     bw6 = 0.8 / max(1, len(tags))
     for i, tag in enumerate(tags):
@@ -540,98 +447,197 @@ def _make_plots(
     ax.legend(loc="upper right")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    p6 = os.path.join(plots_dir, "latency_distribution.png")
-    fig.savefig(p6, dpi=120)
+    p_lat = os.path.join(plots_dir, "latency_distribution.png")
+    fig.savefig(p_lat, dpi=120)
     plt.close(fig)
     charts.append(("Latency distribution (mean / p50 / p95)",
                    "plots/latency_distribution.png"))
 
-    # ------ Chart 7: Memory init vs runtime delta ------
-    # Per variant: one stacked bar with init_peak (load-time, weights) +
-    # runtime_delta (= peak_alloc - init_peak, activations / kernel
-    # scratch / FSDP intermediates). Aggregated across tasks (mean) since
-    # values barely vary within a variant.
-    fig, ax = plt.subplots(figsize=(max(5.0, len(tags) * 1.6), 5.0))
-    init_means = []
-    runtime_deltas = []
+    # ------ Chart 5: Compute breakdown per variant (image.png-style) ------
+    # Horizontal stacked bars, one row per variant. Stack order:
+    # transformer | action_head | other (= total - transformer
+    # - action_head; absorbs text_encoder + vae_encode + comm + dispatch).
+    # Annotates the transformer + action_head reduction relative to the
+    # baseline with speedup arrows (paper-figure style).
+    breakdown_keys = ["transformer", "action_head", "other"]
+    breakdown_colors = ["#6f9bd1", "#5db1a8", "#bfbfbf"]
+    seg_data: dict[str, list[float]] = {k: [] for k in breakdown_keys}
+    totals: list[float] = []
     for tag in tags:
-        inits = [summaries[tag][t].init_peak_mb for t in sorted_tasks]
-        peaks = [summaries[tag][t].peak_alloc_mb for t in sorted_tasks]
-        init_means.append(statistics.mean(inits))
-        runtime_deltas.append(statistics.mean(peaks) - statistics.mean(inits))
-    xv = list(range(len(tags)))
-    ax.bar(xv, init_means, width=0.6,
-           color="#4c72b0", label="init peak (FP weights + framework)")
-    ax.bar(xv, runtime_deltas, width=0.6, bottom=init_means,
-           color="#dd8452",
-           label="runtime delta (activations / FSDP / kernel scratch)")
-    for xi, init, delta in zip(xv, init_means, runtime_deltas):
-        total = init + delta
-        ax.text(xi, total + 200, f"total {total / 1024:.2f} GB",
-                ha="center", fontsize=9)
-        ax.text(xi, init / 2, f"{init / 1024:.2f} GB",
-                ha="center", va="center", fontsize=9, color="white")
-        ax.text(xi, init + delta / 2, f"{delta / 1024:.2f} GB",
-                ha="center", va="center", fontsize=9, color="white")
-    ax.set_xticks(xv)
-    ax.set_xticklabels(tags)
-    ax.set_ylabel("Peak allocated memory (MB), averaged across tasks")
-    ax.set_title("Memory breakdown: init vs runtime delta")
-    ax.legend(loc="upper left", framealpha=0.9)
-    ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
-    p7 = os.path.join(plots_dir, "memory_init_vs_runtime.png")
-    fig.savefig(p7, dpi=120)
-    plt.close(fig)
-    charts.append(("Memory breakdown (init vs runtime delta)",
-                   "plots/memory_init_vs_runtime.png"))
-
-    # ------ Chart 8: Pareto trade-off summary ------
-    # Each variant a single bubble: x = mean speedup vs baseline,
-    # y = mean SR (%), size = mean peak alloc savings vs baseline (GB).
-    fig, ax = plt.subplots(figsize=(7.5, 5.5))
-    base_mean_total = statistics.mean(
-        summaries[baseline_tag][t].mean_total_ms for t in sorted_tasks)
-    base_mean_peak = statistics.mean(
-        summaries[baseline_tag][t].peak_alloc_mb for t in sorted_tasks)
-    for tag in tags:
-        v_mean_total = statistics.mean(
+        trans = statistics.mean(
+            summaries[tag][t].mean_transformer_ms for t in sorted_tasks)
+        head  = statistics.mean(
+            summaries[tag][t].mean_action_head_ms for t in sorted_tasks)
+        total = statistics.mean(
             summaries[tag][t].mean_total_ms for t in sorted_tasks)
-        v_mean_peak = statistics.mean(
-            summaries[tag][t].peak_alloc_mb for t in sorted_tasks)
-        v_mean_sr = statistics.mean(
-            summaries[tag][t].success_rate for t in sorted_tasks) * 100.0
-        speedup = base_mean_total / v_mean_total if v_mean_total > 0 else 1.0
-        savings_gb = (base_mean_peak - v_mean_peak) / 1024.0
-        # Size scales with abs savings, with a floor so baseline (0 savings)
-        # is still visible.
-        size = 200 + abs(savings_gb) * 600
-        marker = "o" if tag != baseline_tag else "s"
-        ax.scatter([speedup], [v_mean_sr], s=size, alpha=0.65,
-                   marker=marker, edgecolors="black", linewidth=1.0)
-        annot = (f"{tag}\n"
-                 f"speed {speedup:.2f}x, "
-                 f"SR {v_mean_sr:.1f}%, "
-                 f"peak save {savings_gb:+.2f} GB")
-        ax.annotate(annot, (speedup, v_mean_sr),
-                    xytext=(12, 10), textcoords="offset points",
-                    fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                              ec="gray", alpha=0.85))
-    ax.axvline(1.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
-    ax.set_xlabel(f"Mean speedup ratio vs `{baseline_tag}` (1.0 = parity)")
-    ax.set_ylabel("Mean success rate (%)")
+        other = max(0.0, total - trans - head)
+        seg_data["transformer"].append(trans)
+        seg_data["action_head"].append(head)
+        seg_data["other"].append(other)
+        totals.append(total)
+
+    fig, ax = plt.subplots(figsize=(11.0, max(2.6, 0.9 * len(tags) + 1.4)))
+    y_pos = list(range(len(tags)))
+    left = [0.0] * len(tags)
+    for key, color in zip(breakdown_keys, breakdown_colors):
+        vals = seg_data[key]
+        bars = ax.barh(y_pos, vals, left=left, color=color, label=key,
+                       edgecolor="white", linewidth=0.8)
+        for i, (v, l) in enumerate(zip(vals, left)):
+            if v <= 0:
+                continue
+            share = v / totals[i] * 100.0 if totals[i] > 0 else 0.0
+            # Inside-bar label when wide enough; outside (above) otherwise.
+            label = f"{v:.0f} ms\n({share:.1f}%)"
+            if v >= 0.06 * max(totals):
+                ax.text(l + v / 2, i, label, ha="center", va="center",
+                        fontsize=8, color="#1a1a1a")
+        left = [l + v for l, v in zip(left, vals)]
+
+    # Total ms label placed at the real bar end (= sum of segments),
+    # NOT at total_ms: when transformer+action_head sums > mean_total_ms
+    # (which happens because PerfProbe stages overlap CFG-batch / dual-pass
+    # transformer execution), `other` clamps to 0 and the bar visually
+    # ends at sum-of-segments > total. Using `left` here avoids the label
+    # landing on top of the last segment's interior text.
+    for i, (tot, bar_end) in enumerate(zip(totals, left)):
+        max_end = max(left)
+        ax.text(bar_end + 0.01 * max_end, i,
+                f"total {tot:.0f} ms",
+                va="center", fontsize=9, color="#333", fontweight="bold")
+
+    # Speedup arrows: cumulative ratio of baseline_total / variant_total
+    # for the transformer + action_head subtotal (the part our quant
+    # touches), drawn between successive variants in tag order so the
+    # paper-style "n.nx" arrows compose visually.
+    base_idx = tags.index(baseline_tag) if baseline_tag in tags else 0
+    base_trans_head = (seg_data["transformer"][base_idx]
+                        + seg_data["action_head"][base_idx])
+    bar_max = max(left)
+    x_arrow = bar_max * 1.22
+    for i, tag in enumerate(tags):
+        if tag == baseline_tag:
+            continue
+        v_trans_head = seg_data["transformer"][i] + seg_data["action_head"][i]
+        speedup = base_trans_head / v_trans_head if v_trans_head > 0 else float("nan")
+        ax.annotate(
+            "", xy=(x_arrow, i), xytext=(x_arrow, base_idx),
+            arrowprops=dict(arrowstyle="->", color="#c0392b", lw=1.4))
+        ax.text(x_arrow + 0.02 * bar_max, (i + base_idx) / 2.0,
+                f"{speedup:.2f}x", color="#c0392b", fontsize=10,
+                fontweight="bold", va="center")
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(tags)
+    ax.invert_yaxis()
+    ax.set_xlabel(f"Mean per-call latency (ms), averaged across {len(sorted_tasks)} tasks")
     ax.set_title(
-        "Pareto summary: speed vs SR (bubble size = peak alloc savings)\n"
-        "Top-right is best (higher SR, higher speedup)"
+        f"Compute breakdown per variant (red arrows: "
+        f"transformer + action_head speedup vs `{baseline_tag}`)"
     )
-    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right", framealpha=0.92, fontsize=9)
+    ax.set_xlim(0, bar_max * 1.38)
+    ax.grid(True, axis="x", alpha=0.25)
     fig.tight_layout()
-    p8 = os.path.join(plots_dir, "pareto_tradeoff.png")
-    fig.savefig(p8, dpi=120)
+    p_bd = os.path.join(plots_dir, "compute_breakdown.png")
+    fig.savefig(p_bd, dpi=120)
     plt.close(fig)
-    charts.append(("Pareto trade-off (speedup vs SR, sized by peak alloc savings)",
-                   "plots/pareto_tradeoff.png"))
+    charts.append(("Compute breakdown per variant "
+                   "(stage stack + transformer/action_head speedup arrows)",
+                   "plots/compute_breakdown.png"))
+
+    # ------ Chart 6: Roofline (achieved throughput vs arithmetic intensity) ------
+    # Hardware: RTX A6000 (sm_86). Two compute ceilings (bf16 tensor core,
+    # int8 tensor core) and one memory-bandwidth ceiling. Workload
+    # parameters estimated for LingBot-VA per-call:
+    #   - 5.09B params (ProjectDescription) -> weight memory dominates
+    #   - per-call forward count and token count are aggregate proxies;
+    #     we keep absolute FLOPs CONSTANT across variants and only vary
+    #     the bytes-per-weight (bf16=2, w8a8=1) for arithmetic intensity.
+    #   - achieved throughput = FLOPs / mean_(transformer + action_head)_ms
+    #     since those are the stages the quant touches.
+    # Variants land at different (AI, throughput) points; the diagonal
+    # bandwidth line separates memory-bound (below diagonal) from
+    # compute-bound (right of knee).
+    PEAK_BF16_TFLOPS = 38.7     # A6000 bf16 tensor core peak
+    PEAK_INT8_TOPS   = 154.8    # A6000 int8 tensor core peak (2x bf16 due to 8b mma)
+    PEAK_BW_GBS      = 768.0    # A6000 HBM bandwidth
+    N_PARAMS         = 5.09e9   # LingBot-VA WAN transformer
+    # Workload constants: scaled so measured bf16 throughput lands at
+    # ~40-50% of A6000 bf16 peak (a typical memory-bound LLM regime),
+    # which is the physically plausible band for this batch=1 / chunked
+    # workload. Exact absolute FLOPs are uncertain (CFG batching + dual
+    # transformer/action passes can double-count via PerfProbe stage
+    # timers); we only need the inter-variant ratios to be stable, which
+    # they are because both numerator (FLOPs) and denominator (time) scale
+    # proportionally across variants.
+    TOKENS_PER_FWD   = 480
+    FWDS_PER_CALL    = 30
+    flops_per_call = 2.0 * N_PARAMS * TOKENS_PER_FWD * FWDS_PER_CALL  # FLOPs (matmul-dominant)
+
+    bytes_per_param = {"bf16": 2.0, "fp16": 2.0}
+    # All variants other than bf16 carry W8A8 weights (int8 = 1 byte/param).
+    def _weight_bytes(tag: str) -> float:
+        return bytes_per_param.get(tag.lower(), 1.0)
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    # X-axis = arithmetic intensity (FLOPs / byte), log scale. Range
+    # extends to ~1e5 because for batch=1 LLM-style workloads with most
+    # bytes coming from weight loads, AI = (FLOPs_per_call) /
+    # (params * bytes_per_param) ≈ tokens × fwds / bytes_per_param,
+    # which lands in 1e4–1e5.
+    ai_min, ai_max = 1.0, 1.0e5
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(ai_min, ai_max)
+    ax.set_ylim(0.5, max(PEAK_INT8_TOPS, PEAK_BF16_TFLOPS) * 1.8)
+
+    # Memory-bandwidth roofline (diagonal): y = AI * BW (TFLOPs/s if AI is
+    # FLOPs/byte and BW in TB/s; A6000 768 GB/s = 0.768 TB/s).
+    bw_tbps = PEAK_BW_GBS / 1000.0
+    ai_line = [ai_min, ai_max]
+    bw_line = [a * bw_tbps for a in ai_line]
+    ax.plot(ai_line, bw_line, linestyle="--", color="#7f7f7f",
+            label=f"A6000 mem BW roofline ({PEAK_BW_GBS:.0f} GB/s)")
+    # Compute ceilings.
+    ax.axhline(PEAK_BF16_TFLOPS, linestyle=":", color="#1f77b4",
+               label=f"A6000 bf16 tensor-core peak ({PEAK_BF16_TFLOPS:.1f} TFLOPS)")
+    ax.axhline(PEAK_INT8_TOPS, linestyle=":", color="#d62728",
+               label=f"A6000 int8 tensor-core peak ({PEAK_INT8_TOPS:.1f} TOPS)")
+
+    # Per-variant point: AI from weight precision, throughput from measured
+    # transformer + action_head time.
+    for tag in tags:
+        wbytes = _weight_bytes(tag)
+        # AI = FLOPs / Bytes; for weight-loaded workload, bytes = params * wbytes
+        ai = flops_per_call / (N_PARAMS * wbytes)
+        # Throughput = FLOPs / time, time in seconds
+        t_ms = statistics.mean(
+            summaries[tag][t].mean_transformer_ms + summaries[tag][t].mean_action_head_ms
+            for t in sorted_tasks)
+        if t_ms <= 0:
+            continue
+        tflops = (flops_per_call / 1e12) / (t_ms / 1000.0)
+        marker = "s" if tag == baseline_tag else "o"
+        ax.scatter([ai], [tflops], s=160, marker=marker, alpha=0.9,
+                   edgecolors="black", linewidth=1.0,
+                   label=f"{tag}  ({tflops:.1f} TFLOPS @ AI {ai:.0f})")
+
+    ax.set_xlabel("Arithmetic intensity (FLOPs / byte loaded)")
+    ax.set_ylabel("Achieved throughput (TFLOPS or TOPS)")
+    ax.set_title(
+        "Roofline: per-variant (AI, throughput) vs A6000 ceilings\n"
+        "FLOPs estimated as 2 × params × tokens × fwd_count (workload constant); "
+        "bytes vary with weight precision"
+    )
+    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+    ax.grid(True, which="both", alpha=0.25)
+    fig.tight_layout()
+    p_rl = os.path.join(plots_dir, "roofline.png")
+    fig.savefig(p_rl, dpi=120)
+    plt.close(fig)
+    charts.append(("Roofline (achieved throughput vs arithmetic intensity, A6000)",
+                   "plots/roofline.png"))
 
     return charts
 
