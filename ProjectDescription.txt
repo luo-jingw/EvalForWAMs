@@ -84,9 +84,14 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
     server.py               fork 自 lingbot-va/wan_va/wan_va_server.py，
                             内插 5 阶段 probe (init/text_encoder/vae_encode/transformer/
                             action_head) + --variant dispatch。
-                            注：action_head 不是独立 module，是 self.transformer
-                            在 action_mode=True 下的另一次调用；与 transformer stage
-                            共享同 30 个 WanTransformerBlock。
+                            注：transformer stage = Algorithm 1 line 4 video stream
+                            denoising loop (3 Euler step × 2 CFG = 6 forwards through
+                            video stream blocks, d_v=3072, ~4.7B params)；action_head
+                            stage = Algorithm 1 line 7 action stream denoising loop
+                            (10 Euler step × 1 = 10 forwards through action stream
+                            blocks, d_a=768, ~350M params + joint cross-modal attn
+                            with video tokens in d_v space). 两条 stream 是 dual-stream
+                            MoT 架构里的**两组独立 transformer block**，不是同一组跑两次
                             calib hooks 已**解耦**：server.py 不再接 --calibrate_out flag；
                             calib 通过 derive_calib_ptq 在独立进程内 build 一次 VA_Server
                             手工 install hooks
