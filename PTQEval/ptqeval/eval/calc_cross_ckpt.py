@@ -836,12 +836,31 @@ def _make_plots(
                    "plots/roofline.png"))
 
     # ------ Chart 7: Op-type breakdown (Linear vs Attention) ------
-    # Architectural FLOPs estimate per variant; mirrors DeltaQuant Fig 3.
-    # When `--op_profile <json>` lands later it can replace _estimate_op_pf
-    # with measured kernel time aggregated by op type.
-    _plot_op_breakdown(
-        plots_dir, tags, baseline_tag,
-        FancyArrowPatch=FancyArrowPatch,
+    # Two data sources, selected per call site:
+    #   1. Measured: profiler JSON keyed by tag -> {linear, attention,
+    #      other} kernel ms (preferred; ground truth).
+    #   2. Estimated: architecture FLOPs derived from _ARCH constants,
+    #      reported in BF16-equivalent TFLOPs (fallback when no
+    #      profiler data exists; DeltaQuant Fig 3 idiom).
+    # _make_plots stays data-agnostic: it always emits the estimated
+    # version. main() additionally renders the measured chart when
+    # --op_profile points at a readable JSON.
+    _render_op_breakdown(
+        plots_dir, tags, baseline_tag, FancyArrowPatch,
+        data={tag: _estimate_op_pf(tag) for tag in tags},
+        unit_label="TF", unit_fmt="{:.1f}",
+        xlabel="BF16-equivalent FLOPs per inference call (TFLOPs)",
+        title="Per-variant op-type FLOPs breakdown (Linear vs Attention)",
+        caption=(
+            "FLOPs estimated from LingBot-VA architecture (d_v=3072 + "
+            "d_a=768 MoT, 30 layers, K=4 chunk, video=3 Euler*2 CFG, "
+            "action=10 Euler). Linear includes self-attn QKV+O, FFN, "
+            "cross-attn, MoT projection; Attention is QK^T + softmax-V. "
+            "w8a8 Linear divided by 4 (int8 TC peak 154.8 TOPS = 4x bf16 "
+            "38.7 TFLOPS). Op-level kernel time not measured -- pass "
+            "--op_profile <path> to use real profiler data."
+        ),
+        out_name="op_breakdown.png",
     )
     charts.append(("Op-type FLOPs breakdown per variant "
                    "(Linear vs Attention, BF16-equivalent; estimated)",
@@ -937,12 +956,41 @@ def _weight_bytes_lookup(tag: str) -> float:
     return 2.0 if tag.lower() in ("bf16", "fp16") else 1.0
 
 
-def _plot_op_breakdown(plots_dir: str, tags: list[str],
-                       baseline_tag: str, FancyArrowPatch) -> None:
+def _load_op_profile(path: str) -> dict[str, dict[str, float]] | None:
+    """Load profiler-measured per-op time JSON. Expected schema:
+        {
+          "_meta": {"unit": "ms", "source": "...", ...},
+          "<tag1>": {"linear": ms, "attention": ms, "other": ms},
+          "<tag2>": {...}
+        }
+    Returns the per-tag dict (sans _meta) or None if unreadable."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    return {k: v for k, v in payload.items() if not k.startswith("_")}
+
+
+def _render_op_breakdown(
+    plots_dir: str,
+    tags: list[str],
+    baseline_tag: str,
+    FancyArrowPatch,
+    data: dict[str, dict[str, float]],
+    unit_label: str,
+    unit_fmt: str,
+    xlabel: str,
+    title: str,
+    caption: str,
+    out_name: str,
+) -> None:
     """Stacked horizontal bar of Linear vs Attention per variant, with
-    DeltaQuant Fig 3 red speedup arrows on Linear segment shrinkage.
-    BF16-equivalent FLOPs so w8a8 variants visibly shrink the Linear
-    bar to 1/4 of bf16 (the actual hardware benefit on int8 TC)."""
+    DeltaQuant Fig 3 red speedup arrows. Data is supplied by the caller
+    so the same renderer serves both the estimated-FLOPs and the
+    measured-time variants."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -953,10 +1001,10 @@ def _plot_op_breakdown(plots_dir: str, tags: list[str],
     seg = {k: [] for k in op_keys}
     totals: list[float] = []
     for tag in tags:
-        est = _estimate_op_pf(tag)
+        entry = data.get(tag, {k: 0.0 for k in op_keys})
         for k in op_keys:
-            seg[k].append(est[k])
-        totals.append(sum(est[k] for k in op_keys))
+            seg[k].append(float(entry.get(k, 0.0)))
+        totals.append(sum(seg[k][-1] for k in op_keys))
 
     fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 1.8)))
     y_pos = list(range(len(tags)))
@@ -970,7 +1018,7 @@ def _plot_op_breakdown(plots_dir: str, tags: list[str],
             if v <= 0:
                 continue
             share = v / totals[i] * 100.0 if totals[i] > 0 else 0.0
-            label = f"{op_labels[key]}: {v:.1f} TF\n({share:.1f}%)"
+            label = f"{op_labels[key]}: {unit_fmt.format(v)} {unit_label}\n({share:.1f}%)"
             # Show inner label only when segment is wide enough; small
             # segments rely on legend + the percentage in the next
             # widest segment's neighborhood.
@@ -984,7 +1032,7 @@ def _plot_op_breakdown(plots_dir: str, tags: list[str],
     for i, (tot, bar_end) in enumerate(zip(totals, left)):
         is_baseline = (tags[i] == baseline_tag)
         pad = 0.010 * bar_max if is_baseline else 0.040 * bar_max
-        ax.text(bar_end + pad, i, f"{tot:.1f} TF",
+        ax.text(bar_end + pad, i, f"{unit_fmt.format(tot)} {unit_label}",
                 va="center", fontsize=10, color="#333", fontweight="bold")
 
     # Reference dotted vertical line + curved red speedup arrows.
@@ -1047,9 +1095,8 @@ def _plot_op_breakdown(plots_dir: str, tags: list[str],
     ax.set_yticklabels(tags, fontsize=11, fontweight="bold")
     ax.set_ylim(-0.6, len(tags) - 0.4)
     ax.invert_yaxis()
-    ax.set_xlabel("BF16-equivalent FLOPs per inference call (TFLOPs)", fontsize=10)
-    ax.set_title("Per-variant op-type FLOPs breakdown (Linear vs Attention)",
-                 fontsize=12, pad=8)
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_title(title, fontsize=12, pad=8)
     ax.legend(loc="upper right", framealpha=0.92, fontsize=10)
     right_pad = 1.20 if len(tags) >= 3 else 1.13
     ax.set_xlim(0, bar_max * right_pad)
@@ -1059,16 +1106,9 @@ def _plot_op_breakdown(plots_dir: str, tags: list[str],
     # Generous left margin so long variant tags (e.g.
     # `viditq_w8a8_dynamic`) are not clipped at the y-tick gutter.
     fig.subplots_adjust(left=0.15, bottom=0.20)
-    fig.text(
-        0.5, 0.02,
-        "FLOPs estimated from LingBot-VA architecture (d_v=3072 + d_a=768 "
-        "MoT, 30 layers, K=4 chunk, video=3 Euler*2 CFG, action=10 Euler). "
-        "Linear includes self-attn QKV+O, FFN, cross-attn, MoT projection; "
-        "Attention is QK^T + softmax-V. w8a8 Linear divided by 4 "
-        "(int8 TC peak 154.8 TOPS = 4x bf16 38.7 TFLOPS). Op-level kernel "
-        "time not measured yet -- swap in profiler data when available.",
-        ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
-    p = os.path.join(plots_dir, "op_breakdown.png")
+    fig.text(0.5, 0.02, caption,
+             ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
+    p = os.path.join(plots_dir, out_name)
     fig.savefig(p, dpi=130)
     plt.close(fig)
 
@@ -1231,6 +1271,7 @@ def write_report_md(
     overall_charts = [
         "plots/compute_breakdown.png",
         "plots/op_breakdown.png",
+        "plots/op_breakdown_measured.png",  # only present when --op_profile
         "plots/roofline.png",
     ]
     for rel in overall_charts:
@@ -1422,6 +1463,12 @@ def main() -> int:
                         "section gains per-category parameter counts "
                         "(active vs cross_attn_fp vs other). Set to "
                         "'' to skip.")
+    p.add_argument("--op_profile", default="",
+                   help="Optional profiler JSON keyed by variant tag -> "
+                        "{linear, attention, other} kernel ms. When "
+                        "supplied, emits plots/op_breakdown_measured.png "
+                        "alongside the architecture-estimated version. "
+                        "Schema documented in _load_op_profile.")
     args = p.parse_args()
 
     variant_specs = [_parse_variant_arg(v) for v in args.variant]
@@ -1481,6 +1528,43 @@ def main() -> int:
     if not args.no_plots:
         charts = _make_plots(args.out_dir, variant_specs, baseline_tag,
                              tasks, summaries, step_limits)
+
+        # Optionally overlay a profiler-measured op_breakdown chart
+        # alongside the architecture-estimated default.
+        op_data = _load_op_profile(args.op_profile)
+        if op_data is not None:
+            from matplotlib.patches import FancyArrowPatch
+            plots_dir = os.path.join(args.out_dir, "plots")
+            missing = [t for t in tags if t not in op_data]
+            if missing:
+                print(f"warning: --op_profile missing entries for "
+                      f"{missing}; measured op_breakdown will show 0 for "
+                      f"those variants.")
+            _render_op_breakdown(
+                plots_dir, tags, baseline_tag, FancyArrowPatch,
+                data=op_data,
+                unit_label="ms", unit_fmt="{:.0f}",
+                xlabel="Mean op-type kernel time per inference call (ms)",
+                title=("Per-variant op-type measured kernel time "
+                       "(Linear vs Attention)"),
+                caption=(
+                    f"Measured kernel time aggregated by op type from "
+                    f"`{os.path.basename(args.op_profile)}`. Linear = "
+                    f"cuBLAS/cuBLASLt + W8A8 GEMM kernels; Attention = "
+                    f"SDPA / fused mha kernels; Other = elementwise + "
+                    f"layernorm + softmax + launch overhead."
+                ),
+                out_name="op_breakdown_measured.png",
+            )
+            charts.append(("Op-type measured kernel time per variant "
+                           "(Linear vs Attention)",
+                           "plots/op_breakdown_measured.png"))
+            print(f"loaded op_profile from {args.op_profile}; rendered "
+                  f"op_breakdown_measured.png")
+        elif args.op_profile:
+            print(f"warning: --op_profile {args.op_profile!r} not "
+                  f"readable; only architecture-estimated op_breakdown "
+                  f"will appear.")
 
     quant_scope = _inspect_quant_scope(args.int_weights_ckpt)
     if quant_scope is None and args.int_weights_ckpt:
