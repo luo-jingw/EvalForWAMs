@@ -977,6 +977,18 @@ def write_report_md(
         a("| " + " | ".join(row) + " |")
     a("")
 
+    # Embed overall-view charts here so they sit right after the
+    # headline numbers they visualize.
+    chart_map = {rel: title for (title, rel) in (charts or [])}
+    overall_charts = [
+        "plots/compute_breakdown.png",
+        "plots/roofline.png",
+    ]
+    for rel in overall_charts:
+        if rel in chart_map:
+            a(f"![{chart_map[rel]}]({rel})")
+            a("")
+
     # ----------------- per-task -----------------
     a("## Per-Task Comparison")
     a("")
@@ -1032,15 +1044,17 @@ def write_report_md(
         a("| " + " | ".join(cells) + " |")
     a("")
 
-    # ----------------- visualizations (files only, not embedded) -----------------
-    if charts:
-        a("## Visualizations")
-        a("")
-        a("Saved under `plots/` next to this report (not embedded inline):")
-        a("")
-        for title, rel in charts:
-            a(f"- `{rel}` — {title}")
-        a("")
+    # Per-task charts embedded after the per-task comparison table.
+    per_task_charts = [
+        "plots/sr_by_task.png",
+        "plots/total_ms_speedup.png",
+        "plots/speedup_by_task.png",
+        "plots/latency_distribution.png",
+    ]
+    for rel in per_task_charts:
+        if rel in chart_map:
+            a(f"![{chart_map[rel]}]({rel})")
+            a("")
 
     # ----------------- notable deltas -----------------
     notable_threshold = 0.10  # |ΔSR| > 10 pp counts as notable
