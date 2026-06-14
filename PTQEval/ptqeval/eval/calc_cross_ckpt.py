@@ -866,6 +866,81 @@ def _make_plots(
                    "(Linear vs Attention, BF16-equivalent; estimated)",
                    "plots/op_breakdown.png"))
 
+    # ------ Chart 8: Memory breakdown (model weights + transient) ------
+    # Two-segment stacked horizontal bar per variant decomposing the
+    # observed VRAM peak into model weights (init_peak_mb, never freed)
+    # and the additional activations/KV cache/scratch buffer (peak -
+    # init). Uses summary.csv fields only -- no extra instrumentation.
+    seg_weights = [
+        statistics.mean(summaries[tag][t].init_peak_mb for t in sorted_tasks)
+        for tag in tags
+    ]
+    seg_transient = [
+        max(0.0, statistics.mean(summaries[tag][t].peak_alloc_mb for t in sorted_tasks)
+            - statistics.mean(summaries[tag][t].init_peak_mb for t in sorted_tasks))
+        for tag in tags
+    ]
+    fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 1.8)))
+    y_pos = list(range(len(tags)))
+    mem_colors = ("#4a6fa5", "#e09f3e")  # weights (cool) + transient (warm)
+    mem_labels = ("Model weights (init peak, persistent)",
+                  "Activations + KV cache + scratch (transient peak)")
+    bar_max_mem = max(w + t for w, t in zip(seg_weights, seg_transient))
+    # Segment 1: weights.
+    ax.barh(y_pos, seg_weights, color=mem_colors[0],
+            label=mem_labels[0], edgecolor="white",
+            linewidth=1.0, height=0.85)
+    for i, w in enumerate(seg_weights):
+        if w >= 0.10 * bar_max_mem:
+            ax.text(w / 2, i,
+                    f"weights\n{w/1024:.1f} GB\n({w / (w + seg_transient[i]) * 100:.1f}%)",
+                    ha="center", va="center", fontsize=9.5,
+                    color="white", fontweight="bold")
+    # Segment 2: transient.
+    ax.barh(y_pos, seg_transient, left=seg_weights, color=mem_colors[1],
+            label=mem_labels[1], edgecolor="white",
+            linewidth=1.0, height=0.85)
+    for i, (t, w) in enumerate(zip(seg_transient, seg_weights)):
+        if t >= 0.05 * bar_max_mem:
+            tot = w + t
+            ax.text(w + t / 2, i,
+                    f"transient\n{t/1024:.1f} GB\n({t / tot * 100:.1f}%)",
+                    ha="center", va="center", fontsize=9.5,
+                    color="#1a1a1a", fontweight="bold")
+    # Total label at bar end.
+    for i, (w, t) in enumerate(zip(seg_weights, seg_transient)):
+        tot = w + t
+        ax.text(tot + 0.012 * bar_max_mem, i, f"{tot/1024:.1f} GB total",
+                va="center", fontsize=10, color="#333", fontweight="bold")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(tags, fontsize=11, fontweight="bold")
+    ax.set_ylim(-0.6, len(tags) - 0.4)
+    ax.invert_yaxis()
+    ax.set_xlabel("VRAM peak alloc (MB)", fontsize=10)
+    ax.set_title("Per-variant VRAM peak breakdown "
+                 "(model weights vs runtime transient)",
+                 fontsize=12, pad=8)
+    ax.legend(loc="lower right", framealpha=0.92, fontsize=9.5)
+    ax.set_xlim(0, bar_max_mem * 1.18)
+    ax.grid(True, axis="x", alpha=0.20)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    fig.subplots_adjust(left=0.15, bottom=0.18)
+    fig.text(0.5, 0.02,
+             "Weights = init_peak_mb (PerfProbe samples allocator right "
+             "after model load). Transient = (max stage peak_alloc) - "
+             "(init peak), aggregating activations + KV cache + scratch + "
+             "fragmentation across the 5 stages (init / text_encoder / "
+             "vae_encode / transformer / action_head); on this workload "
+             "the transient peak falls in vae_encode.",
+             ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
+    p_mem = os.path.join(plots_dir, "memory_breakdown.png")
+    fig.savefig(p_mem, dpi=130)
+    plt.close(fig)
+    charts.append(("VRAM peak breakdown per variant "
+                   "(model weights vs transient activations + KV)",
+                   "plots/memory_breakdown.png"))
+
     return charts
 
 
@@ -1272,6 +1347,7 @@ def write_report_md(
         "plots/compute_breakdown.png",
         "plots/op_breakdown.png",
         "plots/op_breakdown_measured.png",  # only present when --op_profile
+        "plots/memory_breakdown.png",
         "plots/roofline.png",
     ]
     for rel in overall_charts:
