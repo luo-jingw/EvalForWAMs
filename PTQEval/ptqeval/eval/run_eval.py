@@ -107,6 +107,18 @@ def parse_args() -> Config:
     p.add_argument("--server_env", default="lingbot-jw")
     p.add_argument("--client_env", default="RoboTwin-jw")
 
+    # --- optional op-level profiling ---
+    p.add_argument("--profile_ops", action="store_true",
+                   help="Forward --profile_ops to each server: wrap the "
+                        "first --profile_n_calls infer() calls in "
+                        "torch.profiler and dump op_profile.json (kernel "
+                        "ms classified into linear / attention / other). "
+                        "Off by default; profiler ~5-10x slowdown so "
+                        "only enable with small --test_num.")
+    p.add_argument("--profile_n_calls", type=int, default=5,
+                   help="Number of post-warmup infer() calls to profile "
+                        "per server when --profile_ops is on.")
+
     args = p.parse_args()
 
     save_root = args.save_root
@@ -135,6 +147,8 @@ def parse_args() -> Config:
         client_env=args.client_env,
         save_root=save_root,
         perf_log_dir=perf_log_dir,
+        profile_ops=args.profile_ops,
+        profile_n_calls=args.profile_n_calls,
     )
 
 

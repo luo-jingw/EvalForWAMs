@@ -1031,14 +1031,10 @@ def _weight_bytes_lookup(tag: str) -> float:
     return 2.0 if tag.lower() in ("bf16", "fp16") else 1.0
 
 
-def _load_op_profile(path: str) -> dict[str, dict[str, float]] | None:
-    """Load profiler-measured per-op time JSON. Expected schema:
-        {
-          "_meta": {"unit": "ms", "source": "...", ...},
-          "<tag1>": {"linear": ms, "attention": ms, "other": ms},
-          "<tag2>": {...}
-        }
-    Returns the per-tag dict (sans _meta) or None if unreadable."""
+def _load_op_profile_for_tag(path: str) -> dict[str, float] | None:
+    """Read a single aggregator op_profile.json:
+        {"_meta": {...}, "op_per_call_ms": {"linear": .., "attention": .., "other": ..}}
+    Returns the op_per_call_ms dict or None when unreadable / malformed."""
     if not path or not os.path.exists(path):
         return None
     try:
@@ -1046,7 +1042,29 @@ def _load_op_profile(path: str) -> dict[str, dict[str, float]] | None:
             payload = json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
-    return {k: v for k, v in payload.items() if not k.startswith("_")}
+    slot = payload.get("op_per_call_ms")
+    if not isinstance(slot, dict):
+        return None
+    return {k: float(slot.get(k, 0.0)) for k in ("linear", "attention", "other")}
+
+
+def _collect_op_profile(specs: list[str]) -> dict[str, dict[str, float]] | None:
+    """Parse multiple `--op_profile TAG=PATH` entries into a per-tag dict.
+    Returns None if specs is empty or every path is unreadable."""
+    if not specs:
+        return None
+    out: dict[str, dict[str, float]] = {}
+    for s in specs:
+        if "=" not in s:
+            print(f"warning: --op_profile {s!r} must be TAG=PATH; skipped")
+            continue
+        tag, path = s.split("=", 1)
+        data = _load_op_profile_for_tag(path)
+        if data is None:
+            print(f"warning: --op_profile {tag}={path!r} not readable; skipped")
+            continue
+        out[tag] = data
+    return out or None
 
 
 def _render_op_breakdown(
@@ -1539,12 +1557,15 @@ def main() -> int:
                         "section gains per-category parameter counts "
                         "(active vs cross_attn_fp vs other). Set to "
                         "'' to skip.")
-    p.add_argument("--op_profile", default="",
-                   help="Optional profiler JSON keyed by variant tag -> "
-                        "{linear, attention, other} kernel ms. When "
-                        "supplied, emits plots/op_breakdown_measured.png "
-                        "alongside the architecture-estimated version. "
-                        "Schema documented in _load_op_profile.")
+    p.add_argument("--op_profile", action="append", default=[],
+                   help="Per-variant profiler JSON: <TAG>=<path>. Path "
+                        "points at a JSON produced by aggregator's "
+                        "merge_op_profiles (i.e. <summary>/op_profile.json) "
+                        "containing {op_per_call_ms: {linear, attention, "
+                        "other}}. Repeat the flag once per variant. When "
+                        "any are supplied, emits "
+                        "plots/op_breakdown_measured.png next to the "
+                        "architecture-estimated version.")
     args = p.parse_args()
 
     variant_specs = [_parse_variant_arg(v) for v in args.variant]
@@ -1606,8 +1627,10 @@ def main() -> int:
                              tasks, summaries, step_limits)
 
         # Optionally overlay a profiler-measured op_breakdown chart
-        # alongside the architecture-estimated default.
-        op_data = _load_op_profile(args.op_profile)
+        # alongside the architecture-estimated default. Each
+        # --op_profile entry is TAG=PATH; PATH points at an
+        # aggregator-produced op_profile.json.
+        op_data = _collect_op_profile(args.op_profile)
         if op_data is not None:
             from matplotlib.patches import FancyArrowPatch
             plots_dir = os.path.join(args.out_dir, "plots")
@@ -1616,6 +1639,7 @@ def main() -> int:
                 print(f"warning: --op_profile missing entries for "
                       f"{missing}; measured op_breakdown will show 0 for "
                       f"those variants.")
+            srcs = ", ".join(sorted(op_data.keys()))
             _render_op_breakdown(
                 plots_dir, tags, baseline_tag, FancyArrowPatch,
                 data=op_data,
@@ -1624,23 +1648,26 @@ def main() -> int:
                 title=("Per-variant op-type measured kernel time "
                        "(Linear vs Attention)"),
                 caption=(
-                    f"Measured kernel time aggregated by op type from "
-                    f"`{os.path.basename(args.op_profile)}`. Linear = "
-                    f"cuBLAS/cuBLASLt + W8A8 GEMM kernels; Attention = "
-                    f"SDPA / fused mha kernels; Other = elementwise + "
-                    f"layernorm + softmax + launch overhead."
+                    f"Measured kernel time per inference call, aggregated "
+                    f"by torch.profiler over the first 5 post-warmup "
+                    f"infer() calls of each task and averaged across tasks "
+                    f"(sources: {srcs}). Linear = cuBLAS/cuBLASLt + W8A8 "
+                    f"GEMM kernels; Attention = SDPA / fused mha + softmax "
+                    f"kernels; Other = elementwise + layernorm + launch. "
+                    f"Profiler overhead inflates absolute ms -- compare "
+                    f"op-share within a variant, not absolute speed."
                 ),
                 out_name="op_breakdown_measured.png",
             )
             charts.append(("Op-type measured kernel time per variant "
                            "(Linear vs Attention)",
                            "plots/op_breakdown_measured.png"))
-            print(f"loaded op_profile from {args.op_profile}; rendered "
-                  f"op_breakdown_measured.png")
+            print(f"loaded op_profile for {len(op_data)} variants; "
+                  f"rendered op_breakdown_measured.png")
         elif args.op_profile:
-            print(f"warning: --op_profile {args.op_profile!r} not "
-                  f"readable; only architecture-estimated op_breakdown "
-                  f"will appear.")
+            print(f"warning: --op_profile {args.op_profile!r} produced "
+                  f"no usable data; only architecture-estimated "
+                  f"op_breakdown will appear.")
 
     quant_scope = _inspect_quant_scope(args.int_weights_ckpt)
     if quant_scope is None and args.int_weights_ckpt:

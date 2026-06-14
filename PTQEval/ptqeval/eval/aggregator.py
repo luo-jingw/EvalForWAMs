@@ -262,6 +262,49 @@ def write_json(rows: list[SummaryRow], perf: dict[str, TaskPerf], path: str) -> 
         json.dump(payload, fp, indent=2)
 
 
+def merge_op_profiles(perf_log_dir: str, out_dir: str) -> None:
+    """Merge per-task <task>_op_profile.json files (written by server
+    when --profile_ops is on) into a single <out_dir>/op_profile.json
+    containing the mean op-share across tasks. No-op if no per-task
+    file exists."""
+    import glob
+    files = sorted(glob.glob(os.path.join(perf_log_dir, "*_op_profile.json")))
+    if not files:
+        return
+    per_call_ms = {"linear": 0.0, "attention": 0.0, "other": 0.0}
+    n = 0
+    sources = []
+    for f in files:
+        try:
+            with open(f) as fh:
+                p = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        slot = p.get("op_per_call_ms")
+        if not slot:
+            continue
+        for k in per_call_ms:
+            per_call_ms[k] += float(slot.get(k, 0.0))
+        n += 1
+        sources.append(os.path.basename(f))
+    if n == 0:
+        return
+    per_call_ms = {k: v / n for k, v in per_call_ms.items()}
+    out_path = os.path.join(out_dir, "op_profile.json")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump({
+            "_meta": {
+                "unit": "ms",
+                "source": "torch.profiler (per-task averaged)",
+                "n_tasks": n,
+                "task_files": sources,
+            },
+            "op_per_call_ms": per_call_ms,
+        }, f, indent=2)
+    print(f"wrote {out_path} (averaged across {n} tasks)")
+
+
 def main(save_root: str, perf_log_dir: str, out_dir: str) -> None:
     perf_records = load_perf_logs(perf_log_dir)
     perf_stats: dict[str, TaskPerf] = {
@@ -275,6 +318,9 @@ def main(save_root: str, perf_log_dir: str, out_dir: str) -> None:
     write_json(rows, perf_stats, json_path)
     print(f"wrote {csv_path} ({len(rows)} rows)")
     print(f"wrote {json_path}")
+    # Merge optional op_profile artifacts if any server ran with
+    # --profile_ops; harmless when absent.
+    merge_op_profiles(perf_log_dir, out_dir)
 
 
 if __name__ == "__main__":

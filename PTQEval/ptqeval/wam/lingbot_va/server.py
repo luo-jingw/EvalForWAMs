@@ -1,11 +1,36 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import contextlib
+import json
 import os
 import sys
 import time
 from functools import partial
 from typing import Optional
+
+
+# Substring rules for classifying CUDA kernels when --profile_ops is on.
+# Order matters: first match wins. Tuned for cuBLAS bf16 + our W8A8
+# GEMM + PyTorch SDPA + ViDiT-Q kernels.
+_LINEAR_TOKENS = (
+    "gemm", "cublas", "cutlass", "w8a8", "qlinear",
+    "linear", "addmm", "mm_kernel", "mm_out", "act_quant",
+)
+_ATTENTION_TOKENS = (
+    "sdpa", "scaled_dot_product", "flash", "fmha", "mha",
+    "attention_kernel", "softmax",
+)
+
+
+def _classify_kernel(name: str) -> str:
+    n = name.lower()
+    for tok in _LINEAR_TOKENS:
+        if tok in n:
+            return "linear"
+    for tok in _ATTENTION_TOKENS:
+        if tok in n:
+            return "attention"
+    return "other"
 from PIL import Image
 from diffusers.video_processor import VideoProcessor
 from diffusers.utils import export_to_video
@@ -74,6 +99,31 @@ class VA_Server:
                 task_name=perf_task_name,
                 device=job_config.local_rank,
             )
+
+        # Optional op-level kernel profiling: when on, the first
+        # `_profile_target` post-warmup full _infer() calls (the ones
+        # that hit the `else` branch in infer() -- not reset / not
+        # compute_kv_cache) run inside torch.profiler.profile and the
+        # accumulated per-kernel CUDA time is classified into
+        # linear/attention/other and written to
+        # <perf_log_dir>/<task>_op_profile.json. Off by default so
+        # production eval pays nothing. Profiler overhead is real
+        # (~5-10x slowdown for the instrumented calls only), so this
+        # path is meant for short --test_num runs.
+        self._profile_ops = bool(getattr(job_config, 'profile_ops', False))
+        self._profile_target = int(getattr(job_config, 'profile_n_calls', 5))
+        self._profile_warmup = 1
+        self._profile_calls_seen = 0
+        self._op_us: dict = {"linear": 0.0, "attention": 0.0, "other": 0.0}
+        self._op_kernel_top: list = []
+        self._profile_dump_path: Optional[str] = None
+        if self._profile_ops and perf_log_dir:
+            self._profile_dump_path = os.path.join(
+                perf_log_dir, f"{perf_task_name}_op_profile.json")
+            logger.info(f"[profile_ops] will instrument first "
+                        f"{self._profile_target} infer() calls "
+                        f"(+{self._profile_warmup} warmup); dump to "
+                        f"{self._profile_dump_path}")
 
         init_stage_ctx = None
         if self.probe is not None:
@@ -692,11 +742,74 @@ class VA_Server:
                 return dict()
             else:
                 logger.info(f"################# Infer One Chunk #################")
-                action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+                action = self._infer_with_optional_op_profile(obs)
                 return dict(action=action)
         finally:
             if self.probe is not None:
                 self.probe.end_call()
+
+    def _infer_with_optional_op_profile(self, obs):
+        """Wrap _infer in torch.profiler.profile for the first
+        _profile_target post-warmup calls; otherwise call _infer
+        directly. Dumps op_profile JSON once target reached."""
+        if (not self._profile_ops
+                or self._profile_calls_seen >= (self._profile_target + self._profile_warmup)):
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            return action
+
+        try:
+            from torch.profiler import profile as _profile, ProfilerActivity
+        except ImportError:
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            return action
+
+        with _profile(activities=[ProfilerActivity.CUDA]) as prof:
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+
+        # Skip warmup calls (compile / autotune noise).
+        if self._profile_calls_seen >= self._profile_warmup:
+            for row in prof.key_averages():
+                cuda_us = float(row.self_cuda_time_total)
+                if cuda_us <= 0:
+                    continue
+                cat = _classify_kernel(row.key)
+                self._op_us[cat] += cuda_us
+                self._op_kernel_top.append(
+                    {"name": row.key, "cat": cat,
+                     "self_cuda_us": cuda_us, "count": int(row.count)})
+
+        self._profile_calls_seen += 1
+        if (self._profile_calls_seen == self._profile_target + self._profile_warmup
+                and self._profile_dump_path is not None):
+            per_call_ms = {
+                k: v / 1000.0 / max(1, self._profile_target)
+                for k, v in self._op_us.items()
+            }
+            top = sorted(self._op_kernel_top, key=lambda r: -r["self_cuda_us"])[:50]
+            payload = {
+                "_meta": {
+                    "unit": "ms",
+                    "source": "torch.profiler",
+                    "n_calls": self._profile_target,
+                    "warmup": self._profile_warmup,
+                    "note": ("Profiler overhead inflates absolute ms; "
+                             "compare op-type share within a variant."),
+                },
+                "op_per_call_ms": per_call_ms,
+                "_per_kernel_top50": top,
+            }
+            try:
+                os.makedirs(os.path.dirname(self._profile_dump_path), exist_ok=True)
+                with open(self._profile_dump_path, "w") as f:
+                    json.dump(payload, f, indent=2)
+                logger.info(f"[profile_ops] wrote {self._profile_dump_path}: "
+                            f"linear={per_call_ms['linear']:.1f}ms "
+                            f"attention={per_call_ms['attention']:.1f}ms "
+                            f"other={per_call_ms['other']:.1f}ms")
+            except OSError as e:
+                logger.warning(f"[profile_ops] failed to write "
+                               f"{self._profile_dump_path}: {e}")
+        return action
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
@@ -765,6 +878,8 @@ def run(args):
         config.variant = args.variant
     if args.variant_args is not None:
         config.variant_args = args.variant_args
+    config.profile_ops = bool(args.profile_ops)
+    config.profile_n_calls = int(args.profile_n_calls)
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -837,6 +952,22 @@ def main():
         default=None,
         help='path to a yaml file with method-specific args; loaded via '
              'OmegaConf and passed to load_quant_model as a plain dict.'
+    )
+    parser.add_argument(
+        "--profile_ops",
+        action="store_true",
+        help='Wrap the first --profile_n_calls infer() calls (after 1 '
+             'warmup) in torch.profiler and dump '
+             '<perf_log_dir>/<task>_op_profile.json with kernel time '
+             'classified into linear / attention / other. Off by '
+             'default; only enable for short test_num=5/10 speed runs.'
+    )
+    parser.add_argument(
+        "--profile_n_calls",
+        type=int,
+        default=5,
+        help='Number of post-warmup infer() calls to profile when '
+             '--profile_ops is set.'
     )
     args = parser.parse_args()
     run(args)

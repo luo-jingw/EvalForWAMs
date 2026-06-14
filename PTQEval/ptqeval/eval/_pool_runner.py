@@ -62,6 +62,8 @@ class Config:
     client_env: str
     save_root: Path
     perf_log_dir: Path
+    profile_ops: bool = False
+    profile_n_calls: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +243,9 @@ def start_server(cfg: Config, gpu: int, port: int, master_port: int,
         extra.append(f"--variant {cfg.variant}")
         if cfg.variant_args:
             extra.append(f"--variant_args {cfg.variant_args}")
+    if cfg.profile_ops:
+        extra.append("--profile_ops")
+        extra.append(f"--profile_n_calls {cfg.profile_n_calls}")
     extra_cli = " ".join(extra)
 
     cmd = (
