@@ -95,7 +95,7 @@ def _build_prompt_to_task(save_root: Path) -> dict[str, str]:
 
 
 def _filter_episodes(videos_root: Path, task_list: Optional[list[str]],
-                     use_all: bool) -> list[Path]:
+                     use_all: bool, per_task_ep: int = 0) -> list[Path]:
     vis_root = videos_root / "visualization" / "real"
     if not vis_root.exists():
         raise FileNotFoundError(
@@ -104,11 +104,13 @@ def _filter_episodes(videos_root: Path, task_list: Optional[list[str]],
         )
     ep_dirs = sorted(p for p in vis_root.iterdir() if p.is_dir())
     if use_all:
+        if per_task_ep > 0:
+            logger.warning("--per_task_ep ignored because --all is set")
         return ep_dirs
 
     assert task_list, "task_list required when --all is not set"
     prompt_to_task = _build_prompt_to_task(videos_root)
-    selected = []
+    by_task: dict[str, list[Path]] = {}
     skipped_task = 0
     skipped_unknown = 0
     for ep_dir in ep_dirs:
@@ -120,10 +122,20 @@ def _filter_episodes(videos_root: Path, task_list: Optional[list[str]],
         if task not in task_list:
             skipped_task += 1
             continue
-        selected.append(ep_dir)
+        by_task.setdefault(task, []).append(ep_dir)
+    # Sorted iteration already gives chronological order per task; keep
+    # the first per_task_ep when set.
+    selected: list[Path] = []
+    capped = 0
+    for task, eps in by_task.items():
+        keep = eps[:per_task_ep] if per_task_ep > 0 else eps
+        capped += len(eps) - len(keep)
+        selected.extend(keep)
     logger.info(
         f"episode filter: {len(selected)} kept, {skipped_task} other-task, "
-        f"{skipped_unknown} unmapped (no matching mp4 -> prompt mapping)."
+        f"{skipped_unknown} unmapped (no matching mp4 -> prompt mapping)"
+        + (f", {capped} dropped by --per_task_ep={per_task_ep}"
+           if per_task_ep > 0 else "")
     )
     return selected
 
@@ -478,6 +490,12 @@ def main() -> int:
              "Default OFF (filter by --task_list).",
     )
     p.add_argument(
+        "--per_task_ep", type=int, default=0,
+        help="If >0, keep only the first N episodes per task (after "
+             "task_list filter) so calib mass per task is uniform. "
+             "Default 0 = use every matching episode (legacy behavior).",
+    )
+    p.add_argument(
         "--calib_out", type=Path,
         default=Path("/home/arash/EvalForWAMs/results/calib_data/calib_data.pth"),
         help="Per-channel absmax dump path. Overwrites in place.",
@@ -553,7 +571,8 @@ def main() -> int:
     else:
         logger.info("task subset: ALL (--all)")
 
-    ep_dirs = _filter_episodes(args.videos_root, task_list, args.all)
+    ep_dirs = _filter_episodes(args.videos_root, task_list, args.all,
+                                per_task_ep=args.per_task_ep)
     if not ep_dirs:
         logger.error("no episode dirs matched; nothing to do.")
         return 1
