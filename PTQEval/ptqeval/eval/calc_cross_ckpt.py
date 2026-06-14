@@ -333,7 +333,7 @@ def _make_plots(
     charts: list[tuple[str, str]] = []
 
     # ------ Chart 1: SR per task per variant ------
-    fig, ax = plt.subplots(figsize=(fig_w, 5.0))
+    fig, ax = plt.subplots(figsize=(fig_w, 5.4))
     bw = 0.8 / max(1, len(tags))
     for i, tag in enumerate(tags):
         srs = [summaries[tag][t].success_rate * 100.0 for t in sorted_tasks]
@@ -343,8 +343,12 @@ def _make_plots(
     ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Success rate (%)")
     ax.set_ylim(0, 105)
-    ax.set_title("Per-task success rate (tasks sorted by step limit)")
-    ax.legend(loc="lower left")
+    ax.set_title("Per-task success rate (sorted by step limit)", pad=24)
+    # Legend above plot area as a single row so it doesn't occlude bars
+    # in any corner (lower-left collided with adjust_bottle / beat_block
+    # at 0-30%; lower-right would collide with put_bottles_dustbin).
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.005),
+              ncol=len(tags), frameon=False, fontsize=10)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     p1 = os.path.join(plots_dir, "sr_by_task.png")
@@ -353,66 +357,82 @@ def _make_plots(
     charts.append(("Per-task success rate (sorted by step limit)",
                    "plots/sr_by_task.png"))
 
-    # ------ Chart 2: total_ms bars + speedup line ------
-    fig, (ax_top, ax_bot) = plt.subplots(
-        2, 1, figsize=(fig_w, 7.5),
-        gridspec_kw={"height_ratios": [2, 1]}, sharex=True)
+    # ------ Chart 2: total_ms bars (+ speedup line when N>=2) ------
+    # In single-variant mode, the speedup subplot has nothing to draw and
+    # would render as an empty pane; collapse to a single-axis figure
+    # showing only the per-task latency bars.
+    if other_tags:
+        fig, (ax_top, ax_bot) = plt.subplots(
+            2, 1, figsize=(fig_w, 7.5),
+            gridspec_kw={"height_ratios": [2, 1]}, sharex=True)
+    else:
+        fig, ax_top = plt.subplots(figsize=(fig_w, 5.0))
+        ax_bot = None
     for i, tag in enumerate(tags):
         ms = [summaries[tag][t].mean_total_ms for t in sorted_tasks]
         offset = (i - (len(tags) - 1) / 2.0) * bw
         ax_top.bar([xi + offset for xi in x], ms, width=bw, label=tag)
     ax_top.set_ylabel("Mean total ms / call")
-    ax_top.set_title("Latency and speedup vs task (sorted by step limit)")
+    if other_tags:
+        ax_top.set_title("Latency and speedup vs task (sorted by step limit)")
+    else:
+        ax_top.set_title("Per-task mean latency (sorted by step limit)")
+        ax_top.set_xticks(x)
+        ax_top.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
     ax_top.legend(loc="upper right")
     ax_top.grid(True, axis="y", alpha=0.3)
 
     base_ms = [summaries[baseline_tag][t].mean_total_ms for t in sorted_tasks]
-    for tag in other_tags:
-        var_ms = [summaries[tag][t].mean_total_ms for t in sorted_tasks]
-        speedup = [
-            (b / v if v > 0 else float("nan")) for b, v in zip(base_ms, var_ms)
-        ]
-        ax_bot.plot(x, speedup, marker="o", linewidth=1.5,
-                    label=f"{tag} vs {baseline_tag}")
-    ax_bot.axhline(1.0, color="gray", linestyle="--", linewidth=0.8,
-                   alpha=0.7, label="parity (1.0x)")
-    ax_bot.set_xticks(x)
-    ax_bot.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-    ax_bot.set_ylabel("Speedup ratio")
-    ax_bot.legend(loc="upper right")
-    ax_bot.grid(True, axis="y", alpha=0.3)
+    if ax_bot is not None:
+        for tag in other_tags:
+            var_ms = [summaries[tag][t].mean_total_ms for t in sorted_tasks]
+            speedup = [
+                (b / v if v > 0 else float("nan")) for b, v in zip(base_ms, var_ms)
+            ]
+            ax_bot.plot(x, speedup, marker="o", linewidth=1.5,
+                        label=f"{tag} vs {baseline_tag}")
+        ax_bot.axhline(1.0, color="gray", linestyle="--", linewidth=0.8,
+                       alpha=0.7, label="parity (1.0x)")
+        ax_bot.set_xticks(x)
+        ax_bot.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+        ax_bot.set_ylabel("Speedup ratio")
+        ax_bot.legend(loc="upper right")
+        ax_bot.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     p2 = os.path.join(plots_dir, "total_ms_speedup.png")
     fig.savefig(p2, dpi=120)
     plt.close(fig)
-    charts.append(("Mean total ms per call + speedup ratio",
-                   "plots/total_ms_speedup.png"))
+    charts.append(
+        ("Mean total ms per call + speedup ratio" if other_tags
+         else "Per-task mean latency",
+         "plots/total_ms_speedup.png"))
 
-    # ------ Chart 3: Speedup per task (histogram) ------
-    fig, ax = plt.subplots(figsize=(fig_w, 5.0))
-    bw3 = 0.8 / max(1, len(other_tags))
-    for i, tag in enumerate(other_tags):
-        var_ms = [summaries[tag][t].mean_total_ms for t in sorted_tasks]
-        speedup = [
-            (b / v if v > 0 else 0.0) for b, v in zip(base_ms, var_ms)
-        ]
-        offset = (i - (len(other_tags) - 1) / 2.0) * bw3
-        ax.bar([xi + offset for xi in x], speedup, width=bw3,
-               label=f"{tag} vs {baseline_tag}")
-    ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.7,
-               label="parity (1.0x)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Speedup ratio (baseline / variant)")
-    ax.set_title("Speedup ratio per task (tasks sorted by step limit)")
-    ax.legend(loc="upper right")
-    ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
-    p3 = os.path.join(plots_dir, "speedup_by_task.png")
-    fig.savefig(p3, dpi=120)
-    plt.close(fig)
-    charts.append(("Speedup ratio per task (sorted by step limit)",
-                   "plots/speedup_by_task.png"))
+    # ------ Chart 3: Speedup per task (histogram); skip in single-variant mode ------
+    if other_tags:
+        fig, ax = plt.subplots(figsize=(fig_w, 5.0))
+        bw3 = 0.8 / max(1, len(other_tags))
+        for i, tag in enumerate(other_tags):
+            var_ms = [summaries[tag][t].mean_total_ms for t in sorted_tasks]
+            speedup = [
+                (b / v if v > 0 else 0.0) for b, v in zip(base_ms, var_ms)
+            ]
+            offset = (i - (len(other_tags) - 1) / 2.0) * bw3
+            ax.bar([xi + offset for xi in x], speedup, width=bw3,
+                   label=f"{tag} vs {baseline_tag}")
+        ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.7,
+                   label="parity (1.0x)")
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("Speedup ratio (baseline / variant)")
+        ax.set_title("Speedup ratio per task (tasks sorted by step limit)")
+        ax.legend(loc="upper right")
+        ax.grid(True, axis="y", alpha=0.3)
+        fig.tight_layout()
+        p3 = os.path.join(plots_dir, "speedup_by_task.png")
+        fig.savefig(p3, dpi=120)
+        plt.close(fig)
+        charts.append(("Speedup ratio per task (sorted by step limit)",
+                       "plots/speedup_by_task.png"))
 
     # ------ Chart 4: Latency distribution (mean / p50 / p95) ------
     fig, ax = plt.subplots(figsize=(fig_w, 5.5))
@@ -439,13 +459,14 @@ def _make_plots(
                    label=f"{tag} mean", zorder=3)
     ax.set_xticks(x)
     ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Total ms / call")
+    ax.set_ylabel("Total ms / call (log scale)")
+    ax.set_yscale("log")
     ax.set_title(
         "Latency distribution per task "
         "(circle = mean, short dash = p50, vertical bar reaches p95)"
     )
     ax.legend(loc="upper right")
-    ax.grid(True, axis="y", alpha=0.3)
+    ax.grid(True, axis="y", alpha=0.3, which="both")
     fig.tight_layout()
     p_lat = os.path.join(plots_dir, "latency_distribution.png")
     fig.savefig(p_lat, dpi=120)
@@ -453,14 +474,20 @@ def _make_plots(
     charts.append(("Latency distribution (mean / p50 / p95)",
                    "plots/latency_distribution.png"))
 
-    # ------ Chart 5: Compute breakdown per variant (image.png-style) ------
-    # Horizontal stacked bars, one row per variant. Stack order:
-    # transformer | action_head | other (= total - transformer
-    # - action_head; absorbs text_encoder + vae_encode + comm + dispatch).
-    # Annotates the transformer + action_head reduction relative to the
-    # baseline with speedup arrows (paper-figure style).
+    # ------ Chart 5: Compute breakdown per variant (DeltaQuant Fig 3 style) ------
+    # Horizontal stacked bars, one row per variant, stack order:
+    # transformer | action_head | other (= total - transformer - action_head;
+    # absorbs text_encoder + vae_encode + comm + dispatch + PerfProbe overlap
+    # residual). Adjacent variants get a curved red speedup arrow above the
+    # bar end (paper-figure style); a single cumulative arrow on the far right
+    # carries baseline -> last-variant ratio when N >= 3.
+    from matplotlib.patches import FancyArrowPatch  # local import; matplotlib already loaded
+
     breakdown_keys = ["transformer", "action_head", "other"]
-    breakdown_colors = ["#6f9bd1", "#5db1a8", "#bfbfbf"]
+    # Paper palette: deep magenta-rose / mint-teal / pale sand (matches the
+    # DeltaQuant Fig 3 reference image visually so the chart reads as the
+    # same "compute decomposition" idiom).
+    breakdown_colors = ["#a14b6b", "#5db1a8", "#f1d49a"]
     seg_data: dict[str, list[float]] = {k: [] for k in breakdown_keys}
     totals: list[float] = []
     for tag in tags:
@@ -476,74 +503,155 @@ def _make_plots(
         seg_data["other"].append(other)
         totals.append(total)
 
-    fig, ax = plt.subplots(figsize=(11.0, max(2.6, 0.9 * len(tags) + 1.4)))
+    # Compact row spacing to mirror DeltaQuant Fig 3 (bars nearly
+    # touching). Bar height 0.85 with ylim padding 0.15 keeps a thin
+    # visual seam between rows; explicit ylim because matplotlib default
+    # around invert_yaxis can squash bars into a thin band.
+    fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 1.8)))
     y_pos = list(range(len(tags)))
     left = [0.0] * len(tags)
     for key, color in zip(breakdown_keys, breakdown_colors):
         vals = seg_data[key]
-        bars = ax.barh(y_pos, vals, left=left, color=color, label=key,
-                       edgecolor="white", linewidth=0.8)
+        ax.barh(y_pos, vals, left=left, color=color, label=key,
+                edgecolor="white", linewidth=1.0, height=0.85)
         for i, (v, l) in enumerate(zip(vals, left)):
             if v <= 0:
                 continue
             share = v / totals[i] * 100.0 if totals[i] > 0 else 0.0
-            # Inside-bar label when wide enough; outside (above) otherwise.
-            label = f"{v:.0f} ms\n({share:.1f}%)"
-            if v >= 0.06 * max(totals):
+            label = f"{key.replace('_', ' ').title()}: {v:.0f} ms\n({share:.1f}%)"
+            if v >= 0.08 * max(totals):
                 ax.text(l + v / 2, i, label, ha="center", va="center",
-                        fontsize=8, color="#1a1a1a")
+                        fontsize=9.5, color="#1a1a1a", fontweight="bold")
         left = [l + v for l, v in zip(left, vals)]
 
-    # Total ms label placed at the real bar end (= sum of segments),
-    # NOT at total_ms: when transformer+action_head sums > mean_total_ms
-    # (which happens because PerfProbe stages overlap CFG-batch / dual-pass
-    # transformer execution), `other` clamps to 0 and the bar visually
-    # ends at sum-of-segments > total. Using `left` here avoids the label
-    # landing on top of the last segment's interior text.
+    # Total ms label at actual bar end (sum of segments). Padding is
+    # tight on the baseline bar (no arrow head ever lands there) and
+    # generous on every other bar (otherwise the red arrow head whose
+    # dst sits at `bar_end + arrow_anchor_pad` overstrikes the digits).
+    # ms padding must exceed the arrow_anchor_pad used a few lines
+    # below; pick 0.04 so the label sits clearly right of the arrow tip.
+    bar_max = max(left) if left else 1.0
     for i, (tot, bar_end) in enumerate(zip(totals, left)):
-        max_end = max(left)
-        ax.text(bar_end + 0.01 * max_end, i,
-                f"total {tot:.0f} ms",
-                va="center", fontsize=9, color="#333", fontweight="bold")
+        is_baseline = (tags[i] == baseline_tag)
+        pad = 0.010 * bar_max if is_baseline else 0.040 * bar_max
+        ax.text(bar_end + pad, i,
+                f"{tot:.0f} ms",
+                va="center", fontsize=10, color="#333", fontweight="bold")
 
-    # Speedup arrows: cumulative ratio of baseline_total / variant_total
-    # for the transformer + action_head subtotal (the part our quant
-    # touches), drawn between successive variants in tag order so the
-    # paper-style "n.nx" arrows compose visually.
+    # Reference dotted vertical line from the baseline bar end down to
+    # the last bar -- mirrors the black dashed reference in DeltaQuant
+    # Fig 3 that visually anchors the speedup arrows. Drawn before the
+    # arrows so arrows sit on top.
     base_idx = tags.index(baseline_tag) if baseline_tag in tags else 0
-    base_trans_head = (seg_data["transformer"][base_idx]
-                        + seg_data["action_head"][base_idx])
-    bar_max = max(left)
-    x_arrow = bar_max * 1.22
-    for i, tag in enumerate(tags):
-        if tag == baseline_tag:
-            continue
-        v_trans_head = seg_data["transformer"][i] + seg_data["action_head"][i]
-        speedup = base_trans_head / v_trans_head if v_trans_head > 0 else float("nan")
-        ax.annotate(
-            "", xy=(x_arrow, i), xytext=(x_arrow, base_idx),
-            arrowprops=dict(arrowstyle="->", color="#c0392b", lw=1.4))
-        ax.text(x_arrow + 0.02 * bar_max, (i + base_idx) / 2.0,
-                f"{speedup:.2f}x", color="#c0392b", fontsize=10,
-                fontweight="bold", va="center")
+    base_end = left[base_idx]
+    ax.plot([base_end, base_end],
+            [base_idx, len(tags) - 1 + 0.4],
+            linestyle=(0, (2, 3)), color="#222", lw=1.0, alpha=0.55,
+            zorder=4)
+
+    # Curved red speedup arrows (DeltaQuant Fig 3 idiom). Adjacent
+    # arrows are anchored at the actual bar ends -- so 1.38x emerges
+    # from just past the bf16 bar tip (`4657 ms` corner) and curls into
+    # the dynamic bar tip below it -- rather than pushed into a
+    # separate right-side lane. Cumulative arrow (N>=3) keeps its own
+    # right-side column so it does not pile on top of the adjacent
+    # arcs and their labels.
+    arrow_color = "#c0392b"
+    arrow_lw = 1.8
+    arrow_anchor_pad = 0.018 * bar_max   # tiny gap past bar end
+    # src/dst y are pulled toward the gap between rows (instead of row
+    # center) so the arc starts at the bar's lower-right corner and
+    # ends at the next bar's upper-right corner -- "from the bottom-
+    # left of `4657 ms`". This shortens the arc and keeps the head
+    # well clear of the next bar's interior ms label.
+    src_y_pull = 0.30
+    for k in range(1, len(tags)):
+        src_x = left[k - 1] + arrow_anchor_pad
+        dst_x = left[k] + arrow_anchor_pad
+        src_y = (k - 1) + src_y_pull
+        dst_y = k - src_y_pull
+        arrow = FancyArrowPatch(
+            (src_x, src_y), (dst_x, dst_y),
+            arrowstyle="->,head_width=7,head_length=9",
+            color=arrow_color, lw=arrow_lw,
+            connectionstyle="arc3,rad=-0.32",
+            zorder=5,
+        )
+        ax.add_patch(arrow)
+        sp = left[k - 1] / left[k] if left[k] > 0 else float("nan")
+        # Label sits at the arc midpoint (DeltaQuant Fig 3 idiom) so
+        # the digit rides on the curve rather than off to its side.
+        # Small upward offset in display points keeps the digits from
+        # overlapping the red arc itself.
+        mid_x = (src_x + dst_x) / 2.0
+        mid_y = (src_y + dst_y) / 2.0
+        ax.annotate(f"{sp:.2f}x",
+                    xy=(mid_x, mid_y),
+                    xytext=(8, 0), textcoords="offset points",
+                    color=arrow_color, fontsize=14, fontweight="bold",
+                    ha="left", va="center", zorder=6)
+
+    if len(tags) >= 3:
+        last = len(tags) - 1
+        # Cumulative arrow shares endpoints with the adjacent chain:
+        # src matches the 1.38x source (baseline bar end, lower-right
+        # corner of `bf16`), dst matches the 0.97x dst (last bar end,
+        # upper-right corner of `viditq_static`). A larger curvature
+        # pushes the arc further out so it skirts the inner adjacent
+        # arcs and labels instead of overlapping them.
+        src_x = left[base_idx] + arrow_anchor_pad
+        dst_x = left[last] + arrow_anchor_pad
+        src_y = base_idx + src_y_pull
+        dst_y = last - src_y_pull
+        arrow = FancyArrowPatch(
+            (src_x, src_y), (dst_x, dst_y),
+            arrowstyle="->,head_width=8,head_length=10",
+            color=arrow_color, lw=arrow_lw,
+            connectionstyle="arc3,rad=-0.55",
+            zorder=5,
+        )
+        ax.add_patch(arrow)
+        cum_sp = left[base_idx] / left[last] if left[last] > 0 else float("nan")
+        # Label rides the cumulative arc at its midpoint, mirroring
+        # the adjacent labels' "on-the-curve" placement so the three
+        # speedup digits sit in a consistent visual slot.
+        mid_x = (src_x + dst_x) / 2.0
+        mid_y = (src_y + dst_y) / 2.0
+        ax.annotate(f"{cum_sp:.2f}x",
+                    xy=(mid_x, mid_y),
+                    xytext=(8, 0), textcoords="offset points",
+                    color=arrow_color, fontsize=14, fontweight="bold",
+                    ha="left", va="center", zorder=6)
 
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(tags)
+    ax.set_yticklabels(tags, fontsize=11, fontweight="bold")
+    # Tight half-row padding so bars are nearly touching (DeltaQuant
+    # Fig 3 idiom). Invert so baseline reads on top.
+    ax.set_ylim(-0.6, len(tags) - 0.4)
     ax.invert_yaxis()
-    ax.set_xlabel(f"Mean per-call latency (ms), averaged across {len(sorted_tasks)} tasks")
-    ax.set_title(
-        f"Compute breakdown per variant (red arrows: "
-        f"transformer + action_head speedup vs `{baseline_tag}`)"
-    )
-    ax.legend(loc="lower right", framealpha=0.92, fontsize=9)
-    ax.set_xlim(0, bar_max * 1.38)
-    ax.grid(True, axis="x", alpha=0.25)
+    ax.set_xlabel(
+        f"Mean per-call latency (ms), averaged across {len(sorted_tasks)} tasks",
+        fontsize=10)
+    ax.set_title("Per-variant compute breakdown", fontsize=12, pad=8)
+    # Legend at upper right corner avoids landing on speedup-arrow
+    # lanes which all sit in the lower-right quadrant of the plot area.
+    ax.legend(loc="upper right", framealpha=0.92, fontsize=10)
+    # Right padding sized to fit the adjacent-arc labels (~0.05 past
+    # bar_max) and, when >=3 variants, the wider cumulative arc that
+    # bulges further right (~0.13 past bar_max with rad=-0.55) plus
+    # its `X.XXx` label.
+    right_pad = 1.20 if len(tags) >= 3 else 1.13
+    ax.set_xlim(0, bar_max * right_pad)
+    ax.grid(True, axis="x", alpha=0.20)
+    # Hide top/right spines for a cleaner paper look.
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
     fig.tight_layout()
     p_bd = os.path.join(plots_dir, "compute_breakdown.png")
-    fig.savefig(p_bd, dpi=120)
+    fig.savefig(p_bd, dpi=130)
     plt.close(fig)
     charts.append(("Compute breakdown per variant "
-                   "(stage stack + transformer/action_head speedup arrows)",
+                   "(transformer / action_head / other; curved speedup arrows)",
                    "plots/compute_breakdown.png"))
 
     # ------ Chart 6: Roofline (achieved throughput vs arithmetic intensity) ------
@@ -580,61 +688,136 @@ def _make_plots(
     def _weight_bytes(tag: str) -> float:
         return bytes_per_param.get(tag.lower(), 1.0)
 
-    fig, ax = plt.subplots(figsize=(8.5, 5.5))
-    # X-axis = arithmetic intensity (FLOPs / byte), log scale. Range
-    # extends to ~1e5 because for batch=1 LLM-style workloads with most
-    # bytes coming from weight loads, AI = (FLOPs_per_call) /
-    # (params * bytes_per_param) ≈ tokens × fwds / bytes_per_param,
-    # which lands in 1e4–1e5.
+    # VLA-paper Fig 2 idiom (Williams roofline): one circle per
+    # variant, ceilings as solid piecewise lines clipped to where each
+    # bound is actually active, regions tinted with light shading,
+    # numeric label sits inline next to the marker without a box,
+    # caption goes under the figure. Taller figsize so the title at
+    # the top and the caption at the bottom both fit without squeezing
+    # the plot area.
+    fig, ax = plt.subplots(figsize=(9.0, 6.8))
     ai_min, ai_max = 1.0, 1.0e5
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(ai_min, ai_max)
-    ax.set_ylim(0.5, max(PEAK_INT8_TOPS, PEAK_BF16_TFLOPS) * 1.8)
+    y_top = max(PEAK_INT8_TOPS, PEAK_BF16_TFLOPS) * 1.8
+    y_bottom = 0.5
+    ax.set_ylim(y_bottom, y_top)
 
-    # Memory-bandwidth roofline (diagonal): y = AI * BW (TFLOPs/s if AI is
-    # FLOPs/byte and BW in TB/s; A6000 768 GB/s = 0.768 TB/s).
     bw_tbps = PEAK_BW_GBS / 1000.0
-    ai_line = [ai_min, ai_max]
-    bw_line = [a * bw_tbps for a in ai_line]
-    ax.plot(ai_line, bw_line, linestyle="--", color="#7f7f7f",
-            label=f"A6000 mem BW roofline ({PEAK_BW_GBS:.0f} GB/s)")
-    # Compute ceilings.
-    ax.axhline(PEAK_BF16_TFLOPS, linestyle=":", color="#1f77b4",
-               label=f"A6000 bf16 tensor-core peak ({PEAK_BF16_TFLOPS:.1f} TFLOPS)")
-    ax.axhline(PEAK_INT8_TOPS, linestyle=":", color="#d62728",
-               label=f"A6000 int8 tensor-core peak ({PEAK_INT8_TOPS:.1f} TOPS)")
+    ai_knee_bf16 = PEAK_BF16_TFLOPS / bw_tbps   # ~50 FLOPs/byte
+    ai_knee_int8 = PEAK_INT8_TOPS / bw_tbps     # ~200 FLOPs/byte
 
-    # Per-variant point: AI from weight precision, throughput from measured
-    # transformer + action_head time.
-    for tag in tags:
+    # Region shading: memory-bound (left of bf16 knee, under the BW
+    # line) gets a cool tint, compute-bound (right of bf16 knee, under
+    # the compute ceilings) gets a warm tint. Both transparent so
+    # gridlines and markers stay readable.
+    ax.axvspan(ai_min, ai_knee_bf16, color="#cfe2ff", alpha=0.30, zorder=0)
+    ax.axvspan(ai_knee_bf16, ai_max, color="#fde8d0", alpha=0.30, zorder=0)
+
+    # Solid-line roofline, three segments clipped to where each is
+    # active so the diagonal only sits BELOW the horizontals and the
+    # horizontals only sit TO THE RIGHT of the diagonal.
+    # Diagonal (memory-BW roof) runs from ai_min up to the last knee it
+    # actually caps -- the int8 knee -- and stops there.
+    ai_diag = [ai_min, ai_knee_int8]
+    bw_diag = [a * bw_tbps for a in ai_diag]
+    ax.plot(ai_diag, bw_diag, linestyle="-", color="#444", lw=2.0,
+            label=f"mem BW ({PEAK_BW_GBS:.0f} GB/s)", zorder=3)
+    # bf16 ceiling: horizontal from its knee to plot right edge.
+    ax.plot([ai_knee_bf16, ai_max], [PEAK_BF16_TFLOPS, PEAK_BF16_TFLOPS],
+            linestyle="-", color="#1f77b4", lw=2.0,
+            label=f"bf16 TC peak ({PEAK_BF16_TFLOPS:.1f} TFLOPS)",
+            zorder=3)
+    # int8 ceiling: horizontal from its knee to plot right edge.
+    ax.plot([ai_knee_int8, ai_max], [PEAK_INT8_TOPS, PEAK_INT8_TOPS],
+            linestyle="-", color="#d62728", lw=2.0,
+            label=f"int8 TC peak ({PEAK_INT8_TOPS:.1f} TOPS)",
+            zorder=3)
+
+    # Region labels in lower band so they don't collide with ceilings
+    # or marker labels along the top.
+    ax.text(ai_knee_bf16 / 6.0, y_bottom * 4.0, "memory\nbound",
+            color="#666", fontsize=10, fontstyle="italic",
+            ha="center", va="center")
+    ax.text(ai_knee_bf16 * 60.0, y_bottom * 4.0, "compute\nbound",
+            color="#666", fontsize=10, fontstyle="italic",
+            ha="center", va="center")
+
+    # Per-variant markers: all circles, distinguished by color alone.
+    # Saturated edge ring + semi-transparent fill so overlapping
+    # markers at near-identical (AI, throughput) (which happens when
+    # multiple int8 variants share weight bytes => identical AI) still
+    # read distinctly through the layered alpha.
+    marker_palette = ["#1f78b4", "#33a02c", "#e31a1c", "#ff7f00", "#6a3d9a", "#b15928"]
+    # (dx, dy, ha, va) per index -- stagger label slots so coincident
+    # markers do not stack their numeric labels on the same pixels.
+    label_offsets = [
+        (-12, -10, "right", "top"),       # idx 0: left-down
+        (12,   12, "left",  "bottom"),    # idx 1: right-up
+        (12,  -10, "left",  "top"),       # idx 2: right-down
+        (-12,  12, "right", "bottom"),    # idx 3: left-up
+        (0,    18, "center", "bottom"),   # idx 4: above
+        (0,   -22, "center", "top"),      # idx 5: below
+    ]
+    from matplotlib.colors import to_rgba
+    for idx, tag in enumerate(tags):
         wbytes = _weight_bytes(tag)
-        # AI = FLOPs / Bytes; for weight-loaded workload, bytes = params * wbytes
         ai = flops_per_call / (N_PARAMS * wbytes)
-        # Throughput = FLOPs / time, time in seconds
         t_ms = statistics.mean(
             summaries[tag][t].mean_transformer_ms + summaries[tag][t].mean_action_head_ms
             for t in sorted_tasks)
         if t_ms <= 0:
             continue
         tflops = (flops_per_call / 1e12) / (t_ms / 1000.0)
-        marker = "s" if tag == baseline_tag else "o"
-        ax.scatter([ai], [tflops], s=160, marker=marker, alpha=0.9,
-                   edgecolors="black", linewidth=1.0,
-                   label=f"{tag}  ({tflops:.1f} TFLOPS @ AI {ai:.0f})")
+        if wbytes >= 2.0:
+            peak = PEAK_BF16_TFLOPS
+        else:
+            peak = PEAK_INT8_TOPS
+        pct_peak = tflops / peak * 100.0 if peak > 0 else 0.0
+        edge_rgba = to_rgba(marker_palette[idx % len(marker_palette)], 1.0)
+        face_rgba = to_rgba(marker_palette[idx % len(marker_palette)], 0.35)
+        ax.scatter([ai], [tflops], s=180, marker="o",
+                   facecolors=[face_rgba], edgecolors=[edge_rgba],
+                   linewidths=2.2, zorder=5, label=tag)
+        # Inline annotation is only the numeric % peak; tag identity is
+        # already carried by marker color in the legend. Text color
+        # matches the marker edge so each label visually attaches to
+        # its own dot.
+        dx, dy, ha, va = label_offsets[idx % len(label_offsets)]
+        ax.annotate(f"{pct_peak:.1f}% peak",
+                    xy=(ai, tflops),
+                    xytext=(dx, dy), textcoords="offset points",
+                    ha=ha, va=va,
+                    fontsize=9.5, color=edge_rgba, fontweight="bold",
+                    zorder=6)
 
-    ax.set_xlabel("Arithmetic intensity (FLOPs / byte loaded)")
-    ax.set_ylabel("Achieved throughput (TFLOPS or TOPS)")
+    ax.set_xlabel("Arithmetic intensity (FLOPs / byte)", fontsize=10)
+    ax.set_ylabel("Throughput (TFLOPs/s)", fontsize=10)
     ax.set_title(
-        "Roofline: per-variant (AI, throughput) vs A6000 ceilings\n"
-        "FLOPs estimated as 2 × params × tokens × fwd_count (workload constant); "
-        "bytes vary with weight precision"
-    )
-    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
-    ax.grid(True, which="both", alpha=0.25)
-    fig.tight_layout()
+        "Roofline placement of LingBot-VA per-variant inference (RTX A6000)",
+        fontsize=11, pad=8)
+    # Legend in upper-left like the VLA paper, lists ceilings then
+    # markers; compact.
+    ax.legend(loc="upper left", fontsize=8.0, framealpha=0.92, ncol=1)
+    ax.grid(True, which="both", alpha=0.20, zorder=1)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    # Caption below the figure (VLA paper convention). Use fig.text so
+    # it shows in the standalone PNG even when the report.md embed
+    # strips off ax titles.
+    fig.subplots_adjust(top=0.92, bottom=0.18)
+    fig.text(
+        0.5, 0.02,
+        "Each dot is one variant: arithmetic intensity from FLOPs / "
+        "weight bytes; throughput from FLOPs / measured "
+        "transformer+action_head time. Label shows the achieved "
+        "fraction of the relevant tensor-core peak (bf16 peak for "
+        "bf16-weight variants, int8 peak for w8a8 variants).",
+        ha="center", va="bottom", fontsize=8.5, color="#333",
+        wrap=True)
     p_rl = os.path.join(plots_dir, "roofline.png")
-    fig.savefig(p_rl, dpi=120)
+    fig.savefig(p_rl, dpi=130)
     plt.close(fig)
     charts.append(("Roofline (achieved throughput vs arithmetic intensity, A6000)",
                    "plots/roofline.png"))
@@ -979,11 +1162,17 @@ def main() -> int:
     args = p.parse_args()
 
     variant_specs = [_parse_variant_arg(v) for v in args.variant]
-    if len(variant_specs) < 2:
-        print("error: need at least 2 --variant entries "
-              "(1 baseline + 1 comparison)", file=sys.stderr)
+    if len(variant_specs) < 1:
+        print("error: need at least 1 --variant entry", file=sys.stderr)
         return 2
     baseline_tag = variant_specs[0][0]
+    # Single-variant mode: all comparison-only charts and report
+    # sections degrade to "report only" rather than disappearing the
+    # variant entirely. Useful for previewing a new run before the
+    # paired baseline finishes.
+    if len(variant_specs) == 1:
+        print(f"single-variant mode: only {baseline_tag} rendered; "
+              f"comparison-only charts/columns are omitted.")
 
     summaries: dict[str, dict[str, SummaryRow]] = {}
     for tag, path in variant_specs:
