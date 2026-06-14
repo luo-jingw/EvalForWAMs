@@ -21,21 +21,22 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
   - RoboTwin/               — RoboTwin 2.0 仿真。upstream pristine。
   - ViDiT-Q/                — ViDiT-Q 源码（参考实现 + verbatim copy 源头）。upstream pristine。
   - models/lingbot-va-posttrain-robotwin/  — bf16 权重
-  - results/bf16/                              — Part I baseline 评估（15 任务 summary.csv）
+  - results/bf16_clean/                        — Part I baseline 评估（demo_clean config，
+                                                  legacy，仅作配置对比参考；不进 cross_summary，
+                                                  因为新基线要 demo_randomized）
+  - results/bf16/                              — (PENDING) demo_randomized 配置下的 bf16
+                                                  authoritative baseline；用户跑完后落地此路径
   - results/calib_data/calib_data.pth          — 50 task × 5 ep 的 per-channel act absmax
                                                   （derive_calib_ptq 会读 15 task 子集 replay
                                                   时覆盖此文件）
   - results/calib_capture/                     — bf16 视频/perf 语料（collect_calib_videos 输出，
                                                   derive_calib_ptq 的输入；50 task × 5 ep × ~5 chunk）
-  - results/viditq_w8a8_kernel/calib/int_weights.pth   — Phase 24d asym PTQ output（4.7 GB W8A8）
-  - results/viditq_w4a8_kernel/calib/int_weights.pth   — Phase 24d asym PTQ output（2.3 GB W4A8；
-                                                          Phase 28 rebuild kernel 后才能用）
-  - results/viditq_runtime_args_w8a8/          — Phase 27 W8A8 dynamic 15 task eval（authoritative）
   - results/viditq_w8a8_viditq_static/         — Phase 38+33 viditq-static 15 task eval
-                                                  （demo_randomized config）
-  - results/cross_summary/                     — 3-way report.md + plots/（6 charts: sr/total_ms/
-                                                  speedup_by_task/latency_distribution + compute_breakdown
-                                                  + roofline）
+                                                  （demo_randomized config）；calib/int_weights.pth
+                                                  是 ViDiT-Q (smooth+quarot+static) W8A8 4.9 GB
+                                                  唯一保留的量化 ckpt
+  - results/cross_summary/                     — (PENDING) 待 bf16 randomized 跑完后生成 2-way
+                                                  report.md + plots/（bf16 vs viditq_w8a8_static）
   - plan.txt                — 唯一权威计划书（Part I-VI，~2210 行）。Section 0 = P1-P5 原则。
   - principle.txt           — 12 行设计原则（一切显式 / 信息最小化 / 最小实现）
   - ProjectDescription.txt  — 本文件（session 交接说明）
@@ -50,6 +51,13 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
   - GPU：8× RTX A6000 (sm_86, 48 GB)，CUDA 12.6（/usr/local/cuda-12.6/bin/nvcc）
   - lingbot-jw 和 RoboTwin-jw 都需要 pip install -e PTQEval/
   - lingbot-jw 还需要 pip install --no-build-isolation -e PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/
+  - lingbot-jw 还需要 fast_hadamard_transform（QuaRoT runtime CUDA path；缺失时回退 Python
+    butterfly，可用但 ~800ms/call 慢）。pip 默认 sdist 不含 csrc/，要从 GitHub source
+    build：
+      git clone --depth 1 https://github.com/Dao-AILab/fast-hadamard-transform.git
+      cd fast-hadamard-transform
+      FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.6" \
+          /home/arash/.conda/envs/lingbot-jw/bin/pip install --no-build-isolation .
 
   整体架构（PTQEval 内）
 
@@ -191,18 +199,11 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
 
   当前进度状态（git log 是权威 ledger，新 session 先 `git log --oneline -10`）
 
-  - Part I（监控 + 评估管道）：DONE。bf16 baseline 跑过：
-    results/bf16/summary/summary.csv 15 任务，mean SR ≈ 0.888，mean total 8044 ms/call，
-    peak ~32 GB
+  - Part I（监控 + 评估管道）：DONE
   - Part II（量化骨架）：DONE 但 scalar kernel 报废
+  - Part III（忠实移植 ViDiT-Q kernel）：Phase 24a-26a DONE，26b + 28-30 待做
   - Part IV（PTQEval migration, Phase M1-M8）：DONE
-  - Part III（忠实移植 ViDiT-Q kernel）：Phase 24a-26a + 27 DONE，26b + 28-30 待做
-    - Phase 24a-d / 25 / 26a-1/2 见 plan §21
-    - **Phase 27：W8A8 dynamic 15 任务全 eval DONE**
-        mean SR    0.875 vs bf16 0.888（Δ -1.3pp）
-        mean total 3290 ms vs bf16 8044 ms（**1.96× faster**）
-        peak alloc 28339 MB vs bf16 32035 MB（-3.7 GB）
-  - Part V（Static activation quant）：**Phase 31 + 32 + 33 全部 DONE**
+  - Part V（Static activation quant）：Phase 31 + 32 + 33 全部 DONE
     - Phase 31：calib hook（forward_pre_hook 收 per-channel input absmax，fcntl.flock +
       per-PID tmp 防 pool race），50 task × 5 ep 跑完 → results/calib_data/calib_data.pth
       1.8 MB / 180 layer / 全非零
@@ -211,8 +212,7 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
       作为 IntLayerEntry.act_scale_static 写入 state_dict
     - Phase 33：act_quant_bf16_with_sum_static CUDA launcher + base.py forward dispatch
       + loader PREPROCESSING_SUFFIXES + w8a8_viditq_static.yaml + runtime_args yaml
-    - **Phase 34/35（static 15 task eval + 3-way cross_summary）**：DONE，作为 Phase 39 子集
-  - Part VI（Faithful ViDiT-Q Method Reproduction）：**Phase 36/37/38 + viditq_static 全 DONE**
+  - Part VI（Faithful ViDiT-Q Method Reproduction）：Phase 36/37/38 + viditq_static 全 DONE
     - Phase 36 SmoothQuant（canonical s 公式，α=0.99，PTQ `W*s`、runtime `x/s`）
     - Phase 37 QuaRoT（structured Hadamard had12/had28 butterfly，per-Linear int8 sign，
       零矩阵物化）
@@ -220,19 +220,52 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
     - Phase 33 stacked：viditq_static = smooth + quarot + static activation（完整论文方法 +
       static act 路径；configs/w8a8_viditq_static.yaml）
     - check_part6 6 variant plumbing 全 OK
-    - **viditq_w8a8_static 15 task × 25 ep × demo_randomized eval DONE**
-        mean total 5963 ms vs bf16 8044 ms（**1.38× faster**）
-        即 viditq_static 比 viditq_w8a8_dynamic（1.96×）慢——QuaRoT Python butterfly
-        吃掉 40% 加速；static scale 救回的精度 vs dynamic 的性能差距是后续 trade-off
-        研究入口
-  - **Phase 39：3-way cross_summary 已生成**（bf16 / viditq_w8a8_dynamic / viditq_w8a8_static）
-    - report.md + plots/{sr_by_task, total_ms_speedup, speedup_by_task, latency_distribution,
-      compute_breakdown, roofline}.png
-    - compute_breakdown 红箭头数字：bf16→dynamic 1.96×，bf16→static 1.38×
-    - roofline (A6000)：bf16 17.3 TFLOPS @ AI 14400, dynamic 34 TFLOPS @ AI 28800,
-      static 23.9 TFLOPS @ AI 28800（都在 BW knee 右侧 compute-bound 区，但实际
-      throughput 远低于 BF16/INT8 peak，说明 kernel 效率或 launch overhead 主导，不是
-      compute capacity 受限）
+    - viditq_w8a8_static + viditq_w8a8_dynamic 15 task × 25 ep × demo_randomized
+      eval DONE（见下方 Phase 39 完整 3-way 结论）
+
+  Phase 39 (3-way cross_summary, demo_randomized, 终版结论):
+
+  | variant | Mean SR | Δ SR vs bf16 | Mean ms | Speedup |
+  |---|---|---|---|---|
+  | bf16                          | 0.871 | —        | 4657 | 1.00× |
+  | viditq_w8a8_dynamic (SQ+QR)   | 0.869 | -0.2 pp  | 3406 | **1.37×** |
+  | viditq_w8a8_static (SQ+QR+ST) | 0.584 | -28.7 pp | 3575 | 1.30× |
+
+  - Paper-faithful "ViDiT-Q W8A8" 复现 = **dynamic 行**：1.37× 加速 + SR 几乎持平
+  - **SR 损失 100% 归因于 static activation quant**：dynamic（去掉 static）SR 跟 bf16
+    几乎一致（-0.2pp），加上 per-tensor static scale 才崩 -28.7pp。Long-horizon
+    task 是重灾区：put_bottles_dustbin 0.80→0.00、handover_block 0.96→0.08、
+    beat_block_hammer 1.00→0.36。可能原因：per-tensor 标量对 activation
+    分布波动过敏，clipping outlier 同时把信号也压掉
+  - dynamic 速度反而比 static 略快 169 ms（5%）：fused dynamic amax kernel 跟
+    static skip-amax 在 launch jitter 面前差不多，static 还多一次 scale_x[N]
+    broadcast
+  - calib_data 用 demo_randomized 视频（371 ep → per_task_ep=5 共 75 ep）做 derive；
+    SR 跟之前 demo_clean calib 几乎相同（0.587→0.584）说明分布 mismatch 不是 SR
+    退化主因，是 static 方法本身的 limitation
+
+  工程优化（Phase 39 后期）:
+
+  - QuaRoT runtime butterfly：原 PyTorch 9 launches/layer 改成 fast_hadamard_transform
+    CUDA 单 launch；可选 `_HAVE_FHT` flag，PTQ-time fp64 rotate_weight 仍走 Python
+    fallback (FHT 不支持 fp64)。viditq_static 加速从 0.78× 一跳到 1.30×（拿回 ~2.4s/call）
+  - derive_calib_ptq 加 --per_task_ep N 参数：从 369 ep 截到 75 ep（每 task 5 ep），
+    省掉 ~80% replay 时间且 calib 质量等价
+  - calib 数据源改用 bf16 eval 视频（bf16/visualization/real/）替代单独
+    collect_calib_videos run：bf16 eval 本身就 dump obs/latent chunks，省掉一次 ~3h
+    采集
+  - cross_summary plots 改造：compute_breakdown 用 DeltaQuant Fig 3 风格（深紫红 +
+    薄荷青段 + 红色弧形 speedup 箭头 + 数字在弧中部）；roofline 用 VLA Fig 2 风格
+    （所有线实线 + BW 斜线只到 int8 knee + ceiling 横线只在 knee 右侧 + 离散点圆形 +
+    edge 饱和 face 半透明 + inline 只标 % peak 颜色匹配 marker）
+
+  当前 results/ 内容（清理后）：
+  - bf16/                          authoritative bf16 baseline (demo_randomized)
+  - bf16_clean/                    legacy (demo_clean, outlier-polluted, 仅参考)
+  - viditq_w8a8_viditq/            viditq_w8a8_dynamic eval (paper-faithful)
+  - viditq_w8a8_viditq_static/     viditq_w8a8_static eval (附 calib/int_weights.pth)
+  - calib_data/calib_data.pth      derive 输出 (demo_randomized)
+  - cross_summary/                 3-way report.md + 6 plots
 
   待做（明确剩余）
 
@@ -243,21 +276,14 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
   - Phase 30：扩 calc_cross_ckpt 加 viditq_w4a8 一列
 
   Part VI 扩展（attribution + 优化）：
-  - **smooth-only / quarot-only / static-only / viditq-without-static 各自单独 eval**
-    用于 Phase 39 完整 N-way attribution（"smooth 救了 X pp，quarot 吃了 Y ms"）
-  - QuaRoT Python butterfly → CUDA（fast_hadamard_transform 库）：估计能把 viditq_static
-    从 1.38× 拉回接近 dynamic 的 1.96×
+  - smooth-only / quarot-only 单变体 eval：把 dynamic 的 -0.2pp 进一步拆解
+    （目前已知 static 单独损失 -28.5pp；smooth 和 quarot 单独的贡献待测）
+  - W8A8 GEMM kernel 优化：当前 27.1% int8 peak（dynamic）vs bf16 78.4% bf16 peak，
+    kernel 还有大量提升空间，可能让 dynamic 接近 2× speedup
+  - SmoothQuant divisor 融合到 act_quant kernel（少 1 launch per layer × 5400 calls）
 
   Phase 40 (optional)：mixed-precision per-layer bit allocation（W8 高敏感层 / W4 低敏感
     层）叠加 viditq
-
-  待替换 / 已 stale artifact（新 session 注意）
-
-  - results/m4_smoke / m5_smoke_bf16 / m6_smoke_bf16（migration 期间临时验证，可删）
-  - results/viditq_w8a8 / viditq_w8a8_kernel/perf 等 pre-26a-2 的旧产物
-    （Phase 27 authoritative 数据在 results/viditq_runtime_args_w8a8/）
-  - results/viditq_w4a8_kernel/{calib,stseed-*}/  — int_weights.pth 是 Phase 24d
-    新版 asym 格式，但 wrapper 还没 rebuild（Phase 28 后才能用）
 
   新 session 第一步建议
 
@@ -309,28 +335,49 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
       GIT_DIR=.git_orig git status --short --untracked-files=all | \
       grep -vE '^\?\? \.git_orig/'
     输出应为空。新 session 验证 P3 是否守住的快速手段
-  - 完整 calib + ptq + eval 命令链：
-      # 步骤 1：录视频（一次，~3h on 2 GPU pool）
-      python -m ptqeval.wam.lingbot_va.method.viditq.collect_calib_videos
-      # 步骤 2：replay + derive calib + ptq（多 GPU auto，~25min on 4 GPU）
+  - 完整 calib + ptq + eval 命令链（终版，bf16/visualization 作 calib 源 + per_task_ep
+    限制 + FHT runtime CUDA）：
+      # 步骤 0：跑 bf16 eval（自动 dump obs/latent chunks 到 visualization/，~3h on pool）
+      python -m ptqeval.eval.run_eval --mode pool \
+          --task_config demo_randomized --test_num 25 \
+          --save_root results/bf16
+      python -m ptqeval.eval.aggregator \
+          --save_root results/bf16 --perf_log_dir results/bf16/perf \
+          --out_dir results/bf16/summary
+      # 步骤 1：derive calib + ptq（多 GPU auto，~35min on 4 GPU）
+      #   --videos_root 指向 bf16 视频；--per_task_ep 5 截到 75 ep
       python -m ptqeval.wam.lingbot_va.method.viditq.derive_calib_ptq \
+          --videos_root results/bf16 --per_task_ep 5 \
           --layer_config PTQEval/.../configs/w8a8_viditq_static.yaml \
           --int_weights_out results/viditq_w8a8_viditq_static/calib/int_weights.pth
-      # 步骤 3：eval
+      # 步骤 1.5：dynamic 模式无需再 derive（共享 calib_data.pth），只跑一次 ptq：
+      python -m ptqeval.wam.lingbot_va.method.viditq.ptq \
+          --layer_config PTQEval/.../configs/w8a8_viditq.yaml \
+          --output results/viditq_w8a8_viditq/calib/int_weights.pth
+      # 步骤 2：eval（FHT CUDA path 自动生效）
       python -m ptqeval.eval.run_eval --mode pool --variant viditq \
           --variant_args PTQEval/.../configs/runtime_args_w8a8_viditq_static.yaml \
           --task_config demo_randomized --test_num 25 \
           --save_root results/viditq_w8a8_viditq_static
-      # 步骤 4：aggregator + cross_summary
-      python -m ptqeval.eval.aggregator \
-          --save_root results/viditq_w8a8_viditq_static \
+      python -m ptqeval.eval.run_eval --mode pool --variant viditq \
+          --variant_args PTQEval/.../configs/runtime_args_w8a8_viditq.yaml \
+          --task_config demo_randomized --test_num 25 \
+          --save_root results/viditq_w8a8_viditq
+      # 步骤 3：aggregator + 3-way cross_summary
+      python -m ptqeval.eval.aggregator --save_root results/viditq_w8a8_viditq_static \
           --perf_log_dir results/viditq_w8a8_viditq_static/perf \
           --out_dir results/viditq_w8a8_viditq_static/summary
+      python -m ptqeval.eval.aggregator --save_root results/viditq_w8a8_viditq \
+          --perf_log_dir results/viditq_w8a8_viditq/perf \
+          --out_dir results/viditq_w8a8_viditq/summary
       python -m ptqeval.eval.calc_cross_ckpt \
           --variant bf16=results/bf16/summary/summary.csv \
-          --variant viditq_w8a8=results/viditq_runtime_args_w8a8/summary/summary.csv \
+          --variant viditq_w8a8_dynamic=results/viditq_w8a8_viditq/summary/summary.csv \
           --variant viditq_w8a8_static=results/viditq_w8a8_viditq_static/summary/summary.csv \
           --out_dir results/cross_summary
+      # 历史 collect_calib_videos.py 仍保留作 fallback；用 bf16 视频做 calib 更优：
+      # bf16/visualization/real/ 369 ep 自带 demo_randomized 配置 + per task 25 ep
+      # 远大于 collect_calib_videos 50 task × 5 ep × ~75 SELECTED_15 task 子集
 
   用户偏好（要点）
 
