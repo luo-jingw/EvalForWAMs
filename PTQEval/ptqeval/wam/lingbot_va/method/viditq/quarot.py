@@ -37,6 +37,21 @@ import torch
 _HAD12: torch.Tensor | None = None
 _HAD28: torch.Tensor | None = None
 
+# Lazy availability flag for fast_hadamard_transform (the same library
+# ViDiT-Q upstream uses in matmul_hadU_cuda). When present, runtime
+# butterfly collapses from ~9 PyTorch view/slice launches per layer to
+# a single fused CUDA launch -- the engineering equivalent of upstream's
+# CUDA path. When absent, we fall back to the verbatim Python butterfly
+# below. Both paths are mathematically identical; the CUDA path is the
+# faithful one (matches quarot_utils.py:195-208 verbatim) and the Python
+# path is the fallback we shipped before the optional dep was wired up.
+try:
+    import fast_hadamard_transform as _fht  # type: ignore[import-not-found]
+    _HAVE_FHT = True
+except ImportError:
+    _fht = None
+    _HAVE_FHT = False
+
 
 def _build_had12() -> torch.Tensor:
     # ViDiT-Q/quant_utils/qdiff/quarot/quarot_utils.py:269-285 verbatim.
@@ -140,13 +155,44 @@ def _factor_hadamard_size(n: int) -> tuple[torch.Tensor | None, int]:
 def _matmul_hadU(x: torch.Tensor) -> torch.Tensor:
     """Compute X @ H / sqrt(n) where H is the structured Hadamard matrix of
     size n = x.shape[-1]. Applies butterfly to the last dim then a small
-    head matmul. Matches ViDiT-Q quarot_utils.py:158-179 numerically.
+    head matmul. Matches ViDiT-Q quarot_utils.py:195-208 numerically.
 
     The transform is its own inverse up to the 1/sqrt(n) scaling that this
     function applies on output (so H/sqrt(n) is orthogonal).
+
+    Two implementations, picked at call time:
+      - CUDA (default when fast_hadamard_transform is installed) follows
+        upstream matmul_hadU_cuda verbatim: one fused FHT launch + a
+        small K-Hadamard matmul. This is the runtime-hot path.
+      - Python butterfly fallback (only when the dep is missing): the
+        verbatim recursive Kronecker we shipped in Phase 37 prior to
+        wiring the optional dep. Mathematically identical but ~9 launches
+        per layer, which dominates QuaRoT overhead on real models.
     """
     n = x.shape[-1]
     hadK, K = _factor_hadamard_size(n)
+
+    if _HAVE_FHT:
+        # Upstream quarot_utils.py:195-208 exact form. fp64 inputs are
+        # downcast to fp32 because fast_hadamard_transform's kernels do
+        # not ship a fp64 instantiation; PTQ rotate_weight is the only
+        # fp64 caller and stays on the Python path via _matmul_hadU_python.
+        scale = 1.0 / (float(n) ** 0.5)
+        if K == 1:
+            return _fht.hadamard_transform(x.contiguous(), scale)
+        # X @ (I_K kron H_(n/K)) then K-Hadamard on the K axis.
+        x_view = x.contiguous().view(-1, K, n // K)
+        x_view = _fht.hadamard_transform(x_view, scale)
+        x_view = hadK.to(device=x_view.device, dtype=x_view.dtype) @ x_view
+        return x_view.reshape(x.shape)
+
+    return _matmul_hadU_python(x, hadK, K, n)
+
+
+def _matmul_hadU_python(x: torch.Tensor, hadK, K: int, n: int) -> torch.Tensor:
+    """Verbatim Python butterfly fallback (Phase 37 original implementation).
+    Kept verbatim so the fp64 rotate_weight path -- which fast_hadamard
+    transform does not support -- still has a correct implementation."""
     a = x.contiguous().view(-1, n, 1)
     out = a.clone()
     while a.shape[1] > K:
@@ -202,5 +248,10 @@ def rotate_weight(w: torch.Tensor, sign: torch.Tensor) -> torch.Tensor:
     assert sign.dim() == 1 and sign.shape[0] == w.shape[1]
     w64 = w.to(torch.float64)
     s64 = sign.to(torch.float64)
-    rotated = _matmul_hadU(w64 * s64.unsqueeze(0))
+    # Force Python butterfly: fast_hadamard_transform does not ship a
+    # fp64 instantiation, and PTQ correctness is the priority here so we
+    # mirror upstream's .double() promotion exactly.
+    n = w64.shape[-1]
+    hadK, K = _factor_hadamard_size(n)
+    rotated = _matmul_hadU_python(w64 * s64.unsqueeze(0), hadK, K, n)
     return rotated.to(w.dtype)
