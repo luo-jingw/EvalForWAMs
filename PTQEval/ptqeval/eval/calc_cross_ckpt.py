@@ -294,6 +294,7 @@ def _make_plots(
     summaries: dict[str, dict[str, SummaryRow]],
     step_limits: dict[str, int],
     op_data: dict[str, dict[str, float]] | None = None,
+    measured_flops_tf: float | None = None,
 ) -> list[tuple[str, str]]:
     """Renders 6 charts under <out_dir>/plots/:
       1. sr_by_task.png           per-task SR per variant
@@ -691,12 +692,17 @@ def _make_plots(
     PEAK_INT8_TOPS   = 309.7    # A6000 INT8 Tensor Core dense peak (= 2x BF16 TC)
     PEAK_BW_GBS      = 768.0    # A6000 GDDR6 bandwidth
     N_PARAMS         = 5.09e9   # LingBot-VA WAN transformer
-    # Pull raw FLOPs (linear + attention, no bf16-equivalent scaling)
-    # from the same architecture model used by op_breakdown so the
-    # two charts agree on absolute work. _estimate_op_pf("bf16") path
-    # skips the /2 w8a8 scaling and returns honest BF16 FLOPs in TF.
-    _arch_pf = _estimate_op_pf("bf16")
-    flops_per_call = (_arch_pf["linear"] + _arch_pf["attention"]) * 1e12
+    # FLOPs per call: prefer measured (FlopCounterMode dispatcher-level)
+    # over architecture estimate. Architecture sum (linear + attention)
+    # is consistent with op_breakdown chart; measured replaces both with
+    # ground-truth aten dispatcher count.
+    if measured_flops_tf and measured_flops_tf > 0:
+        flops_per_call = float(measured_flops_tf) * 1e12
+        flops_src = "measured"
+    else:
+        _arch_pf = _estimate_op_pf("bf16")
+        flops_per_call = (_arch_pf["linear"] + _arch_pf["attention"]) * 1e12
+        flops_src = "architecture estimate"
 
     bytes_per_param = {"bf16": 2.0, "fp16": 2.0}
     # All variants other than bf16 carry W8A8 weights (int8 = 1 byte/param).
@@ -850,8 +856,9 @@ def _make_plots(
         0.5, 0.02,
         f"Each dot is one variant: arithmetic intensity = FLOPs / "
         f"(weight bytes{ai_caption_suffix}); throughput = FLOPs / "
-        f"measured transformer+action_head time. Label shows the "
-        f"achieved fraction of the relevant tensor-core peak (bf16 "
+        f"measured transformer+action_head time. FLOPs source: "
+        f"{flops_src} ({flops_per_call/1e12:.1f} TF/call). Label shows "
+        f"the achieved fraction of the relevant tensor-core peak (bf16 "
         f"peak for bf16-weight variants, int8 peak for w8a8 variants).",
         ha="center", va="bottom", fontsize=8.5, color="#333",
         wrap=True)
@@ -1599,6 +1606,12 @@ def main() -> int:
                         "any are supplied, emits "
                         "plots/op_breakdown_measured.png next to the "
                         "architecture-estimated version.")
+    p.add_argument("--measured_flops", default="",
+                   help="Path to measure_flops JSON {flops_per_call_tf}. "
+                        "When supplied, roofline uses this measured "
+                        "value instead of the architecture-estimated "
+                        "linear+attention sum -- gives true dispatcher-"
+                        "level FLOPs/call.")
     args = p.parse_args()
 
     variant_specs = [_parse_variant_arg(v) for v in args.variant]
@@ -1658,11 +1671,25 @@ def main() -> int:
     # memcpy bytes for AI estimation (not just weight-bytes-only).
     op_data = _collect_op_profile(args.op_profile)
 
+    # Optional measured FLOPs/call from ptqeval.eval.measure_flops.
+    measured_flops_tf: float | None = None
+    if args.measured_flops and os.path.exists(args.measured_flops):
+        try:
+            with open(args.measured_flops) as f:
+                mf = json.load(f)
+            measured_flops_tf = float(mf.get("flops_per_call_tf", 0)) or None
+            if measured_flops_tf:
+                print(f"loaded measured_flops: {measured_flops_tf:.2f} TF/call "
+                      f"from {args.measured_flops}")
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            print(f"warning: --measured_flops unreadable: {e}")
+
     charts: list[tuple[str, str]] = []
     if not args.no_plots:
         charts = _make_plots(args.out_dir, variant_specs, baseline_tag,
                              tasks, summaries, step_limits,
-                             op_data=op_data)
+                             op_data=op_data,
+                             measured_flops_tf=measured_flops_tf)
 
         # Overlay a profiler-measured op_breakdown chart alongside the
         # architecture-estimated default when op_profile is available.
