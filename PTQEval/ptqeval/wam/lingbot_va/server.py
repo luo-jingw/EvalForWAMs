@@ -766,10 +766,13 @@ class VA_Server:
         with _profile(activities=[ProfilerActivity.CUDA]) as prof:
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
 
-        # Skip warmup calls (compile / autotune noise).
+        # Skip warmup calls (compile / autotune noise). torch>=2.5
+        # renamed self_cuda_time_total -> self_device_time_total
+        # (device-agnostic); fall back to the old name on older builds.
         if self._profile_calls_seen >= self._profile_warmup:
             for row in prof.key_averages():
-                cuda_us = float(row.self_cuda_time_total)
+                cuda_us = float(getattr(row, "self_device_time_total",
+                                getattr(row, "self_cuda_time_total", 0.0)))
                 if cuda_us <= 0:
                     continue
                 cat = _classify_kernel(row.key)
