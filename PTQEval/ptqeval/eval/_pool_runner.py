@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Optional
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -311,24 +312,111 @@ def run_client_blocking(cfg: Config, gpu: int, task_name: str, port: int,
 
 _SESSIONS: set[int] = set()
 _SESSIONS_LOCK = threading.Lock()
+_CFG_FOR_CLEANUP: Optional["Config"] = None
+_SIGNAL_COUNT = 0
+
+
+def _set_cleanup_context(cfg: "Config") -> None:
+    """Stash the active Config so orphan scanners can match `save_root`
+    in /proc/*/cmdline as a last-resort filter."""
+    global _CFG_FOR_CLEANUP
+    _CFG_FOR_CLEANUP = cfg
+
+
+def _scan_orphans_by_save_root(save_root: Optional[str]) -> list[int]:
+    """Find any lingering lingbot_va.server PIDs whose cmdline mentions
+    `save_root`. Catches race-condition orphans where a server was
+    spawned but never added to _SESSIONS (e.g. signal arrived during
+    Popen handoff)."""
+    if not save_root:
+        return []
+    needle = str(save_root)
+    out: list[int] = []
+    self_pid = os.getpid()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == self_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except (OSError, ValueError):
+            continue
+        if "ptqeval.wam" in cmd and "server" in cmd and needle in cmd:
+            out.append(pid)
+    return out
 
 
 def cleanup_all_sessions() -> None:
+    """Idempotent: kill every tracked session, then do a /proc rescan
+    by save_root to catch race-condition orphans (server spawned but
+    not yet added to _SESSIONS when signal fired)."""
     with _SESSIONS_LOCK:
         pids = list(_SESSIONS)
         _SESSIONS.clear()
     for pid in pids:
-        kill_session(pid)
+        try:
+            kill_session(pid)
+        except Exception as e:
+            print(f"[_pool_runner] kill_session({pid}) failed: {e}",
+                  file=sys.stderr)
+    # Last-resort sweep -- finds anything we lost track of, including
+    # children spawned milliseconds before SIGINT arrived.
+    save_root = getattr(_CFG_FOR_CLEANUP, "save_root", None)
+    if save_root is not None:
+        leftover = _scan_orphans_by_save_root(save_root)
+        if leftover:
+            print(f"[_pool_runner] orphan sweep found {len(leftover)} extra "
+                  f"server pid(s) matching {save_root}; killing.",
+                  file=sys.stderr)
+            for pid in leftover:
+                try:
+                    kill_session(pid, timeout=2.0)
+                except Exception:
+                    pass
 
 
 def install_signal_handlers() -> None:
+    """Register SIGINT/SIGTERM/SIGHUP handlers + atexit fallback.
+
+    On 1st signal: graceful cleanup_all_sessions then sys.exit.
+    On 2nd signal: skip wait, SIGKILL every tracked descendant then
+                   os._exit (covers double-Ctrl+C impatient user).
+    SIGHUP is included because closing the terminal sends SIGHUP, not
+    SIGINT, and we still need orphans cleaned up in that case.
+    atexit fires on normal SystemExit so it catches SIGINT/SIGHUP-driven
+    exits even if the signal handler itself raced; harmless duplicate
+    when handler already ran (cleanup is idempotent)."""
+    import atexit
+
     def handler(sig, _frame):
-        print(f"\n[_pool_runner] received signal {sig}; cleaning up sessions...",
-              file=sys.stderr)
-        cleanup_all_sessions()
-        sys.exit(128 + sig)
-    for sig in (signal.SIGINT, signal.SIGTERM):
+        global _SIGNAL_COUNT
+        _SIGNAL_COUNT += 1
+        if _SIGNAL_COUNT == 1:
+            print(f"\n[_pool_runner] received signal {sig}; cleaning up "
+                  f"sessions (press again to force SIGKILL)...",
+                  file=sys.stderr)
+            cleanup_all_sessions()
+            sys.exit(128 + sig)
+        else:
+            print(f"\n[_pool_runner] signal {sig} again; SIGKILL all "
+                  f"tracked descendants and abort.", file=sys.stderr)
+            # Snapshot and SIGKILL without waiting.
+            with _SESSIONS_LOCK:
+                pids = list(_SESSIONS)
+            for pid in pids:
+                for child in [pid] + _find_descendants(pid):
+                    try:
+                        os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            os._exit(128 + sig)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, handler)
+    atexit.register(cleanup_all_sessions)
 
 
 # ---------------------------------------------------------------------------

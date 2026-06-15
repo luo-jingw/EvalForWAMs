@@ -36,6 +36,7 @@ from pathlib import Path
 
 from ptqeval.eval._pool_runner import (
     Config,
+    _set_cleanup_context,
     cleanup_all_sessions,
     install_signal_handlers,
     run_pool,
@@ -61,7 +62,7 @@ def parse_args() -> Config:
     p.add_argument("--seed", type=int, default=0)
 
     # --- pool / GPU detection ---
-    p.add_argument("--min_free_mb", type=int, default=32000,
+    p.add_argument("--min_free_mb", type=int, default=40000,
                    help="GPU is usable when free memory >= this (MB).")
     p.add_argument("--gpu_wait_timeout", type=int, default=0,
                    help="Seconds to wait for GPU memory before failing; 0 = forever.")
@@ -164,6 +165,7 @@ def main() -> int:
         pass
 
     cfg = parse_args()
+    _set_cleanup_context(cfg)
     install_signal_handlers()
     try:
         if cfg.mode == "smoke":
