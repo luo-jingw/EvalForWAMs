@@ -2163,15 +2163,33 @@ Target  Run ptqeval.eval.calc_cross_ckpt across variants;
           - Pareto front (SR vs peak-alloc, SR vs total-ms) with
             every variant plotted
 Done    3-way demo_randomized run (bf16 + viditq_w8a8_dynamic +
-        viditq_w8a8_static):
+        viditq_w8a8_static); 25 ep production headline:
           - bf16                : SR 0.871, 4657 ms, 1.00x
           - viditq_w8a8_dynamic : SR 0.869, 3406 ms, 1.37x speedup,
                                   -0.2 pp SR (paper-faithful repro)
           - viditq_w8a8_static  : SR 0.584, 3575 ms, 1.30x speedup,
                                   -28.7 pp SR (static activation
                                   per-tensor scale loses too much)
-        Key finding: SR loss attributes 100% to static activation
-        quant; smooth+quarot alone is essentially lossless.
+        SR finding: 100% of SR loss attributes to static activation
+        quant; smooth+quarot alone (dynamic) is essentially lossless.
+        Speed finding (op-level torch.profiler over first 5 post-warmup
+        infer calls, 4-class kernel time):
+                    Linear   Attention   Memcpy(KV)   Other   Total ms
+          bf16      2926     236         2410         1385    6956
+          dynamic   2759     235         100          1728    4822
+          static    2723     245         100          1740    4807
+        => w8a8 speedup comes mainly from Memcpy DtoD collapsing 24x
+        (KV cache reallocate pressure halved when weight memory drops
+        from 10 GB to 5 GB). Linear GEMM itself barely speeds up
+        (~1.06x) because cuBLAS bf16 GEMM beats our W8A8 GEMM kernel
+        utilization (BF16 31.6% peak vs INT8 21.8% peak on A6000).
+        Attention is variant-invariant (bf16 flash_fwd_kernel for all).
+        Roofline (FlopCounterMode-measured 236.6 TF/call):
+          - bf16   50 TFLOPS, 31.6% of BF16 TC peak 154.8 TFLOPS
+          - dynamic 67 TFLOPS, 21.8% of INT8 TC peak 309.7 TOPS
+          - static 65 TFLOPS, 21.2% of INT8 TC peak
+        VRAM peak: bf16 31.2 GB (22.7 weights + 8.5 transient);
+        w8a8 27.7 GB (22.5 + 5.3); transient peak in vae_encode.
         results/cross_summary/{report.md, cross_summary.csv, plots/}
         Engineering improvements landed alongside:
           - quarot.py: fast_hadamard_transform CUDA path (Python fp64
@@ -2182,14 +2200,24 @@ Done    3-way demo_randomized run (bf16 + viditq_w8a8_dynamic +
             episodes per task (5*15 = 75 instead of 369).
           - calib videos source: bf16 eval visualization/real/ used
             directly (skips separate collect_calib_videos pass).
-          - calc_cross_ckpt.py plots: compute_breakdown in DeltaQuant
-            Fig 3 style (paper palette + curved speedup arrows with
-            mid-arc labels); roofline in VLA Fig 2 style (solid
-            piecewise lines + colored circle markers + inline % peak
-            colored by marker).
+          - server.py: --profile_ops integrated, wraps first 5
+            post-warmup infer calls in torch.profiler, classifies
+            kernels into linear/attention/memcpy/other 4 classes
+            (record_function markers ATTENTION_SDPA / ATTENTION_DIFFUSERS
+            ensure flash_fwd_kernel is attributed to attention rather
+            than to linear via its cutlass:: substring).
+          - measure_flops.py: FlopCounterMode dispatcher-level FLOP
+            counter, one-shot 3 min, dumps results/measured_flops.json.
+          - aggregator merges per-task op_profile.json into
+            summary/op_profile.json.
+          - calc_cross_ckpt only emits charts backed by real measurement:
+            sr / total_ms_speedup / speedup / latency_distribution +
+            memory_breakdown (PerfProbe) + op_breakdown_measured
+            (--op_profile) + roofline (--measured_flops). Architecture-
+            estimated op_breakdown and stage-level compute_breakdown
+            have been deleted as they did not reflect ground truth.
 Pending Single-variant attribution (smooth-only / quarot-only /
-        viditq-without-static) to refine the -0.2 pp dynamic figure
-        into per-component contributions, once a use case demands it.
+        viditq-without-static) for finer -0.2 pp dynamic decomposition.
 
 Phase 40 (optional, follow-up): Mixed-precision per-layer bit allocation
 Target  Port quant_utils/qdiff/base/mixed_precision_quantizer.py +

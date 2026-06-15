@@ -71,12 +71,24 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
                             session-based 进程清理（os.killpg + /proc tree walk 处理
                             torch.distributed.run setsid 跑掉的 worker）。
     perf_probe.py           M1: PerfProbe 类，CUDA Event 时延 + peak memory，写 JSONL
-    aggregator.py           M5: perf JSONL + RoboTwin SR -> summary.{csv,json}
-    calc_cross_ckpt.py      Q9: N-variant cross summary + 6 张图（matplotlib headless）:
+    aggregator.py           M5: perf JSONL + RoboTwin SR -> summary.{csv,json}；当
+                            perf_log_dir 内有 <task>_op_profile.json 自动 merge 成
+                            <out_dir>/op_profile.json (averaged across tasks)
+    calc_cross_ckpt.py      Q9: N-variant cross summary + 7 张图（matplotlib headless,
+                            全部基于实测数据）:
                               sr_by_task, total_ms_speedup, speedup_by_task,
-                              latency_distribution, compute_breakdown (image.png-style
-                              带 transformer+action_head speedup 红箭头),
-                              roofline (A6000 BF16/INT8/BW ceiling vs achieved AI×throughput)
+                              latency_distribution,
+                              memory_breakdown (PerfProbe init_peak + transient peak),
+                              op_breakdown_measured (--op_profile TAG=PATH,
+                                4-class kernel time: linear/attention/memcpy/other),
+                              roofline (--measured_flops <path> required；FlopCounterMode
+                                FLOPs + memcpy bytes from op_profile，A6000 真实
+                                BF16/INT8 TC ceilings)
+                            注：架构估算的 op_breakdown + stage-level compute_breakdown
+                            已删，不真实
+    measure_flops.py        FlopCounterMode dispatcher-level FLOP counter；one-shot
+                            ~3min bf16 run -> results/measured_flops.json (236.6 TF/call)；
+                            每 call reset+1-frame _infer 避免 VAE conv3d shape mismatch
     monitor.sh              M7: 一次性快照或 watch 实时 dashboard（带 DONE 计数）
 
   ptqeval/wam/lingbot_va/   lingbot_va WAM adapter
@@ -85,13 +97,18 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
                             内插 5 阶段 probe (init/text_encoder/vae_encode/transformer/
                             action_head) + --variant dispatch。
                             注：transformer stage = Algorithm 1 line 4 video stream
-                            denoising loop (3 Euler step × 2 CFG = 6 forwards through
-                            video stream blocks, d_v=3072, ~4.7B params)；action_head
-                            stage = Algorithm 1 line 7 action stream denoising loop
-                            (10 Euler step × 1 = 10 forwards through action stream
-                            blocks, d_a=768, ~350M params + joint cross-modal attn
-                            with video tokens in d_v space). 两条 stream 是 dual-stream
+                            denoising loop；action_head stage = Algorithm 1 line 7
+                            action stream denoising loop。两条 stream 是 dual-stream
                             MoT 架构里的**两组独立 transformer block**，不是同一组跑两次
+                            (video stream d_v=3072 ~4.7B params; action stream d_a=768
+                            ~350M params + 跟 video tokens 的 joint cross-modal attn
+                            in d_v space)
+                            可选 --profile_ops + --profile_n_calls N：当 enabled，wrap
+                            前 N 个 post-warmup _infer call (else 分支)
+                            in torch.profiler，按 record_function marker (ATTENTION_SDPA /
+                            ATTENTION_DIFFUSERS) + kernel name token 分类成
+                            linear/attention/memcpy/other 4 类，dump 到
+                            <perf_log_dir>/<task>_op_profile.json。默认 off
                             calib hooks 已**解耦**：server.py 不再接 --calibrate_out flag；
                             calib 通过 derive_calib_ptq 在独立进程内 build 一次 VA_Server
                             手工 install hooks
@@ -230,47 +247,96 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
 
   Phase 39 (3-way cross_summary, demo_randomized, 终版结论):
 
+  Headline (25 ep × 15 task production eval):
+
   | variant | Mean SR | Δ SR vs bf16 | Mean ms | Speedup |
   |---|---|---|---|---|
   | bf16                          | 0.871 | —        | 4657 | 1.00× |
   | viditq_w8a8_dynamic (SQ+QR)   | 0.869 | -0.2 pp  | 3406 | **1.37×** |
   | viditq_w8a8_static (SQ+QR+ST) | 0.584 | -28.7 pp | 3575 | 1.30× |
 
-  - Paper-faithful "ViDiT-Q W8A8" 复现 = **dynamic 行**：1.37× 加速 + SR 几乎持平
-  - **SR 损失 100% 归因于 static activation quant**：dynamic（去掉 static）SR 跟 bf16
-    几乎一致（-0.2pp），加上 per-tensor static scale 才崩 -28.7pp。Long-horizon
-    task 是重灾区：put_bottles_dustbin 0.80→0.00、handover_block 0.96→0.08、
-    beat_block_hammer 1.00→0.36。可能原因：per-tensor 标量对 activation
-    分布波动过敏，clipping outlier 同时把信号也压掉
-  - dynamic 速度反而比 static 略快 169 ms（5%）：fused dynamic amax kernel 跟
-    static skip-amax 在 launch jitter 面前差不多，static 还多一次 scale_x[N]
-    broadcast
-  - calib_data 用 demo_randomized 视频（371 ep → per_task_ep=5 共 75 ep）做 derive；
-    SR 跟之前 demo_clean calib 几乎相同（0.587→0.584）说明分布 mismatch 不是 SR
-    退化主因，是 static 方法本身的 limitation
+  Op-level breakdown (实测，test_num=5 _speed run + torch.profiler over first 5
+  post-warmup infer calls, averaged across 15 tasks):
 
-  工程优化（Phase 39 后期）:
+  | variant | Linear | Attention | Memcpy(KV) | Other | Total |
+  |---|---|---|---|---|---|
+  | bf16             | 2926 (42%) | 236 (3%) | **2410 (35%)** | 1385 (20%) | 6956 ms |
+  | viditq dynamic   | 2759 (57%) | 235 (5%) | **100 (2%)**   | 1728 (36%) | 4822 ms |
+  | viditq static    | 2723 (57%) | 245 (5%) | **100 (2%)**   | 1740 (36%) | 4807 ms |
 
-  - QuaRoT runtime butterfly：原 PyTorch 9 launches/layer 改成 fast_hadamard_transform
-    CUDA 单 launch；可选 `_HAVE_FHT` flag，PTQ-time fp64 rotate_weight 仍走 Python
-    fallback (FHT 不支持 fp64)。viditq_static 加速从 0.78× 一跳到 1.30×（拿回 ~2.4s/call）
-  - derive_calib_ptq 加 --per_task_ep N 参数：从 369 ep 截到 75 ep（每 task 5 ep），
-    省掉 ~80% replay 时间且 calib 质量等价
-  - calib 数据源改用 bf16 eval 视频（bf16/visualization/real/）替代单独
-    collect_calib_videos run：bf16 eval 本身就 dump obs/latent chunks，省掉一次 ~3h
-    采集
-  - cross_summary plots 改造：compute_breakdown 用 DeltaQuant Fig 3 风格（深紫红 +
-    薄荷青段 + 红色弧形 speedup 箭头 + 数字在弧中部）；roofline 用 VLA Fig 2 风格
-    （所有线实线 + BW 斜线只到 int8 knee + ceiling 横线只在 knee 右侧 + 离散点圆形 +
-    edge 饱和 face 半透明 + inline 只标 % peak 颜色匹配 marker）
+  Roofline (FlopCounterMode-measured FLOPs/call = 236.6 TF + profile-measured
+  memcpy bytes for AI; A6000 BF16 TC 154.8 TFLOPS / INT8 TC 309.7 TOPS dense
+  peak):
+
+  | variant | Throughput | % of relevant TC peak |
+  |---|---|---|
+  | bf16            | 50 TFLOPS | 31.6% BF16 TC peak (near BW knee) |
+  | viditq dynamic  | 67 TFLOPS | 21.8% INT8 TC peak (compute bound) |
+  | viditq static   | 65 TFLOPS | 21.2% INT8 TC peak |
+
+  VRAM peak breakdown (实测 from PerfProbe init_peak + max-stage peak_alloc):
+
+  | variant | Weights | Transient (activations + KV + scratch) | Total |
+  |---|---|---|---|
+  | bf16            | 22.7 GB | 8.5 GB (vae_encode stage peak) | 31.2 GB |
+  | viditq dynamic  | 22.5 GB | 5.3 GB | 27.7 GB |
+  | viditq static   | 22.5 GB | 5.3 GB | 27.7 GB |
+
+  关键 findings (从实测数据看 quant 的真实加速来源):
+
+  - **Paper-faithful "ViDiT-Q W8A8" 复现 = dynamic 行**：1.37× 加速 + SR -0.2pp
+    几乎持平
+  - **SR 损失 100% 归因于 static activation per-tensor scale**：dynamic 跟 bf16
+    几乎一致 (-0.2pp)，加上 static 才崩 -28.7pp。Long-horizon 重灾区：
+    put_bottles_dustbin 0.80→0.00、handover_block 0.96→0.08、beat_block_hammer
+    1.00→0.36。calib_data 用 demo_clean 跟 demo_randomized 跑出 SR 几乎相同
+    (0.587/0.584)，说明不是分布 mismatch，是 static 方法本身 limit
+  - **w8a8 加速主要来自 Memcpy DtoD 砍 24×**（2410→100 ms/call），不是 Linear
+    GEMM (仅 1.06×)。原因：bf16 weight 10 GB 时 PyTorch allocator
+    (expandable_segments) 频繁 reallocate KV cache 触发 device-to-device copy；
+    int8 weight 5 GB 后 allocator 压力减半，KV cache memcpy 几乎消失
+  - **W8A8 GEMM kernel 效率 21.8% int8 peak < cuBLAS bf16 31.6% bf16 peak**：
+    int8 硬件理论 2× 加速没有完整转化为相应加速。Linear GEMM 在 W8A8 上反而
+    跟 bf16 GEMM 时间几乎一样 (2759 vs 2926 ms)。kernel 优化空间巨大
+  - **attention 跨 variant 几乎不变** (235/235/245 ms)：attention 走 bf16
+    flash_fwd_kernel，量化覆盖不到 → KV cache 也是 bf16 (跟 ViDiT-Q paper W8A8
+    设计一致；attention map int8 是 paper W8A8B8 扩展，未实现)
+
+  工程优化（Phase 39 后期，已合并）:
+
+  - QuaRoT runtime butterfly → fast_hadamard_transform CUDA：原 PyTorch
+    9 launches/layer 改单 CUDA launch；可选 `_HAVE_FHT` flag，PTQ-time fp64
+    rotate_weight 仍走 Python fallback (FHT 不支持 fp64)。viditq_static 速度
+    从 0.78× 一跳到 1.30×（拿回 ~2.4s/call）
+  - derive_calib_ptq 加 --per_task_ep N：从 369 ep 截到 75 ep (每 task 5)，
+    省 80% replay 时间
+  - calib 数据源用 bf16 eval 视频 (bf16/visualization/real/) 替代单独
+    collect_calib_videos，省一次 ~3h 采集
+  - profile_ops 集成进 eval pipeline (server.py 加 --profile_ops，wrap 前 5
+    个 post-warmup infer call in torch.profiler，dump
+    <perf_log_dir>/<task>_op_profile.json 含 4-class kernel breakdown)
+  - measure_flops 独立 script (FlopCounterMode dispatcher-level FLOP count，
+    ~3min one-shot)，输出 results/measured_flops.json
+  - scripts/eval_speed.sh 串行跑 3 个 model × test_num=5 × --profile_ops，
+    结果落到 *_speed/，不污染正式 25 ep 数据
+  - cross_summary 7 张图全部用实测数据：sr/total_ms/speedup/latency_distribution
+    + roofline (FlopCounterMode + memcpy bytes) + op_breakdown_measured
+    (profile 4-class) + memory_breakdown (PerfProbe init_peak + transient)
+  - 架构估算的 op_breakdown.png 和 stage-level compute_breakdown.png 已删除
+    (不真实，被实测替代)
 
   当前 results/ 内容（清理后）：
-  - bf16/                          authoritative bf16 baseline (demo_randomized)
-  - bf16_clean/                    legacy (demo_clean, outlier-polluted, 仅参考)
-  - viditq_w8a8_viditq/            viditq_w8a8_dynamic eval (paper-faithful)
-  - viditq_w8a8_viditq_static/     viditq_w8a8_static eval (附 calib/int_weights.pth)
-  - calib_data/calib_data.pth      derive 输出 (demo_randomized)
-  - cross_summary/                 3-way report.md + 6 plots
+  - bf16/                                authoritative bf16 baseline (25 ep, demo_randomized)
+  - bf16_clean/                          legacy (demo_clean, outlier-polluted, 仅参考)
+  - viditq_w8a8_viditq/                  viditq_w8a8_dynamic eval (paper-faithful, 25 ep)
+  - viditq_w8a8_viditq_static/           viditq_w8a8_static eval (25 ep)
+  - bf16_speed/                          test_num=5 + --profile_ops, 出 op_profile.json
+  - viditq_w8a8_viditq_speed/            ditto
+  - viditq_w8a8_viditq_static_speed/     ditto
+  - calib_data/calib_data.pth            derive 输出 (demo_randomized)
+  - measured_flops.json                  FlopCounterMode 实测 236.6 TF/call (bf16)
+  - cross_summary/                       3-way report.md + 7 plots (25 ep + profile/flops 注入)
+  - cross_summary_speed/                 3-way report.md + 7 plots (test_num=5 数据)
 
   待做（明确剩余）
 
@@ -282,13 +348,15 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
 
   Part VI 扩展（attribution + 优化）：
   - smooth-only / quarot-only 单变体 eval：把 dynamic 的 -0.2pp 进一步拆解
-    （目前已知 static 单独损失 -28.5pp；smooth 和 quarot 单独的贡献待测）
-  - W8A8 GEMM kernel 优化：当前 27.1% int8 peak（dynamic）vs bf16 78.4% bf16 peak，
-    kernel 还有大量提升空间，可能让 dynamic 接近 2× speedup
-  - SmoothQuant divisor 融合到 act_quant kernel（少 1 launch per layer × 5400 calls）
+  - W8A8 GEMM kernel 优化：当前 21.8% int8 peak vs bf16 31.6% bf16 peak，
+    kernel 还有大量提升空间；理论 INT8 TC 2× BF16 TC 但实测 Linear ms 反而
+    跟 bf16 一致（最大 actionable improvement）
+  - SmoothQuant divisor 融合到 act_quant kernel
+  - KV cache int8 量化：bf16 → int8 把 KV cache transient 进一步减半，需要
+    int8 attention kernel (vLLM PagedAttention / FlashAttention 风格)，跟
+    ViDiT-Q paper 不覆盖但是 actionable
 
-  Phase 40 (optional)：mixed-precision per-layer bit allocation（W8 高敏感层 / W4 低敏感
-    层）叠加 viditq
+  Phase 40 (optional)：mixed-precision per-layer bit allocation
 
   新 session 第一步建议
 
@@ -368,17 +436,35 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
           --variant_args PTQEval/.../configs/runtime_args_w8a8_viditq.yaml \
           --task_config demo_randomized --test_num 25 \
           --save_root results/viditq_w8a8_viditq
-      # 步骤 3：aggregator + 3-way cross_summary
+      # 步骤 3：aggregator each variant
       python -m ptqeval.eval.aggregator --save_root results/viditq_w8a8_viditq_static \
           --perf_log_dir results/viditq_w8a8_viditq_static/perf \
           --out_dir results/viditq_w8a8_viditq_static/summary
       python -m ptqeval.eval.aggregator --save_root results/viditq_w8a8_viditq \
           --perf_log_dir results/viditq_w8a8_viditq/perf \
           --out_dir results/viditq_w8a8_viditq/summary
+      # 步骤 4：(一次性) 速度采样 -- 串行跑 3 model × test_num=5 × --profile_ops
+      # 写到 *_speed/perf/<task>_op_profile.json + aggregator 自动 merge 成
+      # *_speed/summary/op_profile.json (4-class kernel time per call)
+      bash scripts/eval_speed.sh
+      for d in bf16_speed viditq_w8a8_viditq_speed viditq_w8a8_viditq_static_speed; do
+          python -m ptqeval.eval.aggregator \
+              --save_root results/${d} --perf_log_dir results/${d}/perf \
+              --out_dir results/${d}/summary
+      done
+      # 步骤 5：(一次性) FlopCounterMode 实测 FLOPs/call (~3min, bf16 only)
+      python -m ptqeval.eval.measure_flops \
+          --videos_root results/bf16 --n_calls 3 \
+          --output results/measured_flops.json
+      # 步骤 6：cross_summary 全量 (25 ep 时延 + speed op_profile + measured FLOPs)
       python -m ptqeval.eval.calc_cross_ckpt \
           --variant bf16=results/bf16/summary/summary.csv \
           --variant viditq_w8a8_dynamic=results/viditq_w8a8_viditq/summary/summary.csv \
           --variant viditq_w8a8_static=results/viditq_w8a8_viditq_static/summary/summary.csv \
+          --op_profile bf16=results/bf16_speed/summary/op_profile.json \
+          --op_profile viditq_w8a8_dynamic=results/viditq_w8a8_viditq_speed/summary/op_profile.json \
+          --op_profile viditq_w8a8_static=results/viditq_w8a8_viditq_static_speed/summary/op_profile.json \
+          --measured_flops results/measured_flops.json \
           --out_dir results/cross_summary
       # 历史 collect_calib_videos.py 仍保留作 fallback；用 bf16 视频做 calib 更优：
       # bf16/visualization/real/ 369 ep 自带 demo_randomized 配置 + per task 25 ep
