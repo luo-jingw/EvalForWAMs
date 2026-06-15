@@ -293,6 +293,7 @@ def _make_plots(
     tasks: list[str],
     summaries: dict[str, dict[str, SummaryRow]],
     step_limits: dict[str, int],
+    op_data: dict[str, dict[str, float]] | None = None,
 ) -> list[tuple[str, str]]:
     """Renders 6 charts under <out_dir>/plots/:
       1. sr_by_task.png           per-task SR per variant
@@ -702,6 +703,23 @@ def _make_plots(
     def _weight_bytes(tag: str) -> float:
         return bytes_per_param.get(tag.lower(), 1.0)
 
+    # Effective device-to-device bandwidth used to convert profile-measured
+    # memcpy ms back into bytes. A6000 spec is 768 GB/s; the practical
+    # DtoD copy bandwidth (cudaMemcpyAsync within the same device) tops
+    # out around 600-700 GB/s due to allocator + scheduler overhead.
+    _DTOD_BW_GBS = 600.0
+
+    def _extra_bytes_from_profile(tag: str) -> float:
+        """Bytes/call beyond raw weight load, estimated from profile
+        memcpy ms. Returns 0 when op_data missing."""
+        if op_data is None:
+            return 0.0
+        entry = op_data.get(tag)
+        if not entry:
+            return 0.0
+        memcpy_ms = float(entry.get("memcpy", 0.0))
+        return memcpy_ms * 1e-3 * _DTOD_BW_GBS * 1e9
+
     # VLA-paper Fig 2 idiom (Williams roofline): one circle per
     # variant, ceilings as solid piecewise lines clipped to where each
     # bound is actually active, regions tinted with light shading,
@@ -777,7 +795,9 @@ def _make_plots(
     from matplotlib.colors import to_rgba
     for idx, tag in enumerate(tags):
         wbytes = _weight_bytes(tag)
-        ai = flops_per_call / (N_PARAMS * wbytes)
+        weight_bytes = N_PARAMS * wbytes
+        extra_bytes = _extra_bytes_from_profile(tag)
+        ai = flops_per_call / (weight_bytes + extra_bytes)
         t_ms = statistics.mean(
             summaries[tag][t].mean_transformer_ms + summaries[tag][t].mean_action_head_ms
             for t in sorted_tasks)
@@ -821,13 +841,18 @@ def _make_plots(
     # it shows in the standalone PNG even when the report.md embed
     # strips off ax titles.
     fig.subplots_adjust(top=0.92, bottom=0.18)
+    ai_caption_suffix = (" + profile-measured memcpy bytes "
+                          f"({_DTOD_BW_GBS:.0f} GB/s effective DtoD BW)"
+                          if op_data is not None else
+                          " (weight bytes only; KV-cache / activation "
+                          "traffic not counted -- AI over-estimated)")
     fig.text(
         0.5, 0.02,
-        "Each dot is one variant: arithmetic intensity from FLOPs / "
-        "weight bytes; throughput from FLOPs / measured "
-        "transformer+action_head time. Label shows the achieved "
-        "fraction of the relevant tensor-core peak (bf16 peak for "
-        "bf16-weight variants, int8 peak for w8a8 variants).",
+        f"Each dot is one variant: arithmetic intensity = FLOPs / "
+        f"(weight bytes{ai_caption_suffix}); throughput = FLOPs / "
+        f"measured transformer+action_head time. Label shows the "
+        f"achieved fraction of the relevant tensor-core peak (bf16 "
+        f"peak for bf16-weight variants, int8 peak for w8a8 variants).",
         ha="center", va="bottom", fontsize=8.5, color="#333",
         wrap=True)
     p_rl = os.path.join(plots_dir, "roofline.png")
@@ -1629,16 +1654,18 @@ def main() -> int:
     json_path = os.path.join(args.out_dir, "cross_summary.json")
     md_path   = os.path.join(args.out_dir, "report.md")
 
+    # Load op_profile data up-front so roofline can use measured
+    # memcpy bytes for AI estimation (not just weight-bytes-only).
+    op_data = _collect_op_profile(args.op_profile)
+
     charts: list[tuple[str, str]] = []
     if not args.no_plots:
         charts = _make_plots(args.out_dir, variant_specs, baseline_tag,
-                             tasks, summaries, step_limits)
+                             tasks, summaries, step_limits,
+                             op_data=op_data)
 
-        # Optionally overlay a profiler-measured op_breakdown chart
-        # alongside the architecture-estimated default. Each
-        # --op_profile entry is TAG=PATH; PATH points at an
-        # aggregator-produced op_profile.json.
-        op_data = _collect_op_profile(args.op_profile)
+        # Overlay a profiler-measured op_breakdown chart alongside the
+        # architecture-estimated default when op_profile is available.
         if op_data is not None:
             from matplotlib.patches import FancyArrowPatch
             plots_dir = os.path.join(args.out_dir, "plots")
