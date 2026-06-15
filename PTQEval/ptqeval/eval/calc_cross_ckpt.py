@@ -296,16 +296,17 @@ def _make_plots(
     op_data: dict[str, dict[str, float]] | None = None,
     measured_flops_tf: float | None = None,
 ) -> list[tuple[str, str]]:
-    """Renders 6 charts under <out_dir>/plots/:
+    """Renders charts under <out_dir>/plots/:
       1. sr_by_task.png           per-task SR per variant
       2. total_ms_speedup.png     latency + speedup curve per task
-      3. speedup_by_task.png      speedup ratio per task
+      3. speedup_by_task.png      speedup ratio per task (omitted when single variant)
       4. latency_distribution.png mean / p50 / p95 per task
-      5. compute_breakdown.png    horizontal stacked-bar with speedup arrows
-                                  (paper-figure style, image.png-inspired)
-      6. roofline.png             achieved (AI, throughput) vs A6000 ceilings
-    Returns [(title, report-relative path)] pairs for embedding in
-    report.md. Empty list if matplotlib is missing (graceful fallback)."""
+      5. roofline.png             achieved (AI, throughput) vs A6000 ceilings
+                                  (requires --measured_flops; skipped otherwise)
+      6. memory_breakdown.png     VRAM peak = model weights + transient
+    Main also writes op_breakdown_measured.png when --op_profile entries
+    are supplied. Returns [(title, report-relative path)] pairs for
+    embedding in report.md. Empty list if matplotlib is missing."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -476,200 +477,7 @@ def _make_plots(
     charts.append(("Latency distribution (mean / p50 / p95)",
                    "plots/latency_distribution.png"))
 
-    # ------ Chart 5: Compute breakdown per variant (DeltaQuant Fig 3 style) ------
-    # Horizontal stacked bars, one row per variant, stack order:
-    # transformer | action_head | other (= total - transformer - action_head;
-    # absorbs text_encoder + vae_encode + comm + dispatch + PerfProbe overlap
-    # residual). Adjacent variants get a curved red speedup arrow above the
-    # bar end (paper-figure style); a single cumulative arrow on the far right
-    # carries baseline -> last-variant ratio when N >= 3.
-    from matplotlib.patches import FancyArrowPatch  # local import; matplotlib already loaded
-
-    # Segment keys map to PerfProbe stage fields:
-    #   transformer  -> "Video"  (Algorithm 1 line 4: video stream 3
-    #                   Euler-step partial denoising loop, runs through
-    #                   the d_v=3072 video-stream transformer blocks)
-    #   action_head  -> "Action" (Algorithm 1 line 7: action stream 10
-    #                   Euler-step full denoising loop conditioned on
-    #                   the predicted video chunk, runs through the
-    #                   d_a=768 action-stream blocks with joint cross-
-    #                   modal attention into the video space)
-    #   other        -> "Other" (text_encoder + vae_encode + dispatch +
-    #                   PerfProbe stage-overlap residual)
-    # Source fields stay as transformer/action_head for backward
-    # compatibility; only the visible label is renamed.
-    breakdown_keys = ["transformer", "action_head", "other"]
-    breakdown_labels = {"transformer": "Video", "action_head": "Action",
-                        "other": "Other"}
-    breakdown_colors = ["#a14b6b", "#5db1a8", "#f1d49a"]
-    seg_data: dict[str, list[float]] = {k: [] for k in breakdown_keys}
-    totals: list[float] = []
-    for tag in tags:
-        trans = statistics.mean(
-            summaries[tag][t].mean_transformer_ms for t in sorted_tasks)
-        head  = statistics.mean(
-            summaries[tag][t].mean_action_head_ms for t in sorted_tasks)
-        total = statistics.mean(
-            summaries[tag][t].mean_total_ms for t in sorted_tasks)
-        other = max(0.0, total - trans - head)
-        seg_data["transformer"].append(trans)
-        seg_data["action_head"].append(head)
-        seg_data["other"].append(other)
-        totals.append(total)
-
-    # Compact row spacing to mirror DeltaQuant Fig 3 (bars nearly
-    # touching). Bar height 0.85 with ylim padding 0.15 keeps a thin
-    # visual seam between rows; explicit ylim because matplotlib default
-    # around invert_yaxis can squash bars into a thin band.
-    fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 1.8)))
-    y_pos = list(range(len(tags)))
-    left = [0.0] * len(tags)
-    for key, color in zip(breakdown_keys, breakdown_colors):
-        vals = seg_data[key]
-        ax.barh(y_pos, vals, left=left, color=color,
-                label=breakdown_labels[key],
-                edgecolor="white", linewidth=1.0, height=0.85)
-        for i, (v, l) in enumerate(zip(vals, left)):
-            if v <= 0:
-                continue
-            share = v / totals[i] * 100.0 if totals[i] > 0 else 0.0
-            label = f"{breakdown_labels[key]}: {v:.0f} ms\n({share:.1f}%)"
-            if v >= 0.08 * max(totals):
-                ax.text(l + v / 2, i, label, ha="center", va="center",
-                        fontsize=9.5, color="#1a1a1a", fontweight="bold")
-        left = [l + v for l, v in zip(left, vals)]
-
-    # Total ms label at actual bar end (sum of segments). Padding is
-    # tight on the baseline bar (no arrow head ever lands there) and
-    # generous on every other bar (otherwise the red arrow head whose
-    # dst sits at `bar_end + arrow_anchor_pad` overstrikes the digits).
-    # ms padding must exceed the arrow_anchor_pad used a few lines
-    # below; pick 0.04 so the label sits clearly right of the arrow tip.
-    bar_max = max(left) if left else 1.0
-    for i, (tot, bar_end) in enumerate(zip(totals, left)):
-        is_baseline = (tags[i] == baseline_tag)
-        pad = 0.010 * bar_max if is_baseline else 0.040 * bar_max
-        ax.text(bar_end + pad, i,
-                f"{tot:.0f} ms",
-                va="center", fontsize=10, color="#333", fontweight="bold")
-
-    # Reference dotted vertical line from the baseline bar end down to
-    # the last bar -- mirrors the black dashed reference in DeltaQuant
-    # Fig 3 that visually anchors the speedup arrows. Drawn before the
-    # arrows so arrows sit on top.
-    base_idx = tags.index(baseline_tag) if baseline_tag in tags else 0
-    base_end = left[base_idx]
-    ax.plot([base_end, base_end],
-            [base_idx, len(tags) - 1 + 0.4],
-            linestyle=(0, (2, 3)), color="#222", lw=1.0, alpha=0.55,
-            zorder=4)
-
-    # Curved red speedup arrows (DeltaQuant Fig 3 idiom). Adjacent
-    # arrows are anchored at the actual bar ends -- so 1.38x emerges
-    # from just past the bf16 bar tip (`4657 ms` corner) and curls into
-    # the dynamic bar tip below it -- rather than pushed into a
-    # separate right-side lane. Cumulative arrow (N>=3) keeps its own
-    # right-side column so it does not pile on top of the adjacent
-    # arcs and their labels.
-    arrow_color = "#c0392b"
-    arrow_lw = 1.8
-    arrow_anchor_pad = 0.018 * bar_max   # tiny gap past bar end
-    # src/dst y are pulled toward the gap between rows (instead of row
-    # center) so the arc starts at the bar's lower-right corner and
-    # ends at the next bar's upper-right corner -- "from the bottom-
-    # left of `4657 ms`". This shortens the arc and keeps the head
-    # well clear of the next bar's interior ms label.
-    src_y_pull = 0.30
-    for k in range(1, len(tags)):
-        src_x = left[k - 1] + arrow_anchor_pad
-        dst_x = left[k] + arrow_anchor_pad
-        src_y = (k - 1) + src_y_pull
-        dst_y = k - src_y_pull
-        arrow = FancyArrowPatch(
-            (src_x, src_y), (dst_x, dst_y),
-            arrowstyle="->,head_width=7,head_length=9",
-            color=arrow_color, lw=arrow_lw,
-            connectionstyle="arc3,rad=-0.32",
-            zorder=5,
-        )
-        ax.add_patch(arrow)
-        sp = left[k - 1] / left[k] if left[k] > 0 else float("nan")
-        # Label sits at the arc midpoint (DeltaQuant Fig 3 idiom) so
-        # the digit rides on the curve rather than off to its side.
-        # Small upward offset in display points keeps the digits from
-        # overlapping the red arc itself.
-        mid_x = (src_x + dst_x) / 2.0
-        mid_y = (src_y + dst_y) / 2.0
-        ax.annotate(f"{sp:.2f}x",
-                    xy=(mid_x, mid_y),
-                    xytext=(8, 0), textcoords="offset points",
-                    color=arrow_color, fontsize=14, fontweight="bold",
-                    ha="left", va="center", zorder=6)
-
-    if len(tags) >= 3:
-        last = len(tags) - 1
-        # Cumulative arrow shares endpoints with the adjacent chain:
-        # src matches the 1.38x source (baseline bar end, lower-right
-        # corner of `bf16`), dst matches the 0.97x dst (last bar end,
-        # upper-right corner of `viditq_static`). A larger curvature
-        # pushes the arc further out so it skirts the inner adjacent
-        # arcs and labels instead of overlapping them.
-        src_x = left[base_idx] + arrow_anchor_pad
-        dst_x = left[last] + arrow_anchor_pad
-        src_y = base_idx + src_y_pull
-        dst_y = last - src_y_pull
-        arrow = FancyArrowPatch(
-            (src_x, src_y), (dst_x, dst_y),
-            arrowstyle="->,head_width=8,head_length=10",
-            color=arrow_color, lw=arrow_lw,
-            connectionstyle="arc3,rad=-0.55",
-            zorder=5,
-        )
-        ax.add_patch(arrow)
-        cum_sp = left[base_idx] / left[last] if left[last] > 0 else float("nan")
-        # Label rides the cumulative arc at its midpoint, mirroring
-        # the adjacent labels' "on-the-curve" placement so the three
-        # speedup digits sit in a consistent visual slot.
-        mid_x = (src_x + dst_x) / 2.0
-        mid_y = (src_y + dst_y) / 2.0
-        ax.annotate(f"{cum_sp:.2f}x",
-                    xy=(mid_x, mid_y),
-                    xytext=(8, 0), textcoords="offset points",
-                    color=arrow_color, fontsize=14, fontweight="bold",
-                    ha="left", va="center", zorder=6)
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(tags, fontsize=11, fontweight="bold")
-    # Tight half-row padding so bars are nearly touching (DeltaQuant
-    # Fig 3 idiom). Invert so baseline reads on top.
-    ax.set_ylim(-0.6, len(tags) - 0.4)
-    ax.invert_yaxis()
-    ax.set_xlabel(
-        f"Mean per-call latency (ms), averaged across {len(sorted_tasks)} tasks",
-        fontsize=10)
-    ax.set_title("Per-variant compute breakdown", fontsize=12, pad=8)
-    # Legend at upper right corner avoids landing on speedup-arrow
-    # lanes which all sit in the lower-right quadrant of the plot area.
-    ax.legend(loc="upper right", framealpha=0.92, fontsize=10)
-    # Right padding sized to fit the adjacent-arc labels (~0.05 past
-    # bar_max) and, when >=3 variants, the wider cumulative arc that
-    # bulges further right (~0.13 past bar_max with rad=-0.55) plus
-    # its `X.XXx` label.
-    right_pad = 1.20 if len(tags) >= 3 else 1.13
-    ax.set_xlim(0, bar_max * right_pad)
-    ax.grid(True, axis="x", alpha=0.20)
-    # Hide top/right spines for a cleaner paper look.
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
-    fig.tight_layout()
-    p_bd = os.path.join(plots_dir, "compute_breakdown.png")
-    fig.savefig(p_bd, dpi=130)
-    plt.close(fig)
-    charts.append(("Compute breakdown per variant "
-                   "(transformer / action_head / other; curved speedup arrows)",
-                   "plots/compute_breakdown.png"))
-
-    # ------ Chart 6: Roofline (achieved throughput vs arithmetic intensity) ------
+    # ------ Chart 5: Roofline (achieved throughput vs arithmetic intensity) ------
     # Hardware: RTX A6000 (sm_86). Two compute ceilings (bf16 tensor core,
     # int8 tensor core) and one memory-bandwidth ceiling. Workload
     # parameters estimated for LingBot-VA per-call:
@@ -692,17 +500,16 @@ def _make_plots(
     PEAK_INT8_TOPS   = 309.7    # A6000 INT8 Tensor Core dense peak (= 2x BF16 TC)
     PEAK_BW_GBS      = 768.0    # A6000 GDDR6 bandwidth
     N_PARAMS         = 5.09e9   # LingBot-VA WAN transformer
-    # FLOPs per call: prefer measured (FlopCounterMode dispatcher-level)
-    # over architecture estimate. Architecture sum (linear + attention)
-    # is consistent with op_breakdown chart; measured replaces both with
-    # ground-truth aten dispatcher count.
-    if measured_flops_tf and measured_flops_tf > 0:
-        flops_per_call = float(measured_flops_tf) * 1e12
-        flops_src = "measured"
-    else:
-        _arch_pf = _estimate_op_pf("bf16")
-        flops_per_call = (_arch_pf["linear"] + _arch_pf["attention"]) * 1e12
-        flops_src = "architecture estimate"
+    # FLOPs per call from FlopCounterMode dispatcher-level measurement
+    # (ptqeval.eval.measure_flops). Required: roofline depends on real
+    # FLOPs/call, not a hand-tuned architecture estimate. Pass
+    # --measured_flops <path> to enable.
+    if not (measured_flops_tf and measured_flops_tf > 0):
+        print("warning: roofline chart needs --measured_flops <path> "
+              "(JSON from ptqeval.eval.measure_flops); skipping.",
+              file=sys.stderr)
+        return charts
+    flops_per_call = float(measured_flops_tf) * 1e12
 
     bytes_per_param = {"bf16": 2.0, "fp16": 2.0}
     # All variants other than bf16 carry W8A8 weights (int8 = 1 byte/param).
@@ -856,10 +663,10 @@ def _make_plots(
         0.5, 0.02,
         f"Each dot is one variant: arithmetic intensity = FLOPs / "
         f"(weight bytes{ai_caption_suffix}); throughput = FLOPs / "
-        f"measured transformer+action_head time. FLOPs source: "
-        f"{flops_src} ({flops_per_call/1e12:.1f} TF/call). Label shows "
-        f"the achieved fraction of the relevant tensor-core peak (bf16 "
-        f"peak for bf16-weight variants, int8 peak for w8a8 variants).",
+        f"measured transformer+action_head time. FLOPs measured by "
+        f"FlopCounterMode ({flops_per_call/1e12:.1f} TF/call). Label "
+        f"shows the achieved fraction of the relevant tensor-core peak "
+        f"(bf16 peak for bf16-weight variants, int8 peak for w8a8 variants).",
         ha="center", va="bottom", fontsize=8.5, color="#333",
         wrap=True)
     p_rl = os.path.join(plots_dir, "roofline.png")
@@ -868,38 +675,7 @@ def _make_plots(
     charts.append(("Roofline (achieved throughput vs arithmetic intensity, A6000)",
                    "plots/roofline.png"))
 
-    # ------ Chart 7: Op-type breakdown (Linear vs Attention) ------
-    # Two data sources, selected per call site:
-    #   1. Measured: profiler JSON keyed by tag -> {linear, attention,
-    #      other} kernel ms (preferred; ground truth).
-    #   2. Estimated: architecture FLOPs derived from _ARCH constants,
-    #      reported in BF16-equivalent TFLOPs (fallback when no
-    #      profiler data exists; DeltaQuant Fig 3 idiom).
-    # _make_plots stays data-agnostic: it always emits the estimated
-    # version. main() additionally renders the measured chart when
-    # --op_profile points at a readable JSON.
-    _render_op_breakdown(
-        plots_dir, tags, baseline_tag, FancyArrowPatch,
-        data={tag: _estimate_op_pf(tag) for tag in tags},
-        unit_label="TF", unit_fmt="{:.1f}",
-        xlabel="BF16-equivalent FLOPs per inference call (TFLOPs)",
-        title="Per-variant op-type FLOPs breakdown (Linear vs Attention)",
-        caption=(
-            "FLOPs estimated from LingBot-VA architecture (d_v=3072 + "
-            "d_a=768 MoT, 30 layers, K=4 chunk, video=3 Euler*2 CFG, "
-            "action=10 Euler). Linear includes self-attn QKV+O, FFN, "
-            "cross-attn, MoT projection; Attention is QK^T + softmax-V. "
-            "w8a8 Linear divided by 2 (A6000 INT8 TC peak 309.7 TOPS = "
-            "2x BF16 TC peak 154.8 TFLOPS). Op-level kernel time not "
-            "measured -- pass --op_profile <path> to use real profiler data."
-        ),
-        out_name="op_breakdown.png",
-    )
-    charts.append(("Op-type FLOPs breakdown per variant "
-                   "(Linear vs Attention, BF16-equivalent; estimated)",
-                   "plots/op_breakdown.png"))
-
-    # ------ Chart 8: Memory breakdown (model weights + transient) ------
+    # ------ Chart 6: Memory breakdown (model weights + transient) ------
     # Two-segment stacked horizontal bar per variant decomposing the
     # observed VRAM peak into model weights (init_peak_mb, never freed)
     # and the additional activations/KV cache/scratch buffer (peak -
@@ -978,94 +754,8 @@ def _make_plots(
 
 
 # --------------------------------------------------------------------------
-# Op-type FLOPs estimation + chart
+# Op-type measured kernel time chart
 # --------------------------------------------------------------------------
-
-# LingBot-VA architecture constants (paper §4.2 + ptq.py inspection).
-# Encapsulated so a future profiler-based replacement can swap them out
-# without disturbing the rest of the chart pipeline.
-_ARCH = dict(
-    d_v=3072,             # video stream hidden dim (Wan2.2-5B backbone)
-    d_a=768,              # action stream hidden dim
-    n_layers=30,
-    ffn_inner_v=14336,    # video ffn inner dim
-    ffn_inner_a=3584,     # action ffn inner dim (4x smaller)
-    n_tokens_per_frame=192,  # spatial tokens per frame after VAE+patchify
-    chunk_K=4,            # video frames per chunk
-    tau=4,                # action tokens per video frame
-    video_steps=3,        # Euler steps to s=0.5 (Algorithm 1 line 4)
-    action_steps=10,      # Euler steps to s=1.0 (Algorithm 1 line 7)
-    video_cfg_forwards=2, # CFG=5.0 -> cond+uncond batched as 2 forwards
-    action_cfg_forwards=1,  # CFG=1.0 -> no CFG batch
-    text_seq_len=256,     # T5 text encoder typical output length
-)
-
-
-def _estimate_op_pf(tag: str) -> dict:
-    """Return {linear, attention, other} in PF (BF16-equivalent FLOPs)
-    per inference call. Architecture-based; assumes the workload is
-    one chunk of K video frames + tau*K action tokens.
-
-    BF16-equivalent: w8a8 Linear FLOPs are divided by 4 since INT8 TC
-    runs 4x faster per FLOP than BF16 TC on A6000 (154.8 TOPS vs 38.7
-    TFLOPS). Attention stays in BF16 SDPA across all variants so its
-    PF is variant-independent."""
-    a = _ARCH
-    # Linear FLOPs per token per layer (4 self-attn + 2 ffn + 4 cross-attn
-    # to text encoder, matching ViDiT-Q remain_fp_regex scope).
-    lin_per_tok_v = (8 * a["d_v"]**2                  # self-attn (q/k/v/out)
-                     + 4 * a["d_v"] * a["ffn_inner_v"]  # ffn up + down
-                     + 8 * a["d_v"]**2)               # cross-attn attn2
-    lin_per_tok_a = (8 * a["d_a"]**2
-                     + 4 * a["d_a"] * a["ffn_inner_a"]
-                     + 8 * a["d_a"]**2)
-    # Video stream per chunk: K frames * N tokens/frame video tokens,
-    # all 30 layers, video_steps * cfg_forwards forward passes.
-    n_video_tok = a["chunk_K"] * a["n_tokens_per_frame"]
-    n_video_fwd = a["video_steps"] * a["video_cfg_forwards"]
-    video_linear_flops = n_video_fwd * a["n_layers"] * n_video_tok * lin_per_tok_v
-    # Action stream per chunk: tau*K action tokens, all 30 layers,
-    # action_steps * cfg_forwards forward passes.
-    n_action_tok = a["tau"] * a["chunk_K"]
-    n_action_fwd = a["action_steps"] * a["action_cfg_forwards"]
-    action_linear_flops = n_action_fwd * a["n_layers"] * n_action_tok * lin_per_tok_a
-    # Cross-modal projection in MoT (action <-> video dim each layer).
-    n_cross_proj = 2 * a["d_v"] * a["d_a"]  # 2 Linears (in + out)
-    cross_proj_flops = n_action_fwd * a["n_layers"] * n_action_tok * 2 * n_cross_proj
-    linear_flops = video_linear_flops + action_linear_flops + cross_proj_flops
-
-    # Attention FLOPs (self-attn within chunk; joint attn for action).
-    # Self-attn: 4 * S^2 * d  (Q.K^T + softmax-weighted V, both 2*S*S*d).
-    video_self_attn = n_video_fwd * a["n_layers"] * 4 * n_video_tok**2 * a["d_v"]
-    # Action joint attn uses video-dim space; combined seq len = video + action.
-    joint_seq = n_video_tok + n_action_tok
-    action_joint_attn = n_action_fwd * a["n_layers"] * 4 * joint_seq**2 * a["d_v"]
-    # Cross-attn to text encoder (video + action queries vs text K/V).
-    video_text_attn = n_video_fwd * a["n_layers"] * 4 * n_video_tok * a["text_seq_len"] * a["d_v"]
-    action_text_attn = n_action_fwd * a["n_layers"] * 4 * n_action_tok * a["text_seq_len"] * a["d_a"]
-    attn_flops = video_self_attn + action_joint_attn + video_text_attn + action_text_attn
-
-    # BF16-equivalent: a w8a8 Linear with N raw FLOPs takes N / INT8_TC
-    # seconds; the same N FLOPs would take N / BF16_TC seconds on the
-    # bf16 path. The "bf16-equivalent" view scales so they share the
-    # bf16 time axis: bf16_eq_FLOPs = N * (BF16_TC / INT8_TC) = N / 2.
-    # Attention stays bf16 either way (no int8 attention kernel).
-    is_w8a8 = (_weight_bytes_lookup(tag) < 2.0)
-    linear_bf16eq = linear_flops / 2.0 if is_w8a8 else linear_flops
-
-    TF = 1e12
-    return {
-        "linear": linear_bf16eq / TF,
-        "attention": attn_flops / TF,
-        "memcpy": 0.0,    # not knowable from architecture; profiler-only
-        "other": 0.0,
-    }
-
-
-def _weight_bytes_lookup(tag: str) -> float:
-    """Mirror of _weight_bytes inner-fn from roofline; bf16/fp16 -> 2.0,
-    everything else (w8a8 / int8 quant) -> 1.0."""
-    return 2.0 if tag.lower() in ("bf16", "fp16") else 1.0
 
 
 def _load_op_profile_for_tag(path: str) -> dict[str, float] | None:
@@ -1402,11 +1092,9 @@ def write_report_md(
     # headline numbers they visualize.
     chart_map = {rel: title for (title, rel) in (charts or [])}
     overall_charts = [
-        "plots/compute_breakdown.png",
-        "plots/op_breakdown.png",
-        "plots/op_breakdown_measured.png",  # only present when --op_profile
+        "plots/op_breakdown_measured.png",  # present when --op_profile
         "plots/memory_breakdown.png",
-        "plots/roofline.png",
+        "plots/roofline.png",               # present when --measured_flops
     ]
     for rel in overall_charts:
         if rel in chart_map:
