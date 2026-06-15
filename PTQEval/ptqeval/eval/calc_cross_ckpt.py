@@ -680,21 +680,22 @@ def _make_plots(
     # Variants land at different (AI, throughput) points; the diagonal
     # bandwidth line separates memory-bound (below diagonal) from
     # compute-bound (right of knee).
-    PEAK_BF16_TFLOPS = 38.7     # A6000 bf16 tensor core peak
-    PEAK_INT8_TOPS   = 154.8    # A6000 int8 tensor core peak (2x bf16 due to 8b mma)
-    PEAK_BW_GBS      = 768.0    # A6000 HBM bandwidth
+    # A6000 spec (NVIDIA datasheet, dense / no structured sparsity):
+    #   FP32 CUDA cores       38.7 TFLOPS  <- NOT used here, common confusion
+    #   BF16/FP16 Tensor Core 154.8 TFLOPS (4x FP32 since TC fuse mma)
+    #   INT8 Tensor Core      309.7 TOPS   (2x BF16 since 8b vs 16b mma)
+    #   GDDR6 bandwidth       768 GB/s
+    # Sparse peaks would be 2x of these but our path is dense.
+    PEAK_BF16_TFLOPS = 154.8    # A6000 BF16 Tensor Core dense peak
+    PEAK_INT8_TOPS   = 309.7    # A6000 INT8 Tensor Core dense peak (= 2x BF16 TC)
+    PEAK_BW_GBS      = 768.0    # A6000 GDDR6 bandwidth
     N_PARAMS         = 5.09e9   # LingBot-VA WAN transformer
-    # Workload constants: scaled so measured bf16 throughput lands at
-    # ~40-50% of A6000 bf16 peak (a typical memory-bound LLM regime),
-    # which is the physically plausible band for this batch=1 / chunked
-    # workload. Exact absolute FLOPs are uncertain (CFG batching + dual
-    # transformer/action passes can double-count via PerfProbe stage
-    # timers); we only need the inter-variant ratios to be stable, which
-    # they are because both numerator (FLOPs) and denominator (time) scale
-    # proportionally across variants.
-    TOKENS_PER_FWD   = 480
-    FWDS_PER_CALL    = 30
-    flops_per_call = 2.0 * N_PARAMS * TOKENS_PER_FWD * FWDS_PER_CALL  # FLOPs (matmul-dominant)
+    # Pull raw FLOPs (linear + attention, no bf16-equivalent scaling)
+    # from the same architecture model used by op_breakdown so the
+    # two charts agree on absolute work. _estimate_op_pf("bf16") path
+    # skips the /2 w8a8 scaling and returns honest BF16 FLOPs in TF.
+    _arch_pf = _estimate_op_pf("bf16")
+    flops_per_call = (_arch_pf["linear"] + _arch_pf["attention"]) * 1e12
 
     bytes_per_param = {"bf16": 2.0, "fp16": 2.0}
     # All variants other than bf16 carry W8A8 weights (int8 = 1 byte/param).
@@ -856,9 +857,9 @@ def _make_plots(
             "d_a=768 MoT, 30 layers, K=4 chunk, video=3 Euler*2 CFG, "
             "action=10 Euler). Linear includes self-attn QKV+O, FFN, "
             "cross-attn, MoT projection; Attention is QK^T + softmax-V. "
-            "w8a8 Linear divided by 4 (int8 TC peak 154.8 TOPS = 4x bf16 "
-            "38.7 TFLOPS). Op-level kernel time not measured -- pass "
-            "--op_profile <path> to use real profiler data."
+            "w8a8 Linear divided by 2 (A6000 INT8 TC peak 309.7 TOPS = "
+            "2x BF16 TC peak 154.8 TFLOPS). Op-level kernel time not "
+            "measured -- pass --op_profile <path> to use real profiler data."
         ),
         out_name="op_breakdown.png",
     )
@@ -1012,10 +1013,13 @@ def _estimate_op_pf(tag: str) -> dict:
     action_text_attn = n_action_fwd * a["n_layers"] * 4 * n_action_tok * a["text_seq_len"] * a["d_a"]
     attn_flops = video_self_attn + action_joint_attn + video_text_attn + action_text_attn
 
-    # BF16-equivalent: w8a8 Linear runs 4x faster on int8 TC,
-    # so equivalent FLOPs = raw / 4. Attention stays bf16 either way.
+    # BF16-equivalent: a w8a8 Linear with N raw FLOPs takes N / INT8_TC
+    # seconds; the same N FLOPs would take N / BF16_TC seconds on the
+    # bf16 path. The "bf16-equivalent" view scales so they share the
+    # bf16 time axis: bf16_eq_FLOPs = N * (BF16_TC / INT8_TC) = N / 2.
+    # Attention stays bf16 either way (no int8 attention kernel).
     is_w8a8 = (_weight_bytes_lookup(tag) < 2.0)
-    linear_bf16eq = linear_flops / 4.0 if is_w8a8 else linear_flops
+    linear_bf16eq = linear_flops / 2.0 if is_w8a8 else linear_flops
 
     TF = 1e12
     return {
