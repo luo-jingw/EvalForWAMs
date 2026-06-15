@@ -44,6 +44,14 @@ logging.basicConfig(level=logging.INFO,
 # Mirrors derive_calib_ptq._build_server / profile_ops._build_server but
 # bf16-only since FLOPs don't depend on weight dtype.
 def _build_server(model_path: str, save_root: Path):
+    # init_distributed reads MASTER_ADDR/PORT from env; set them up-front
+    # since we are running directly (not via torch.distributed.run launcher).
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29680")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+
     import ptqeval.wam.lingbot_va as _lingbot_va_pkg  # noqa: F401
     _wan_va_dir = os.path.join(_lingbot_va_pkg.LINGBOT_VA_PATH, "wan_va")
     if _wan_va_dir not in sys.path:
@@ -123,9 +131,19 @@ def main() -> int:
     obs_dict = {"obs": [obs_list[0]], "prompt": prompt,
                 "save_visualization": False}
 
-    server.infer({"reset": True, "prompt": prompt, "save_visualization": False})
+    # Each measurement is independent: reset + 1-frame _infer (matches
+    # derive_calib_ptq._replay_episode pattern). Repeating infer() with
+    # the same single-frame obs without resetting between calls causes
+    # the streaming VAE to mismatch its conv3d kernel against the
+    # 1-frame input on subsequent calls.
+    def _reset_and_warm():
+        server.infer({"reset": True, "prompt": prompt,
+                      "save_visualization": False})
+
+    _reset_and_warm()
     for _ in range(args.warmup):
         server.infer(obs_dict)
+        _reset_and_warm()
     torch.cuda.synchronize()
     logger.info(f"warmup done; counting FLOPs over {args.n_calls} calls")
 
@@ -135,6 +153,7 @@ def main() -> int:
         with FlopCounterMode(display=False) as fcm:
             server.infer(obs_dict)
         torch.cuda.synchronize()
+        _reset_and_warm()  # restore clean state for next sample
         total = int(fcm.get_total_flops())
         per_call_flops.append(total)
         # by-op aggregation (FlopCounterMode tracks per-aten-op).
