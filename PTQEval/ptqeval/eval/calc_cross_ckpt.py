@@ -1021,6 +1021,7 @@ def _estimate_op_pf(tag: str) -> dict:
     return {
         "linear": linear_bf16eq / TF,
         "attention": attn_flops / TF,
+        "memcpy": 0.0,    # not knowable from architecture; profiler-only
         "other": 0.0,
     }
 
@@ -1045,7 +1046,9 @@ def _load_op_profile_for_tag(path: str) -> dict[str, float] | None:
     slot = payload.get("op_per_call_ms")
     if not isinstance(slot, dict):
         return None
-    return {k: float(slot.get(k, 0.0)) for k in ("linear", "attention", "other")}
+    # Legacy 3-key profiles (no memcpy) fall back to 0 for memcpy.
+    return {k: float(slot.get(k, 0.0))
+            for k in ("linear", "attention", "memcpy", "other")}
 
 
 def _collect_op_profile(specs: list[str]) -> dict[str, dict[str, float]] | None:
@@ -1088,9 +1091,10 @@ def _render_op_breakdown(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    op_keys = ["linear", "attention", "other"]
-    op_labels = {"linear": "Linear", "attention": "Attention", "other": "Other"}
-    op_colors = ["#a14b6b", "#5db1a8", "#f1d49a"]
+    op_keys = ["linear", "attention", "memcpy", "other"]
+    op_labels = {"linear": "Linear", "attention": "Attention",
+                 "memcpy": "Memcpy (KV cache)", "other": "Other"}
+    op_colors = ["#a14b6b", "#5db1a8", "#7e8fbf", "#f1d49a"]
     seg = {k: [] for k in op_keys}
     totals: list[float] = []
     for tag in tags:

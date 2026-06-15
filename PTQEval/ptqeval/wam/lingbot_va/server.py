@@ -9,28 +9,81 @@ from functools import partial
 from typing import Optional
 
 
-# Substring rules for classifying CUDA kernels when --profile_ops is on.
-# Order matters: first match wins. Tuned for cuBLAS bf16 + our W8A8
-# GEMM + PyTorch SDPA + ViDiT-Q kernels.
+# Substring rules for classifying CUDA kernels under --profile_ops.
+# Order matters: ATTENTION first because record_function markers we
+# install below (e.g. "ATTENTION_SDPA") wrap GEMM children -- without
+# the marker check the inner cutlass GEMM would falsely match LINEAR.
+_ATTENTION_TOKENS = (
+    "attention_sdpa", "attention_diffusers",
+    "sdpa", "scaled_dot_product", "flash", "fmha", "mha",
+    "attention_kernel",
+)
 _LINEAR_TOKENS = (
     "gemm", "cublas", "cutlass", "w8a8", "qlinear",
     "linear", "addmm", "mm_kernel", "mm_out", "act_quant",
 )
-_ATTENTION_TOKENS = (
-    "sdpa", "scaled_dot_product", "flash", "fmha", "mha",
-    "attention_kernel", "softmax",
-)
+_MEMCPY_TOKENS = ("memcpy",)
 
 
 def _classify_kernel(name: str) -> str:
     n = name.lower()
-    for tok in _LINEAR_TOKENS:
-        if tok in n:
-            return "linear"
     for tok in _ATTENTION_TOKENS:
         if tok in n:
             return "attention"
+    for tok in _LINEAR_TOKENS:
+        if tok in n:
+            return "linear"
+    for tok in _MEMCPY_TOKENS:
+        if tok in n:
+            return "memcpy"
     return "other"
+
+
+_SDPA_PATCH_INSTALLED = False
+
+
+def _install_attention_markers() -> None:
+    """Monkey-patch F.scaled_dot_product_attention and diffusers
+    Attention.forward so PyTorch profiler attributes their GEMM
+    children under a named record_function event (rather than the
+    bare cutlass kernel name which is identical to nn.Linear's).
+
+    Called once when --profile_ops is enabled; idempotent."""
+    global _SDPA_PATCH_INSTALLED
+    if _SDPA_PATCH_INSTALLED:
+        return
+    _SDPA_PATCH_INSTALLED = True
+    try:
+        from torch.profiler import record_function
+    except ImportError:
+        return
+
+    # 1) SDPA fast path (most diffusers AttnProcessor2_0 calls this).
+    try:
+        import torch.nn.functional as _F
+        _orig_sdpa = _F.scaled_dot_product_attention
+
+        def _sdpa_wrap(*a, **kw):
+            with record_function("ATTENTION_SDPA"):
+                return _orig_sdpa(*a, **kw)
+        _F.scaled_dot_product_attention = _sdpa_wrap
+        logger.info("[profile_ops] wrapped F.scaled_dot_product_attention")
+    except Exception as e:
+        logger.warning(f"[profile_ops] SDPA wrap failed: {e}")
+
+    # 2) diffusers Attention.forward (covers manual matmul + softmax
+    # attention paths that don't go through SDPA).
+    try:
+        from diffusers.models.attention_processor import Attention as _DiffAttn
+        _orig_forward = _DiffAttn.forward
+
+        def _attn_wrap(self, *a, **kw):
+            with record_function("ATTENTION_DIFFUSERS"):
+                return _orig_forward(self, *a, **kw)
+        _DiffAttn.forward = _attn_wrap
+        logger.info("[profile_ops] wrapped diffusers Attention.forward")
+    except Exception as e:
+        logger.warning(f"[profile_ops] diffusers Attention wrap failed: {e}")
 from PIL import Image
 from diffusers.video_processor import VideoProcessor
 from diffusers.utils import export_to_video
@@ -114,7 +167,8 @@ class VA_Server:
         self._profile_target = int(getattr(job_config, 'profile_n_calls', 5))
         self._profile_warmup = 1
         self._profile_calls_seen = 0
-        self._op_us: dict = {"linear": 0.0, "attention": 0.0, "other": 0.0}
+        self._op_us: dict = {"linear": 0.0, "attention": 0.0,
+                              "memcpy": 0.0, "other": 0.0}
         self._op_kernel_top: list = []
         self._profile_dump_path: Optional[str] = None
         if self._profile_ops and perf_log_dir:
@@ -124,6 +178,7 @@ class VA_Server:
                         f"{self._profile_target} infer() calls "
                         f"(+{self._profile_warmup} warmup); dump to "
                         f"{self._profile_dump_path}")
+            _install_attention_markers()
 
         init_stage_ctx = None
         if self.probe is not None:
@@ -792,11 +847,17 @@ class VA_Server:
             payload = {
                 "_meta": {
                     "unit": "ms",
-                    "source": "torch.profiler",
+                    "source": "torch.profiler + record_function markers",
                     "n_calls": self._profile_target,
                     "warmup": self._profile_warmup,
+                    "categories": ["linear", "attention", "memcpy", "other"],
                     "note": ("Profiler overhead inflates absolute ms; "
-                             "compare op-type share within a variant."),
+                             "compare op-type share within a variant. "
+                             "attention attribution relies on "
+                             "ATTENTION_SDPA / ATTENTION_DIFFUSERS "
+                             "record_function markers wrapping the "
+                             "attention forward; bare cutlass GEMM "
+                             "outside those markers counts as linear."),
                 },
                 "op_per_call_ms": per_call_ms,
                 "_per_kernel_top50": top,

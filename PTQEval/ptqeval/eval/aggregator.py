@@ -271,7 +271,8 @@ def merge_op_profiles(perf_log_dir: str, out_dir: str) -> None:
     files = sorted(glob.glob(os.path.join(perf_log_dir, "*_op_profile.json")))
     if not files:
         return
-    per_call_ms = {"linear": 0.0, "attention": 0.0, "other": 0.0}
+    per_call_ms = {"linear": 0.0, "attention": 0.0,
+                    "memcpy": 0.0, "other": 0.0}
     n = 0
     sources = []
     for f in files:
@@ -283,6 +284,8 @@ def merge_op_profiles(perf_log_dir: str, out_dir: str) -> None:
         slot = p.get("op_per_call_ms")
         if not slot:
             continue
+        # Accept legacy 3-key profiles (linear/attention/other only)
+        # by treating their `other` as `other` and leaving memcpy at 0.
         for k in per_call_ms:
             per_call_ms[k] += float(slot.get(k, 0.0))
         n += 1
