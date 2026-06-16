@@ -208,11 +208,15 @@ class VA_Server:
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'tokenizer'), )
 
+            # Phase 41: text encoder always loads on CPU regardless of
+            # enable_offload. _reset() swaps to GPU only for the one-shot
+            # encode pass per prompt, then back to CPU. Drops the 11 GB
+            # text encoder from init_peak + transient peak.
             self.text_encoder = load_text_encoder(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'text_encoder'),
                 torch_dtype=self.dtype,
-                torch_device='cpu' if self.enable_offload else self.device,
+                torch_device='cpu',
             )
 
             variant: Optional[str] = getattr(job_config, 'variant', None)
@@ -591,6 +595,17 @@ class VA_Server:
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
+            # Phase 41: text encoder (UMT5-XXL, ~11 GB) stays on CPU
+            # permanently. encode_prompt runs on whatever device the
+            # encoder lives on (see _get_t5_prompt_embeds at line ~300)
+            # and only the small ~0.6 MB prompt_embeds tensors get moved
+            # to GPU before cross-attention consumes them.
+            # Per-_reset cost: ~5-15s for the CPU encode of 77-512 text
+            # tokens through UMT5-XXL — negligible vs the multi-second
+            # rollout that follows.
+            # VRAM peak drops 31.2 -> 20.2 GB (bf16) / 27.7 -> 16.7 GB
+            # (W8A8). No GPU swap means the offload survives even when
+            # the GPU is too crowded to temporarily host 11 GB more.
             with self._stage('text_encoder'):
                 self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                     prompt=prompt,
