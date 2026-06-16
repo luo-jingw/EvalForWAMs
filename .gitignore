@@ -48,3 +48,10 @@ RoboTwin/=0.49.1
 lingbot-va/wan_va/quant/**/build/
 lingbot-va/wan_va/quant/**/*.so
 lingbot-va/wan_va/quant/**/*.o
+
+# Reference materials kept at repo root for context, not source of truth
+# (papers + image references downloaded for chart-design / methodology compare)
+/Li_DeltaQuant_4-bit_Video_Diffusion_Models_with_Spatiotemporal_Delta_Smoothing_CVPR_2026_paper.pdf
+/lingbot-va_paper.pdf
+/Roofline.png
+/computation.png
