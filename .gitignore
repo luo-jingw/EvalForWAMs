@@ -55,3 +55,8 @@ lingbot-va/wan_va/quant/**/*.o
 /lingbot-va_paper.pdf
 /Roofline.png
 /computation.png
+
+# Working planning + handover docs (kept on disk per machine, not via git)
+/ProjectDescription.txt
+/principle.txt
+/plan.txt
