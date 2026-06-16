@@ -386,25 +386,38 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
   - cross_summary/                       3-way report.md + 7 plots (25 ep + profile/flops 注入)
   - cross_summary_speed/                 3-way report.md + 7 plots (test_num=5 数据)
 
-  待做（明确剩余）
+  待做（明确剩余 — stance：迁移复现 ViDiT-Q paper，不做超 paper 的优化）
 
-  Part III:
+  Phase 41 (next, deployment-only)：Text encoder CPU offload
+  - 改动：~30 行 in server.py — `_reset()` 跑完 text_encoder(prompt) 拿到
+    text_emb 后立即 self.text_encoder.cpu() 或 del self.text_encoder
+  - 收益：peak VRAM 31.2 → 20.2 GB (bf16) / 27.7 → 16.7 GB (W8A8)
+  - 公平性：ViDiT-Q paper 只规定权重 + 激活量化方案，不规定 text encoder
+    的 GPU 驻留策略。text encoder 在 rollout 中只在 reset 时跑一次。offload
+    是 Diffusers / Sora 等 video diffusion 部署标准实践 (enable_model_cpu_offload
+    pattern)。与 ViDiT-Q 算法零冲突，作为部署优化收录
+
+  Part III (W4A8 chain, in-scope paper variant)：
   - Phase 26b：cleanup 旧 scratch + Phase 24c port + W4A8 wrapper
   - Phase 28：W4A8 QServe port + 重建 qlinear_w4a8 wrapper
   - Phase 29：W4A8 15 任务全 eval
   - Phase 30：扩 calc_cross_ckpt 加 viditq_w4a8 一列
 
-  Part VI 扩展（attribution + 优化）：
-  - smooth-only / quarot-only 单变体 eval：把 dynamic 的 -0.2pp 进一步拆解
-  - W8A8 GEMM kernel 优化：当前 21.8% int8 peak vs bf16 31.6% bf16 peak，
-    kernel 还有大量提升空间；理论 INT8 TC 2× BF16 TC 但实测 Linear ms 反而
-    跟 bf16 一致（最大 actionable improvement）
-  - SmoothQuant divisor 融合到 act_quant kernel
-  - KV cache int8 量化：bf16 → int8 把 KV cache transient 进一步减半，需要
-    int8 attention kernel (vLLM PagedAttention / FlashAttention 风格)，跟
-    ViDiT-Q paper 不覆盖但是 actionable
+  Phase 40 (optional, after W4A8)：mixed-precision per-layer bit allocation
+  - 超 ViDiT-Q paper scope；保留为 optional，仅在 Phase 29 W4A8 SR 损失大
+    时启动 (用 W8 救最敏感层)
 
-  Phase 40 (optional)：mixed-precision per-layer bit allocation
+  已记录的 findings — 不作为待做 (stance: 复现，不优化 paper)：
+  - W8A8 GEMM kernel 利用率 19.6% INT8 peak < cuBLAS bf16 42.7% BF16 peak。
+    优化它 = 超 paper (我们当前 kernel 已逐字 port 自 ViDiT-Q upstream
+    `w8a8_gemm_cuda.cu` 含 bias-fusion)。findings 留作 PI 参考
+  - act_quant kernel 加 +343 ms 到 Other 桶 = paper-faithful 算法本质开销
+  - KV cache int8 量化 = ViDiT-Q paper W8A8 不覆盖 (paper 明确 KV bf16)，
+    不做以保持复现一致性
+  - SmoothQuant divisor 融合到 act_quant kernel = paper 不要求的工程优化，
+    不做
+  - dynamic SR -0.2 pp 的 smooth-only / quarot-only 单变体拆解 = 不做
+    (PI 不关心，且会触发 2-3h × 2 次 eval)
 
   新 session 第一步建议
 
@@ -414,12 +427,12 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
   4. `git log --oneline -10` 确认最新 commit
   5. 看 results/cross_summary/report.md + plots/ 把握 3-way 实验结论
   6. 选下一个 phase：
-     - QuaRoT CUDA 加速（去掉 Python butterfly 瓶颈，最有性价比的提升）
-     - 单变体 attribution eval（smooth-only / quarot-only / static-only）补全 Phase 39
-     - Phase 28-29（W4A8 重建 + eval）—— 跟 Part V/VI 正交
-     - Phase 40 mixed-precision —— 长期研究入口
+     - Phase 41 Text encoder CPU offload —— 最快可见 VRAM win (-11 GB)
+     - Phase 28-29 W4A8 重建 + eval —— in-scope paper variant
+     - Phase 40 mixed-precision —— optional，W4A8 后续
   7. 用户偏好：让用户执行需要交互的命令（pip install、nvcc build、eval），
-     claude 只读结果改代码；smoke 可以由 claude 自跑
+     claude 只读结果改代码；smoke 可以由 claude 自跑；迁移复现 stance，
+     不做超 paper 的 kernel / algorithm 优化
 
   其他散碎交接信息
 

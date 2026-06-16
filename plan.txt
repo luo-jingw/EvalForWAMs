@@ -2254,10 +2254,36 @@ Done    3-way demo_randomized run (bf16 + viditq_w8a8_dynamic +
             (--op_profile) + roofline (--measured_flops). Architecture-
             estimated op_breakdown and stage-level compute_breakdown
             have been deleted as they did not reflect ground truth.
-Pending Single-variant attribution (smooth-only / quarot-only /
-        viditq-without-static) for finer -0.2 pp dynamic decomposition.
+Pending None. Stance: reproducing ViDiT-Q paper, not optimizing it.
+        Single-variant attribution explicitly DROPPED per PI direction.
 
-Phase 40 (optional, follow-up): Mixed-precision per-layer bit allocation
+Phase 41: Text encoder CPU offload (deployment, in-scope reproduction)
+Target  Free the 11 GB UMT5-XXL text encoder from GPU after _reset()
+        captures the prompt embedding. Encoder is unused for the rest
+        of the rollout (text_emb is fed into cross-attn as a small
+        tensor; only the cached output is needed).
+        Expected VRAM peak drop: 31.2 -> 20.2 GB (bf16) /
+                                 27.7 -> 16.7 GB (W8A8).
+        Fairness vs ViDiT-Q: paper only specifies the weight + linear
+        activation quantization scheme; it does NOT constrain text
+        encoder GPU residency. Diffusers' enable_model_cpu_offload is
+        the standard video-diffusion deployment pattern. No conflict
+        with ViDiT-Q algorithm; recorded as deployment-only optimization.
+Add     (none; modify server.py only)
+Modify  PTQEval/ptqeval/wam/lingbot_va/server.py
+          - In _reset(): after self.text_emb = self.text_encoder(...)
+            call self.text_encoder.cpu() (or del + gc.collect() if
+            we won't need it across episodes; reload from disk on next
+            reset costs ~10s once per episode)
+          - Verify text_emb stays on GPU as a small tensor (~0.6 MB)
+Verify  bf16 + W8A8 peak_alloc_mb drops by ~11 GB in summary.csv;
+        SR unchanged (text_emb is the only thing cross-attn consumes,
+        and we still produce it identically).
+
+Phase 40 (optional, after Phase 28-29 W4A8): Mixed-precision per-layer bit allocation
+Note    Beyond ViDiT-Q paper scope. Only triggers if Phase 29 W4A8
+        SR loss is unacceptable -- use W8 for the K% most sensitive
+        layers, W4 elsewhere.
 Target  Port quant_utils/qdiff/base/mixed_precision_quantizer.py +
         quant_model.py's layer_name_regex dispatch. Two sub-tasks:
           a) Sensitivity scoring: per-Linear,
