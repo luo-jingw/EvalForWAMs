@@ -264,23 +264,40 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
   | viditq dynamic   | 2759 (57%) | 235 (5%) | **100 (2%)**   | 1728 (36%) | 4822 ms |
   | viditq static    | 2723 (57%) | 245 (5%) | **100 (2%)**   | 1740 (36%) | 4807 ms |
 
-  Roofline (FlopCounterMode-measured FLOPs/call = 236.6 TF + profile-measured
-  memcpy bytes for AI; A6000 BF16 TC 154.8 TFLOPS / INT8 TC 309.7 TOPS dense
-  peak):
+  Roofline (multi-chunk steady-state FlopCounterMode: 291.4 TF/call after
+  36-chunk warmup; AI 分母 = weight + hook-measured KV/attn I/O (596.6 GB) +
+  inter-block activation (5.8 GB) + profile memcpy; A6000 BF16 TC 154.8
+  TFLOPS / INT8 TC 309.7 TOPS dense peak):
 
-  | variant | Throughput | % of relevant TC peak |
+  | variant | AI (F/B) | Throughput | % of relevant TC peak | Region |
+  |---|---|---|---|---|
+  | bf16            | ~140 | 43 TFLOPS | **42.7%** BF16 TC peak | memory-bound (left of knee 200) |
+  | viditq dynamic  | ~440 | 61 TFLOPS | **19.6%** INT8 TC peak | compute-bound |
+  | viditq static   | ~440 | 72 TFLOPS | **23.2%** INT8 TC peak | compute-bound |
+
+  VRAM peak spatial breakdown (analytical: text+VAE 来自 disk size，
+  transformer 来自 N_PARAMS×dtype-mix，KV cache 来自 attn_window=72 × 24192
+  tokens × 24 heads × 128 d × bf16 × 30 layers × 2 (K+V) = 8.92 GB；
+  activation+scratch 是残差 = 实测 peak - 上述和；完美对齐到 <3% off):
+
+  | variant | Text enc | Xfmr weights | KV cache | VAE | Act+scratch | Total |
+  |---|---|---|---|---|---|---|
+  | bf16            | 11.0 GB (34%) | 10.2 GB (31%) | 8.9 GB (27%) | 2.7 GB (8%) | ~0 | 32.8 GB |
+  | viditq dynamic  | 11.0 GB (39%) | 5.4 GB (19%)  | 8.9 GB (32%) | 2.7 GB (10%) | ~0 | 28.0 GB |
+  | viditq static   | 11.0 GB (39%) | 5.4 GB (19%)  | 8.9 GB (32%) | 2.7 GB (10%) | ~0 | 28.0 GB |
+
+  Floor (text + KV + VAE 全部未量化) = 22.6 GB；W8A8 在 transformer 上的
+  savings 上限 = -4.8 GB；要再降 VRAM 必须做 KV int8 量化（省 ~4.5 GB）
+  或 text-encoder CPU offload（省 11 GB，一次性 reload 开销 ~10s/episode）。
+
+  FLOP composition (multi-chunk steady-state, by_op_tf_per_call Global-only;
+  与 1-frame baseline 1.86% attention 显著不同):
+
+  | op | TF/call | % |
   |---|---|---|
-  | bf16            | 50 TFLOPS | 31.6% BF16 TC peak (near BW knee) |
-  | viditq dynamic  | 67 TFLOPS | 21.8% INT8 TC peak (compute bound) |
-  | viditq static   | 65 TFLOPS | 21.2% INT8 TC peak |
-
-  VRAM peak breakdown (实测 from PerfProbe init_peak + max-stage peak_alloc):
-
-  | variant | Weights | Transient (activations + KV + scratch) | Total |
-  |---|---|---|---|
-  | bf16            | 22.7 GB | 8.5 GB (vae_encode stage peak) | 31.2 GB |
-  | viditq dynamic  | 22.5 GB | 5.3 GB | 27.7 GB |
-  | viditq static   | 22.5 GB | 5.3 GB | 27.7 GB |
+  | aten.addmm (Linear)                      | 231.59 | 79.5% |
+  | aten._scaled_dot_product_flash_attention | 59.80  | 20.5% |
+  | aten.bmm + 其它                          | 0.001  | <0.1% |
 
   关键 findings (从实测数据看 quant 的真实加速来源):
 
@@ -292,15 +309,33 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
     1.00→0.36。calib_data 用 demo_clean 跟 demo_randomized 跑出 SR 几乎相同
     (0.587/0.584)，说明不是分布 mismatch，是 static 方法本身 limit
   - **w8a8 加速主要来自 Memcpy DtoD 砍 24×**（2410→100 ms/call），不是 Linear
-    GEMM (仅 1.06×)。原因：bf16 weight 10 GB 时 PyTorch allocator
-    (expandable_segments) 频繁 reallocate KV cache 触发 device-to-device copy；
-    int8 weight 5 GB 后 allocator 压力减半，KV cache memcpy 几乎消失
-  - **W8A8 GEMM kernel 效率 21.8% int8 peak < cuBLAS bf16 31.6% bf16 peak**：
+    GEMM (仅 1.06×)。**真正原因（修正）**：ViDiT-Q W8A8 kernel
+    (`GemmInt8SharedRegPipelineV2`) 使用 `has_bias=true` 模板，把 bias-add
+    融入 GEMM kernel 的 register accumulation (`psums += bias`，见
+    `kernel/csrc/w8a8/w8a8_gemm.cu:446-528`)，与上游 ViDiT-Q `w8a8_gemm_cuda.cu`
+    逐字一致。bf16 路径走 cuBLAS addmm，需要把 bias 暂存到 output buffer
+    (每 linear forward → 1 个 ~37us 小 Memcpy DtoD × 6 linear/block × 30 layer ×
+    77 forward × 5 ep × 5 test ≈ 324K launches/task)。bias-fusion 是业界量化
+    kernel 标配 (FlashAttention/AWQ/SmoothQuant/SVDQuant 通用做法)，
+    ViDiT-Q 遵循而非独创，但作为 ViDiT-Q 部署方案的一部分对比是公平的。
+    （注：先前文档归因为 "allocator 压力减半" 是错的，已修正）
+  - **W8A8 GEMM kernel 效率 19.6% int8 peak < cuBLAS bf16 42.7% bf16 peak**：
     int8 硬件理论 2× 加速没有完整转化为相应加速。Linear GEMM 在 W8A8 上反而
     跟 bf16 GEMM 时间几乎一样 (2759 vs 2926 ms)。kernel 优化空间巨大
-  - **attention 跨 variant 几乎不变** (235/235/245 ms)：attention 走 bf16
-    flash_fwd_kernel，量化覆盖不到 → KV cache 也是 bf16 (跟 ViDiT-Q paper W8A8
-    设计一致；attention map int8 是 paper W8A8B8 扩展，未实现)
+  - **attention wall-time 跨 variant 几乎不变** (235/235/245 ms)：attention 走
+    bf16 flash_fwd_kernel，量化覆盖不到 → KV cache 也是 bf16 (跟 ViDiT-Q paper
+    W8A8 设计一致；attention map int8 是 paper W8A8B8 扩展，未实现)
+  - **Attention wall-time 占比 (3-5%) 远低于 FLOP 占比 (20.5%)** = 三因素叠加:
+    (1) flash-attn TC 利用率远高于 batch=1 cuBLAS GEMM，单位 FLOP 跑得快；
+    (2) chunked KV-cached rollout 下单次 attn S_kv ≈ 1000，远小于 DeltaQuant
+    Wan2.2 的 72K tokens (O(S²) vs O(S) 在小 S 下 Linear 占优；DeltaQuant
+    那张 Fig 3 是 attention 占 80.9% 完全反过来)；
+    (3) Algorithm 1 中 16 forwards/chunk 里有 10 个是 action forward
+    (S_action≈32，attention 几乎为 0)，平均下来 attention 时间被拉低
+  - **Op "other" 在 W8A8 反而变大** (1385→1728 ms, +343 ms)：W8A8 的
+    act_quant kernel (per-token int8 scale 计算 + 量化) 算到 other 里 → INT8
+    GEMM 省下的部分时间被 act_quant overhead 抵消，最终 wall-time speedup
+    1.37× 而非理论 1.96×
 
   工程优化（Phase 39 后期，已合并）:
 
@@ -315,8 +350,21 @@ LingBot-VA × ViDiT-Q 量化项目 — 高层交接说明
   - profile_ops 集成进 eval pipeline (server.py 加 --profile_ops，wrap 前 5
     个 post-warmup infer call in torch.profiler，dump
     <perf_log_dir>/<task>_op_profile.json 含 4-class kernel breakdown)
-  - measure_flops 独立 script (FlopCounterMode dispatcher-level FLOP count，
-    ~3min one-shot)，输出 results/measured_flops.json
+  - measure_flops 独立 script (FlopCounterMode dispatcher-level FLOP count
+    + WanAttention / WanTransformerBlock byte hooks for KV/activation
+    bytes，~5-10 min multi-chunk one-shot：reset 一次 → warmup 36 chunks 填
+    KV cache 到 attn_window/2 → 接 measure 3 chunks 用 server._infer 显式
+    传 frame_st_id 模拟 generate() 流程)，输出 results/measured_flops.json
+    含 flops_per_call_tf + bytes_per_call_b{kv_attention_bytes_b,
+    block_activation_bytes_b}
+  - calc_cross_ckpt --measured_flops 同时消费 FLOPs + KV/act bytes：roofline
+    AI 分母 = weight_bytes(variant) + measured KV (596 GB) + measured act
+    (5.8 GB) + profile memcpy；by_op 切到 fcm.flop_counts['Global']（旧
+    iteration 遍历所有模块导致 5× overcount）
+  - calc_cross_ckpt memory_breakdown 改成空间分解 (4 + residual segments)：
+    text encoder / transformer weights / KV cache / VAE / activation+scratch
+    替代之前的 init+transient 时间分解（PI 要的是 "32GB 的 breakdown"，
+    时间维度答不了）
   - scripts/eval_speed.sh 串行跑 3 个 model × test_num=5 × --profile_ops，
     结果落到 *_speed/，不污染正式 25 ep 数据
   - cross_summary 7 张图全部用实测数据：sr/total_ms/speedup/latency_distribution

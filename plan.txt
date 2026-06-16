@@ -2178,18 +2178,56 @@ Done    3-way demo_randomized run (bf16 + viditq_w8a8_dynamic +
           bf16      2926     236         2410         1385    6956
           dynamic   2759     235         100          1728    4822
           static    2723     245         100          1740    4807
-        => w8a8 speedup comes mainly from Memcpy DtoD collapsing 24x
-        (KV cache reallocate pressure halved when weight memory drops
-        from 10 GB to 5 GB). Linear GEMM itself barely speeds up
-        (~1.06x) because cuBLAS bf16 GEMM beats our W8A8 GEMM kernel
-        utilization (BF16 31.6% peak vs INT8 21.8% peak on A6000).
-        Attention is variant-invariant (bf16 flash_fwd_kernel for all).
-        Roofline (FlopCounterMode-measured 236.6 TF/call):
-          - bf16   50 TFLOPS, 31.6% of BF16 TC peak 154.8 TFLOPS
-          - dynamic 67 TFLOPS, 21.8% of INT8 TC peak 309.7 TOPS
-          - static 65 TFLOPS, 21.2% of INT8 TC peak
-        VRAM peak: bf16 31.2 GB (22.7 weights + 8.5 transient);
-        w8a8 27.7 GB (22.5 + 5.3); transient peak in vae_encode.
+        => w8a8 speedup comes mainly from Memcpy DtoD collapsing 24x.
+        CORRECTION (Phase 39b): the real cause is bias-fusion in the
+        ViDiT-Q W8A8 GEMM kernel (`GemmInt8SharedRegPipelineV2` with
+        `has_bias=true` template, ports upstream `w8a8_gemm_cuda.cu`).
+        cuBLAS bf16 addmm stages bias into the output buffer via a
+        separate ~37us Memcpy DtoD per linear forward; the W8A8 kernel
+        folds it into register accumulation (psums += bias), eliminating
+        ~324K small memcpy launches/task. NOT allocator reallocate
+        pressure (prior hypothesis was wrong; verified via kernel source
+        grep). Bias-fusion is industry-standard for custom quant GEMM
+        kernels (FlashAttention/AWQ/SmoothQuant/SVDQuant all do this),
+        ViDiT-Q follows the convention; comparison is fair as a deployment
+        comparison.
+        Linear GEMM itself barely speeds up (~1.06x) because cuBLAS bf16
+        beats our W8A8 GEMM kernel utilization (BF16 42.7% peak vs INT8
+        19.6% peak on A6000, both numbers from multi-chunk steady-state
+        roofline).
+        Other variant-invariant findings: attention wall-time is variant-
+        invariant (bf16 flash_fwd_kernel for all). Other category grows
+        +343 ms in W8A8 because act_quant kernel (per-token int8 scale
+        derivation) is W8A8-only and lands there.
+        Roofline (multi-chunk FlopCounterMode 291.4 TF/call, AI denom =
+        weight + measured KV/attn I/O 596 GB + activation 5.8 GB + memcpy):
+          - bf16   AI ~140 F/B, 43 TFLOPS, 42.7% of BF16 TC peak 154.8 TFLOPS
+                                          (memory-bound, left of knee 200)
+          - dynamic AI ~440 F/B, 61 TFLOPS, 19.6% of INT8 TC peak 309.7 TOPS
+                                          (compute-bound)
+          - static  AI ~440 F/B, 72 TFLOPS, 23.2% of INT8 TC peak
+                                          (compute-bound)
+        FLOP composition (multi-chunk steady-state by_op_tf_per_call):
+          Linear (aten.addmm)              231.59 TF (79.5%)
+          Attention (aten._sdpa_flash)      59.80 TF (20.5%)
+          Other (bmm + ...)                 ~0      (<0.1%)
+        => attention占 FLOPs 20.5% but only 3-5% wall-time because
+        (1) flash-attn TC utilization >> batch=1 cuBLAS GEMM per FLOP,
+        (2) chunked KV-cached rollout caps per-call S ~ 1000 (vs DeltaQuant
+        Wan2.2 72K, attention 80.9%), O(S²) doesn't dominate at small S,
+        (3) action forwards (10/16 per chunk) have S_action≈32 so attention
+        is near-zero compute there.
+        VRAM peak SPATIAL breakdown (analytical, matches measured to <3%):
+                          Text  Xfmr  KV    VAE   Act+scr  Total
+          bf16            11.0  10.2   8.9   2.7   ~0      32.8 GB
+          dynamic         11.0   5.4   8.9   2.7   ~0      28.0 GB
+          static          11.0   5.4   8.9   2.7   ~0      28.0 GB
+        Floor (text + KV + VAE, all unquantized in our W8A8 path) =
+        22.6 GB. W8A8 only moves transformer weights -> caps at -4.8 GB
+        savings. Next levers: KV int8 quant (-4.5 GB orthogonal to
+        ViDiT-Q), text encoder CPU offload (-11 GB, single reload ~10s
+        per episode; encoder unused after _reset()'s one-shot text
+        embed pass).
         results/cross_summary/{report.md, cross_summary.csv, plots/}
         Engineering improvements landed alongside:
           - quarot.py: fast_hadamard_transform CUDA path (Python fp64

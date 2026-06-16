@@ -295,6 +295,8 @@ def _make_plots(
     step_limits: dict[str, int],
     op_data: dict[str, dict[str, float]] | None = None,
     measured_flops_tf: float | None = None,
+    measured_kv_bytes: float | None = None,
+    measured_act_bytes: float | None = None,
 ) -> list[tuple[str, str]]:
     """Renders charts under <out_dir>/plots/:
       1. sr_by_task.png           per-task SR per variant
@@ -533,6 +535,16 @@ def _make_plots(
         memcpy_ms = float(entry.get("memcpy", 0.0))
         return memcpy_ms * 1e-3 * _DTOD_BW_GBS * 1e9
 
+    # KV-cache + attention I/O + inter-block activation R/W from the
+    # measure_flops hook. Dtype-invariant across variants because
+    # ViDiT-Q keeps the attention path + inter-block hidden_states at
+    # bf16. None when measure_flops JSON predates the hook.
+    measured_extra_b = 0.0
+    if measured_kv_bytes is not None:
+        measured_extra_b += float(measured_kv_bytes)
+    if measured_act_bytes is not None:
+        measured_extra_b += float(measured_act_bytes)
+
     # VLA-paper Fig 2 idiom (Williams roofline): one circle per
     # variant, ceilings as solid piecewise lines clipped to where each
     # bound is actually active, regions tinted with light shading,
@@ -609,7 +621,7 @@ def _make_plots(
     for idx, tag in enumerate(tags):
         wbytes = _weight_bytes(tag)
         weight_bytes = N_PARAMS * wbytes
-        extra_bytes = _extra_bytes_from_profile(tag)
+        extra_bytes = _extra_bytes_from_profile(tag) + measured_extra_b
         ai = flops_per_call / (weight_bytes + extra_bytes)
         t_ms = statistics.mean(
             summaries[tag][t].mean_transformer_ms + summaries[tag][t].mean_action_head_ms
@@ -654,16 +666,27 @@ def _make_plots(
     # it shows in the standalone PNG even when the report.md embed
     # strips off ax titles.
     fig.subplots_adjust(top=0.92, bottom=0.18)
-    ai_caption_suffix = (" + profile-measured memcpy bytes "
-                          f"({_DTOD_BW_GBS:.0f} GB/s effective DtoD BW)"
-                          if op_data is not None else
-                          " (weight bytes only; KV-cache / activation "
-                          "traffic not counted -- AI over-estimated)")
+    # Build AI-denominator description that matches what was actually
+    # added per-variant above (weight + optional KV/activation +
+    # optional memcpy). Keeps caption honest about scope.
+    ai_parts = ["weight bytes"]
+    if measured_kv_bytes is not None or measured_act_bytes is not None:
+        kv_gb = (float(measured_kv_bytes or 0)) / 1e9
+        act_gb = (float(measured_act_bytes or 0)) / 1e9
+        ai_parts.append(
+            f"hook-measured KV/attn I/O ({kv_gb:.2f} GB) + "
+            f"inter-block activation ({act_gb:.2f} GB)")
+    if op_data is not None:
+        ai_parts.append(f"profile memcpy ({_DTOD_BW_GBS:.0f} GB/s effective)")
+    if measured_kv_bytes is None and measured_act_bytes is None and \
+            op_data is None:
+        ai_parts.append("KV/activation NOT counted -- AI over-estimated")
+    ai_caption = " + ".join(ai_parts)
     fig.text(
         0.5, 0.02,
         f"Each dot is one variant: arithmetic intensity = FLOPs / "
-        f"(weight bytes{ai_caption_suffix}); throughput = FLOPs / "
-        f"measured transformer+action_head time. FLOPs measured by "
+        f"({ai_caption}); throughput = FLOPs / measured "
+        f"transformer+action_head time. FLOPs measured by "
         f"FlopCounterMode ({flops_per_call/1e12:.1f} TF/call). Label "
         f"shows the achieved fraction of the relevant tensor-core peak "
         f"(bf16 peak for bf16-weight variants, int8 peak for w8a8 variants).",
@@ -675,79 +698,140 @@ def _make_plots(
     charts.append(("Roofline (achieved throughput vs arithmetic intensity, A6000)",
                    "plots/roofline.png"))
 
-    # ------ Chart 6: Memory breakdown (model weights + transient) ------
-    # Two-segment stacked horizontal bar per variant decomposing the
-    # observed VRAM peak into model weights (init_peak_mb, never freed)
-    # and the additional activations/KV cache/scratch buffer (peak -
-    # init). Uses summary.csv fields only -- no extra instrumentation.
-    seg_weights = [
-        statistics.mean(summaries[tag][t].init_peak_mb for t in sorted_tasks)
+    # ------ Chart 6: Memory breakdown (spatial, analytical) ------
+    # Decompose the observed VRAM peak into the four physical
+    # components that actually occupy it (per PI question: "how is the
+    # breakdown of the 32 GB peak VRAM"). Quantities are computed from
+    # model architecture + KV-cache config, then validated against the
+    # measured peak; the gap goes to a residual "activations + scratch"
+    # segment so the bar lengths match summary.csv exactly.
+    #
+    #   Text encoder (UMT5-XXL)    : 11.0 GB const  (not quantized in ViDiT-Q)
+    #   Transformer weights        : per-variant (bf16 ~10 GB, W8A8 ~5.5 GB)
+    #   KV cache                   : 8.92 GB const  (attn_window=72,
+    #                                                frame_chunk_size=2,
+    #                                                latent 32x40, action=16,
+    #                                                30 layers, 24 heads,
+    #                                                head_dim=128, bf16)
+    #   VAE (AutoencoderKLWan)     : 2.7 GB const
+    #   Activations / scratch / frag: measured_peak - sum(above)
+    _TEXT_ENCODER_GB = 11.0     # disk: text_encoder/ ~ 11 GB; fp16/bf16 weights, loaded on GPU
+    _VAE_GB          = 2.7      # disk: vae/ ~ 2.7 GB
+    _KV_CACHE_GB     = 8.92     # 30 layers * 2 (K+V) * B=1 * 24192 tokens * 24 H * 128 D * 2 bytes
+    _N_PARAMS_XFMR   = N_PARAMS  # 5.09e9 (defined in roofline block above)
+    # Fraction of transformer params that get quantized (everything
+    # inside the 30 WanTransformerBlocks; embedders / condition_embedder
+    # / proj_out / scale_shift_table stay FP per remain_fp_regex).
+    _XFMR_QUANT_FRAC = 0.95
+    _QUANT_META_GB = 0.03  # per-channel scales + smooth + Hadamard sign
+
+    def _xfmr_weight_gb(tag: str) -> float:
+        # bf16: all params at 2 bytes/param
+        # W8A8: quant_frac * 1 byte + (1-quant_frac) * 2 bytes + metadata
+        if tag.lower() in ("bf16", "fp16"):
+            return _N_PARAMS_XFMR * 2 / 1e9
+        return (_N_PARAMS_XFMR * _XFMR_QUANT_FRAC * 1 / 1e9
+                + _N_PARAMS_XFMR * (1 - _XFMR_QUANT_FRAC) * 2 / 1e9
+                + _QUANT_META_GB)
+
+    measured_peak_gb = [
+        statistics.mean(summaries[tag][t].peak_alloc_mb for t in sorted_tasks) / 1024.0
         for tag in tags
     ]
-    seg_transient = [
-        max(0.0, statistics.mean(summaries[tag][t].peak_alloc_mb for t in sorted_tasks)
-            - statistics.mean(summaries[tag][t].init_peak_mb for t in sorted_tasks))
-        for tag in tags
-    ]
-    fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 1.8)))
+
+    # 5 segments per bar in fixed left-to-right order. Last is the
+    # residual so the visualization always matches the measured total.
+    seg_names = ["Text encoder (UMT5)", "Transformer weights",
+                 "KV cache (self-attn)", "VAE", "Activations + scratch"]
+    seg_colors = ["#6b4596", "#1f78b4", "#ff7f00", "#33a02c", "#999999"]
+    seg_data = []  # list per variant: [text, xfmr, kv, vae, residual]  in GB
+    for idx, tag in enumerate(tags):
+        text = _TEXT_ENCODER_GB
+        xfmr = _xfmr_weight_gb(tag)
+        kv   = _KV_CACHE_GB
+        vae  = _VAE_GB
+        residual = max(0.0, measured_peak_gb[idx] - (text + xfmr + kv + vae))
+        seg_data.append([text, xfmr, kv, vae, residual])
+
+    fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 2.2)))
     y_pos = list(range(len(tags)))
-    mem_colors = ("#4a6fa5", "#e09f3e")  # weights (cool) + transient (warm)
-    mem_labels = ("Model weights (init peak, persistent)",
-                  "Activations + KV cache + scratch (transient peak)")
-    bar_max_mem = max(w + t for w, t in zip(seg_weights, seg_transient))
-    # Segment 1: weights.
-    ax.barh(y_pos, seg_weights, color=mem_colors[0],
-            label=mem_labels[0], edgecolor="white",
-            linewidth=1.0, height=0.85)
-    for i, w in enumerate(seg_weights):
-        if w >= 0.10 * bar_max_mem:
-            ax.text(w / 2, i,
-                    f"weights\n{w/1024:.1f} GB\n({w / (w + seg_transient[i]) * 100:.1f}%)",
-                    ha="center", va="center", fontsize=9.5,
-                    color="white", fontweight="bold")
-    # Segment 2: transient.
-    ax.barh(y_pos, seg_transient, left=seg_weights, color=mem_colors[1],
-            label=mem_labels[1], edgecolor="white",
-            linewidth=1.0, height=0.85)
-    for i, (t, w) in enumerate(zip(seg_transient, seg_weights)):
-        if t >= 0.05 * bar_max_mem:
-            tot = w + t
-            ax.text(w + t / 2, i,
-                    f"transient\n{t/1024:.1f} GB\n({t / tot * 100:.1f}%)",
-                    ha="center", va="center", fontsize=9.5,
-                    color="#1a1a1a", fontweight="bold")
-    # Total label at bar end.
-    for i, (w, t) in enumerate(zip(seg_weights, seg_transient)):
-        tot = w + t
-        ax.text(tot + 0.012 * bar_max_mem, i, f"{tot/1024:.1f} GB total",
+    bar_total_gb = [sum(row) for row in seg_data]
+    bar_max_gb = max(bar_total_gb)
+    for s_idx, (s_name, s_color) in enumerate(zip(seg_names, seg_colors)):
+        widths = [row[s_idx] for row in seg_data]
+        lefts  = [sum(row[:s_idx]) for row in seg_data]
+        ax.barh(y_pos, widths, left=lefts, color=s_color,
+                label=s_name, edgecolor="white",
+                linewidth=1.0, height=0.78)
+        # Inline label only when segment is big enough to fit text legibly.
+        for i, w in enumerate(widths):
+            if w >= 0.045 * bar_max_gb:
+                tot = bar_total_gb[i]
+                pct = w / tot * 100 if tot > 0 else 0
+                center = lefts[i] + w / 2
+                txt_color = "white" if s_idx in (0, 1, 3) else "#1a1a1a"
+                ax.text(center, i,
+                        f"{s_name.split(' (')[0]}\n{w:.1f} GB\n({pct:.0f}%)",
+                        ha="center", va="center", fontsize=8.5,
+                        color=txt_color, fontweight="bold")
+    # Total at bar right edge.
+    for i, tot in enumerate(bar_total_gb):
+        ax.text(tot + 0.012 * bar_max_gb, i, f"{tot:.1f} GB total",
                 va="center", fontsize=10, color="#333", fontweight="bold")
+    # Bf16 -> W8A8 savings arrow (skip if only one variant).
+    if len(tags) >= 2:
+        bf16_idx = next((i for i, t in enumerate(tags) if t.lower() in ("bf16", "fp16")), 0)
+        for j, tag in enumerate(tags):
+            if j == bf16_idx:
+                continue
+            saving = bar_total_gb[bf16_idx] - bar_total_gb[j]
+            if saving > 0.1:
+                ax.annotate(
+                    f"-{saving:.1f} GB ({saving / bar_total_gb[bf16_idx] * 100:.1f}%)",
+                    xy=(bar_total_gb[j], j),
+                    xytext=(bar_total_gb[bf16_idx] + 0.18 * bar_max_gb, j - 0.30),
+                    arrowprops=dict(arrowstyle="->", color="#b22222", lw=1.6,
+                                    connectionstyle="arc3,rad=-0.25"),
+                    fontsize=9.5, color="#b22222", fontweight="bold",
+                    ha="center", va="center")
+
     ax.set_yticks(y_pos)
     ax.set_yticklabels(tags, fontsize=11, fontweight="bold")
     ax.set_ylim(-0.6, len(tags) - 0.4)
     ax.invert_yaxis()
-    ax.set_xlabel("VRAM peak alloc (MB)", fontsize=10)
+    ax.set_xlabel("VRAM peak alloc (GB)", fontsize=10)
     ax.set_title("Per-variant VRAM peak breakdown "
-                 "(model weights vs runtime transient)",
+                 "(spatial decomposition of the 32 GB)",
                  fontsize=12, pad=8)
-    ax.legend(loc="lower right", framealpha=0.92, fontsize=9.5)
-    ax.set_xlim(0, bar_max_mem * 1.18)
+    ax.legend(loc="lower right", framealpha=0.92, fontsize=8.5, ncol=2)
+    ax.set_xlim(0, bar_max_gb * 1.32)
     ax.grid(True, axis="x", alpha=0.20)
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
-    fig.subplots_adjust(left=0.15, bottom=0.18)
-    fig.text(0.5, 0.02,
-             "Weights = init_peak_mb (PerfProbe samples allocator right "
-             "after model load). Transient = (max stage peak_alloc) - "
-             "(init peak), aggregating activations + KV cache + scratch + "
-             "fragmentation across the 5 stages (init / text_encoder / "
-             "vae_encode / transformer / action_head); on this workload "
-             "the transient peak falls in vae_encode.",
-             ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
+    fig.subplots_adjust(left=0.18, bottom=0.18)
+    floor_gb = _TEXT_ENCODER_GB + _KV_CACHE_GB + _VAE_GB
+    xfmr_cap_gb = _N_PARAMS_XFMR * 2 / 1e9 - _xfmr_weight_gb('viditq_w8a8')
+    fig.text(
+        0.5, 0.04,
+        f"Text encoder, VAE, KV cache: unquantized.  "
+        f"KV cache analytical: attn_window=72, 30 layers, 24 heads × 128 d, "
+        f"24192 tokens/layer, bf16.  "
+        f"Transformer: N_PARAMS={_N_PARAMS_XFMR/1e9:.2f}B, W8A8 quantizes "
+        f"~{_XFMR_QUANT_FRAC*100:.0f}% (remain_fp_regex).  "
+        f"Activations+scratch = residual.",
+        ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
+    fig.text(
+        0.5, 0.008,
+        f"Floor (text + KV + VAE) = {floor_gb:.1f} GB  •  "
+        f"W8A8-on-transformer cap = -{xfmr_cap_gb:.1f} GB  •  "
+        f"next levers: KV int8 quant / text-encoder CPU offload.",
+        ha="center", va="bottom", fontsize=8.5, color="#b22222",
+        fontstyle="italic")
     p_mem = os.path.join(plots_dir, "memory_breakdown.png")
     fig.savefig(p_mem, dpi=130)
     plt.close(fig)
-    charts.append(("VRAM peak breakdown per variant "
-                   "(model weights vs transient activations + KV)",
+    charts.append(("VRAM peak spatial breakdown per variant "
+                   "(text encoder / transformer / KV / VAE / scratch)",
                    "plots/memory_breakdown.png"))
 
     return charts
@@ -1359,16 +1443,29 @@ def main() -> int:
     # memcpy bytes for AI estimation (not just weight-bytes-only).
     op_data = _collect_op_profile(args.op_profile)
 
-    # Optional measured FLOPs/call from ptqeval.eval.measure_flops.
+    # Optional measured FLOPs/call AND measured bytes/call from
+    # ptqeval.eval.measure_flops. The bytes block is dtype-invariant
+    # (KV cache + inter-block activations stay bf16 even in W8A8) and
+    # is added to the roofline AI denominator on top of per-variant
+    # weight bytes.
     measured_flops_tf: float | None = None
+    measured_kv_bytes: float | None = None
+    measured_act_bytes: float | None = None
     if args.measured_flops and os.path.exists(args.measured_flops):
         try:
             with open(args.measured_flops) as f:
                 mf = json.load(f)
             measured_flops_tf = float(mf.get("flops_per_call_tf", 0)) or None
+            bpc = mf.get("bytes_per_call_b") or {}
+            measured_kv_bytes = float(bpc.get("kv_attention_bytes_b", 0)) or None
+            measured_act_bytes = float(bpc.get("block_activation_bytes_b", 0)) or None
             if measured_flops_tf:
-                print(f"loaded measured_flops: {measured_flops_tf:.2f} TF/call "
-                      f"from {args.measured_flops}")
+                msg = (f"loaded measured_flops: {measured_flops_tf:.2f} "
+                       f"TF/call from {args.measured_flops}")
+                if measured_kv_bytes or measured_act_bytes:
+                    msg += (f"; KV {measured_kv_bytes / 1e9:.2f} GB + "
+                            f"act {measured_act_bytes / 1e9:.2f} GB / call")
+                print(msg)
         except (OSError, json.JSONDecodeError, ValueError) as e:
             print(f"warning: --measured_flops unreadable: {e}")
 
@@ -1377,7 +1474,9 @@ def main() -> int:
         charts = _make_plots(args.out_dir, variant_specs, baseline_tag,
                              tasks, summaries, step_limits,
                              op_data=op_data,
-                             measured_flops_tf=measured_flops_tf)
+                             measured_flops_tf=measured_flops_tf,
+                             measured_kv_bytes=measured_kv_bytes,
+                             measured_act_bytes=measured_act_bytes)
 
         # Overlay a profiler-measured op_breakdown chart alongside the
         # architecture-estimated default when op_profile is available.
@@ -1398,14 +1497,13 @@ def main() -> int:
                 title=("Per-variant op-type measured kernel time "
                        "(Linear vs Attention)"),
                 caption=(
-                    f"Measured kernel time per inference call, aggregated "
-                    f"by torch.profiler over the first 5 post-warmup "
-                    f"infer() calls of each task and averaged across tasks "
-                    f"(sources: {srcs}). Linear = cuBLAS/cuBLASLt + W8A8 "
-                    f"GEMM kernels; Attention = SDPA / fused mha + softmax "
-                    f"kernels; Other = elementwise + layernorm + launch. "
-                    f"Profiler overhead inflates absolute ms -- compare "
-                    f"op-share within a variant, not absolute speed."
+                    "Memcpy ↓24×: W8A8 kernel fuses bias-add in-register; "
+                    "bf16 cuBLAS addmm stages bias via separate Memcpy DtoD "
+                    "(~37 us × 324K launches/task).\n"
+                    "Other = LayerNorm/RMSNorm + GELU + RoPE complex mul + "
+                    "residual/AdaLN elementwise + KV-cache slot scatter "
+                    "+ dtype cast (bf16↔fp32 for norms) + W8A8-only: "
+                    "act_quant kernel (per-token int8 scale, ~+350 ms vs bf16)."
                 ),
                 out_name="op_breakdown_measured.png",
             )
