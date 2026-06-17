@@ -59,6 +59,27 @@ torch::Tensor w8a8_obf16_nobias_weight_sym(
     torch::Tensor scale_weight
 );
 
+// w4a8/w4a8_gemm.cu (Phase 28: ViDiT-Q QServe W4A8 port + bf16).
+// scale_weight is fp16/bf16 [N], szeros_weight is fp16/bf16 [N]
+// (= scale_weight * zero_point_unsigned, precomputed at PTQ time).
+// Packed weight: int8 [N, K/2] in QServe pre-permuted layout.
+torch::Tensor w4a8_of16_nobias_weight_asym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight,
+    torch::Tensor sum_input,
+    torch::Tensor szeros_weight
+);
+torch::Tensor w4a8_obf16_nobias_weight_asym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight,
+    torch::Tensor sum_input,
+    torch::Tensor szeros_weight
+);
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "qwan_extension: BF16-native int8 GEMM kernels for LingBot-VA.";
@@ -156,4 +177,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("weight"),
           py::arg("scale_input"),
           py::arg("scale_weight"));
+
+    m.def("w4a8_of16_nobias_weight_asym",
+          &w4a8_of16_nobias_weight_asym,
+          "ViDiT-Q/QServe W4A8 GEMM (fp16 output, asym weight, no bias).\n"
+          "Computes y[m,n] = scale_input[m] * scale_weight[n] *\n"
+          "  sum_k(input_int8[m,k] * weight_int4_unsigned[n,k])\n"
+          "  - szeros_weight[n] * sum_input[m].\n"
+          "Shapes: input [M,K] int8, weight [N,K/2] int8 (QServe-packed),\n"
+          "  scale_input [M] fp16, scale_weight [N] fp16,\n"
+          "  sum_input [M] fp16 (= scale_input * sum_k(input_int8)),\n"
+          "  szeros_weight [N] fp16 (= scale_weight * zp_unsigned, precomputed).\n"
+          "Output [M,N] fp16. No bias variant; caller adds bias post-GEMM.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"),
+          py::arg("sum_input"),
+          py::arg("szeros_weight"));
+
+    m.def("w4a8_obf16_nobias_weight_asym",
+          &w4a8_obf16_nobias_weight_asym,
+          "W4A8 GEMM with bf16 output (Phase 28; mirrors w4a8_of16 in bf16).",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"),
+          py::arg("sum_input"),
+          py::arg("szeros_weight"));
 }

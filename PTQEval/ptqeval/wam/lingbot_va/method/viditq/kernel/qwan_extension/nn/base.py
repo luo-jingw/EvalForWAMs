@@ -1,16 +1,23 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 """Common base for kernel-backed quantized Linear modules.
 
-Subclasses (currently only qlinear_w8a8) specify the weight bit width
-and the GEMM kernel to call in forward. State (int_weight, scale_weight,
-zp_weight, bias) is registered as buffers here so state_dict serialization
-is uniform. Phase 28 will add qlinear_w4a8 as a second subclass.
+Subclasses (qlinear_w8a8, qlinear_w4a8) specify the weight bit width
+and the GEMM kernel to call in forward. State that is common to both
+(int_weight, scale_weight, bias) is registered as buffers here so
+state_dict serialization is uniform. Each subclass registers its own
+weight-zero-point representation in __init__ because the W8A8 and W4A8
+kernel epilogues consume the zero-point in DIFFERENT shapes:
 
-state_dict keys (Phase 26a-2, asym per-channel weight schema):
+  W8A8: `zp_weight int16 [C_out]`         (kernel: `+ a_sum * zp_b * b_scale`)
+  W4A8: `szeros_weight bf16 [C_out]`      (kernel: `- s_z * a_ssum`,
+                                           s_z precomputed = scale_w * zp_unsigned)
+
+state_dict keys common across both subclasses:
     int_weight   int8  [C_out, C_in_pack]   (C_in or C_in/2)
     scale_weight bf16  [C_out]
-    zp_weight    int16 [C_out]
     bias         bf16  [C_out]               (omitted when has_bias=False)
+
+Plus the subclass-specific zero-point buffer (see above).
 
 Optional Part VI preprocessing buffers (default None -> no-op):
     quarot_sign      int8  [C_in]            (Phase 37 QuaRoT sign vector;
@@ -64,14 +71,8 @@ class QuantWanLinearBase(nn.Module, ABC):
             torch.empty(out_features, dtype=torch.bfloat16),
             persistent=True,
         )
-        # Phase 26a-2: per-channel asymmetric weight quant; zp_weight is the
-        # short2-aligned zero point consumed by the W8A8 kernel's asym
-        # epilogue term `psums += a_sum * zp_b * b_scale`.
-        self.register_buffer(
-            "zp_weight",
-            torch.empty(out_features, dtype=torch.int16),
-            persistent=True,
-        )
+        # Subclass registers its own zero-point buffer (W8A8: zp_weight
+        # int16, W4A8: szeros_weight bf16). See subclass __init__.
         if has_bias:
             self.register_buffer(
                 "bias",

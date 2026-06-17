@@ -33,13 +33,17 @@ verified). Plan section 18.2's written formula has a typo; the formula
 implemented here is from ViDiT-Q upstream directly and is the
 authoritative one.
 
-Output: flat torch state_dict via torch.save. Up to 5 keys per quantized
-layer (Phase 37+):
-    <module_name>.int_weight     int8  [C_out, C_in] or [C_out, C_in/2]
+Output: flat torch state_dict via torch.save. Per quantized layer:
+    <module_name>.int_weight     int8  [C_out, C_in] (W8A8) or
+                                       [C_out, C_in/2] (W4A8, QServe layout)
     <module_name>.scale_weight   bf16  [C_out]
-    <module_name>.zp_weight      int16 [C_out]
+    <module_name>.zp_weight      int16 [C_out]   (W8A8 only)
+    <module_name>.szeros_weight  bf16  [C_out]   (W4A8 only;
+                                                  = scale_weight * zp_unsigned)
     <module_name>.bias           bf16  [C_out]   (omitted if absent)
     <module_name>.quarot_sign    int8  [C_in]    (only when --quarot)
+    <module_name>.act_channel_div bf16 [C_in]    (only when --smooth_quant)
+    <module_name>.act_scale_static bf16 [1]      (only when static_act)
 
 CLI:
     python -m ptqeval.wam.lingbot_va.method.viditq.ptq \\
@@ -71,10 +75,18 @@ logger = logging.getLogger("ptqeval.wam.lingbot_va.method.viditq.ptq")
 
 @dataclass
 class IntLayerEntry:
-    int_weight: torch.Tensor      # int8 [C_out, C_in] or [C_out, C_in/2]
+    int_weight: torch.Tensor      # int8 [C_out, C_in] (W8A8) or [C_out, C_in/2]
+                                  # in QServe-packed layout (W4A8)
     scale_weight: torch.Tensor    # bf16 [C_out]
-    zp_weight: torch.Tensor       # int16 [C_out]
     bias: Optional[torch.Tensor]  # bf16 [C_out] or None
+    # Exactly one of zp_weight (W8A8) and szeros_weight (W4A8) is set.
+    # The W4A8 epilogue (`- szeros * a_sum`, ViDiT-Q/QServe convention)
+    # uses scale_w * zp_unsigned precomputed at PTQ time; the W8A8
+    # epilogue (`+ a_sum * zp * b_scale`, ViDiT-Q signed convention)
+    # uses the raw int16 zero-point. Different kernels demand different
+    # types; loader matches the buffer name to the active subclass.
+    zp_weight: Optional[torch.Tensor] = None         # int16 [C_out] (W8A8 only)
+    szeros_weight: Optional[torch.Tensor] = None     # bf16 [C_out]  (W4A8 only)
     quarot_sign: Optional[torch.Tensor] = None       # int8 [C_in] or None
     act_channel_div: Optional[torch.Tensor] = None   # bf16 [C_in] (SmoothQuant
                                                      #   channel_mask) or None
@@ -126,7 +138,10 @@ def _per_channel_asym_quant(
 
 def _pack_int4_two_per_byte(w_int4: torch.Tensor) -> torch.Tensor:
     """w_int4: int8 [M, K] in [-8, 7], K even. Returns packed int8 [M, K/2]
-    with low nibble = col 2c, high nibble = col 2c+1, both signed."""
+    with low nibble = col 2c, high nibble = col 2c+1, both signed.
+
+    Used by the W8A8-derived signed W4 path (Phase 24d ; SUPERSEDED).
+    The kernel-active W4A8 path uses _pack_int4_qserve below."""
     M, K = w_int4.shape
     assert K % 2 == 0, f"K must be even for int4 packing, got {K}"
     w32 = w_int4.to(torch.int32)
@@ -134,6 +149,90 @@ def _pack_int4_two_per_byte(w_int4: torch.Tensor) -> torch.Tensor:
     high = w32[:, 1::2] & 0xF
     packed_u = ((high << 4) | low) & 0xFF
     return packed_u.to(torch.uint8).view(torch.int8).contiguous()
+
+
+def _per_channel_asym_quant_unsigned(
+    w_f32: torch.Tensor,
+    n_bits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Asymmetric per-channel UNSIGNED quant of W [C_out, C_in] in fp32.
+
+    Returns:
+      int_w  : uint8 [C_out, C_in], values in [0, 2^n_bits - 1]
+      scale  : bf16  [C_out]
+      zp_uns : uint8 [C_out]   (unsigned zero-point, in [0, 2^n_bits - 1])
+
+    Formula matches omniserve W4A8 from_linear per-channel branch +
+    QServe kernel epilogue convention `w_real = scale * (w_int - zp)`:
+        scale  = (W.amax(1) - W.amin(1)) / (n_levels - 1)
+        zp_uns = round(-W.amin(1) / scale).clamp(0, n_levels - 1)
+        W_int  = (round(W / scale) + zp_uns).clamp(0, n_levels - 1)
+    The kernel sees scale as bf16, so quantize against the bf16-rounded
+    scale to avoid PTQ-vs-runtime divergence at borderline values.
+
+    Note: this is DIFFERENT from _per_channel_asym_quant above. That one
+    produces signed int_w + signed zp matching the W8A8 kernel epilogue
+    `+ a_sum * zp * scale` (Phase 24b). The W4A8 QServe kernel uses
+    `- szeros * a_sum` with unsigned zp; the sign flips. Both formulas
+    are mathematically valid asym quants -- they differ in which side
+    of the dequant the zero-point is folded into.
+    """
+    if n_bits not in (4,):
+        raise ValueError(
+            f"_per_channel_asym_quant_unsigned: only n_bits=4 supported "
+            f"(QServe W4A8); got {n_bits}"
+        )
+    n_levels = 2 ** n_bits  # 16
+    max_int = n_levels - 1  # 15
+    x_max = w_f32.amax(dim=1)
+    x_min = w_f32.amin(dim=1)
+    delta = ((x_max - x_min) / max_int).clamp_min(1e-8)
+    scale_bf16 = delta.to(torch.bfloat16)
+    scale_eff = scale_bf16.to(torch.float32)
+    zp_uns_f = torch.round(-x_min / scale_eff).clamp(0, max_int)
+    int_w = (
+        torch.round(w_f32 / scale_eff.unsqueeze(1)) + zp_uns_f.unsqueeze(1)
+    ).clamp(0, max_int).to(torch.uint8)
+    zp_uns = zp_uns_f.to(torch.uint8)
+    return int_w, scale_bf16, zp_uns
+
+
+def _pack_int4_qserve(w_int_unsigned: torch.Tensor) -> torch.Tensor:
+    """QServe W4 weight pack. Verbatim from omniserve W4A8 from_linear
+    per-channel branch (lines 295-327 of
+    omniserve/modeling/layers/quantized_linear/w4a8_linear.py).
+
+    Layout: weight in_features-axis is reorganized into 32-channel groups
+    with intra-group permutation that matches m16n8k32 ldmatrix access
+    inside dense_kernel0::share_to_reg_one_stage_B.
+
+    Input  : uint8 [N, K] with values in [0, 15], N % 32 == 0, K % 32 == 0
+    Output : int8  [N, K/2] with packed nibbles ((hi<<4)|lo) interpreted
+             by the kernel after its 8-level reshape unpack.
+
+    Algorithm (verbatim from omniserve):
+      reshape  [N, K] -> [N/32, 2, 2, 8, K/32, 2, 4, 4]
+      permute  (0, 4, 3, 6, 1, 5, 2, 7)
+      permute  (0, 1, 2, 3, 5, 6, 7, 4)
+      pack     (X[..., 1] << 4) | X[..., 0]
+      reshape  -> [N/32, K/32, 32, 16] -> [N, K/2]
+    """
+    N, K = w_int_unsigned.shape
+    if N % 32 != 0:
+        raise ValueError(f"QServe W4 pack: N must be a multiple of 32, got {N}")
+    if K % 32 != 0:
+        raise ValueError(f"QServe W4 pack: K must be a multiple of 32, got {K}")
+
+    # Reshape into the 8-level layout that the kernel ldmatrix loads expect.
+    lw = w_int_unsigned.to(torch.int32)  # use int32 for << / | arithmetic
+    lw = lw.reshape(N // 32, 2, 2, 8, K // 32, 2, 4, 4)
+    lw = lw.permute(0, 4, 3, 6, 1, 5, 2, 7).contiguous()
+    lw = lw.permute(0, 1, 2, 3, 5, 6, 7, 4).contiguous()
+    # lw last dim is 4 (the inner 'pair' axis after both permutes); pack
+    # adjacent pairs into bytes.
+    packed = ((lw[..., 1] << 4) | (lw[..., 0] & 0xF)) & 0xFF
+    packed = packed.reshape(N // 32, K // 32, 32, 16).reshape(N, K // 2)
+    return packed.to(torch.uint8).view(torch.int8).contiguous()
 
 
 def _quantize_one(
@@ -166,20 +265,41 @@ def _quantize_one(
         w_f32 = w_f32 * smooth_channel_mask.to(w_f32.device, torch.float32).unsqueeze(0)
     if quarot_sign is not None:
         w_f32 = rotate_weight(w_f32, quarot_sign.to(w_f32.device))
-    int_w, scale_w, zp_w = _per_channel_asym_quant(w_f32, weight_bits)
-    if weight_bits == 4:
-        int_w = _pack_int4_two_per_byte(int_w)
+
     bias = (linear.bias.detach().to(torch.bfloat16).contiguous()
             if linear.bias is not None else None)
     quarot_out = (quarot_sign.detach().to(torch.int8).contiguous()
                   if quarot_sign is not None else None)
     smooth_out = (smooth_channel_mask.detach().to(torch.bfloat16).contiguous()
                   if smooth_channel_mask is not None else None)
+
+    if weight_bits == 4:
+        # Phase 28: ViDiT-Q/QServe W4A8 path. Unsigned per-channel asym
+        # quant + QServe weight pack + szeros = scale * zp_unsigned
+        # precomputed for the kernel epilogue `- szeros * a_sum`.
+        int_w_u, scale_w, zp_uns = _per_channel_asym_quant_unsigned(w_f32, n_bits=4)
+        packed = _pack_int4_qserve(int_w_u)
+        szeros = (
+            scale_w.to(torch.float32) * zp_uns.to(torch.float32)
+        ).to(torch.bfloat16).contiguous()
+        return IntLayerEntry(
+            int_weight=packed.contiguous(),
+            scale_weight=scale_w.contiguous(),
+            bias=bias,
+            zp_weight=None,
+            szeros_weight=szeros,
+            quarot_sign=quarot_out,
+            act_channel_div=smooth_out,
+        )
+
+    # W8A8: signed per-channel asym, kernel epilogue `+ a_sum * zp * scale`.
+    int_w, scale_w, zp_w = _per_channel_asym_quant(w_f32, weight_bits)
     return IntLayerEntry(
         int_weight=int_w.contiguous(),
         scale_weight=scale_w.contiguous(),
-        zp_weight=zp_w.contiguous(),
         bias=bias,
+        zp_weight=zp_w.contiguous(),
+        szeros_weight=None,
         quarot_sign=quarot_out,
         act_channel_div=smooth_out,
     )
@@ -314,7 +434,13 @@ def _flatten_to_state_dict(
     for name, e in entries.items():
         sd[f"{name}.int_weight"] = e.int_weight.cpu()
         sd[f"{name}.scale_weight"] = e.scale_weight.cpu()
-        sd[f"{name}.zp_weight"] = e.zp_weight.cpu()
+        # Exactly one of (zp_weight, szeros_weight) is set per entry; W8A8
+        # uses zp_weight int16, W4A8 uses szeros_weight bf16. Loader matches
+        # the key name to the active subclass's registered buffer.
+        if e.zp_weight is not None:
+            sd[f"{name}.zp_weight"] = e.zp_weight.cpu()
+        if e.szeros_weight is not None:
+            sd[f"{name}.szeros_weight"] = e.szeros_weight.cpu()
         if e.bias is not None:
             sd[f"{name}.bias"] = e.bias.cpu()
         if e.quarot_sign is not None:

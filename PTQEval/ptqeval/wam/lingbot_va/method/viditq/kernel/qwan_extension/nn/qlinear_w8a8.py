@@ -26,6 +26,17 @@ from qwan_extension.nn.base import QuantWanLinearBase
 class QuantWanLinearW8A8(QuantWanLinearBase):
     WEIGHT_BITS: int = 8
 
+    def __init__(self, in_features: int, out_features: int, has_bias: bool) -> None:
+        super().__init__(in_features, out_features, has_bias)
+        # Phase 26a-2: per-channel asymmetric weight quant; zp_weight is the
+        # short2-aligned zero point consumed by the W8A8 kernel's asym
+        # epilogue term `psums += a_sum * zp_b * b_scale`.
+        self.register_buffer(
+            "zp_weight",
+            torch.empty(out_features, dtype=torch.int16),
+            persistent=True,
+        )
+
     @staticmethod
     def _packed_in_features(in_features: int) -> int:
         return in_features
