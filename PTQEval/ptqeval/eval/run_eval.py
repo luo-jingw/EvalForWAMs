@@ -25,8 +25,8 @@ Examples:
   python -m ptqeval.eval.run_eval \\
       --mode pool \\
       --variant viditq \\
-      --variant_args .../runtime_args_w8a8_viditq.yaml \\
-      --save_root /home/arash/EvalForWAMs/results/viditq_w8a8_viditq
+      --variant_args .../runtime_args_w8a8_dynamic.yaml \\
+      --save_root /home/arash/EvalForWAMs/results/viditq_w8a8_dynamic
 """
 from __future__ import annotations
 
@@ -108,22 +108,36 @@ def parse_args() -> Config:
     p.add_argument("--server_env", default="lingbot-jw")
     p.add_argument("--client_env", default="RoboTwin-jw")
 
-    # --- optional op-level profiling ---
-    p.add_argument("--profile_ops", action="store_true",
-                   help="Forward --profile_ops to each server: wrap the "
-                        "first --profile_n_calls infer() calls in "
-                        "torch.profiler and dump op_profile.json (kernel "
-                        "ms classified into linear / attention / other). "
-                        "Off by default; profiler ~5-10x slowdown so "
-                        "only enable with small --test_num.")
+    # --- op-level profiling ---
+    # ON BY DEFAULT (since the workflow audit on 2026-06-17 showed that the
+    # earlier _speed sidecar pattern was a workaround, not the intended
+    # path). The profiler only wraps the first --profile_n_calls (default 5)
+    # post-warmup infer() calls; the remaining N x 25 ep x ~10 calls/ep run
+    # un-instrumented, so SR data is unaffected. One eval run now produces
+    # both the SR table AND op_breakdown.png without a separate test_num=5
+    # follow-up. Pass --no_profile_ops to disable explicitly.
+    p.add_argument("--profile_ops", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Wrap the first --profile_n_calls post-warmup infer "
+                        "calls in torch.profiler and dump op_profile.json "
+                        "(kernel ms classified into linear / attention / "
+                        "memcpy / other). Default ON; remaining calls run "
+                        "un-instrumented so SR is unaffected. Disable with "
+                        "--no-profile_ops.")
     p.add_argument("--profile_n_calls", type=int, default=5,
                    help="Number of post-warmup infer() calls to profile "
                         "per server when --profile_ops is on.")
 
     args = p.parse_args()
 
-    save_root = args.save_root
-    perf_log_dir = args.perf_log_dir if args.perf_log_dir else save_root / "perf"
+    # Resolve to absolute paths immediately. eval_client.py does
+    # os.chdir(ROBOTWIN_ROOT) on import, so any relative --save_root passed
+    # to the client subprocess would land under RoboTwin/ instead of the
+    # repo root (silently splitting res.json + visualization across the
+    # wrong tree from server-side perf JSONL written by the server cwd).
+    # Same logic for perf_log_dir / wam_model_path / variant_args / robotwin_root.
+    save_root = args.save_root.resolve()
+    perf_log_dir = (args.perf_log_dir if args.perf_log_dir else save_root / "perf").resolve()
     save_root.mkdir(parents=True, exist_ok=True)
     perf_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -138,10 +152,10 @@ def parse_args() -> Config:
         gpu_poll_interval=args.gpu_poll_interval,
         rerun_all=args.rerun_all,
         wam_name=args.wam_name,
-        wam_model_path=str(args.wam_model_path),
-        robotwin_root=str(args.robotwin_root),
+        wam_model_path=str(args.wam_model_path.resolve()),
+        robotwin_root=str(args.robotwin_root.resolve()),
         variant=args.variant,
-        variant_args=str(args.variant_args) if args.variant_args else "",
+        variant_args=str(args.variant_args.resolve()) if args.variant_args else "",
         task_list_name=args.task_list_name,
         task_config=args.task_config,
         server_env=args.server_env,

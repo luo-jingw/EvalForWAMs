@@ -19,8 +19,14 @@ _ATTENTION_TOKENS = (
     "attention_kernel",
 )
 _LINEAR_TOKENS = (
-    "gemm", "cublas", "cutlass", "w8a8", "qlinear",
+    "gemm", "cublas", "cutlass", "w8a8", "w4a8", "qlinear",
     "linear", "addmm", "mm_kernel", "mm_out", "act_quant",
+    # ViDiT-Q / QServe W4A8 kernel function name is literally
+    # `dense_kernel0<OutT, ...>` -- no GEMM substring, so without this
+    # token it would (and historically did) leak into the "other" bucket
+    # and falsely report W4A8 GEMM as ~1000ms/call of unaccounted-for
+    # overhead. Added 2026-06-17 after audit of W4A8 op_breakdown.
+    "dense_kernel",
 )
 _MEMCPY_TOKENS = ("memcpy",)
 

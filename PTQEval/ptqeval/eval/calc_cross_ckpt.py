@@ -706,8 +706,11 @@ def _make_plots(
     # measured peak; the gap goes to a residual "activations + scratch"
     # segment so the bar lengths match summary.csv exactly.
     #
-    #   Text encoder (UMT5-XXL)    : 11.0 GB const  (not quantized in ViDiT-Q)
-    #   Transformer weights        : per-variant (bf16 ~10 GB, W8A8 ~5.5 GB)
+    #   Text encoder (UMT5-XXL)    : 0 GB (Phase 41 CPU offload; was 11 GB)
+    #   Transformer weights        : per-variant from tag (bf16 2 byte/param,
+    #                                W8A8 1 byte/param quantized + 2 byte/param
+    #                                kept FP, W4A8 0.5 byte/param quantized +
+    #                                2 byte/param kept FP)
     #   KV cache                   : 8.92 GB const  (attn_window=72,
     #                                                frame_chunk_size=2,
     #                                                latent 32x40, action=16,
@@ -715,7 +718,10 @@ def _make_plots(
     #                                                head_dim=128, bf16)
     #   VAE (AutoencoderKLWan)     : 2.7 GB const
     #   Activations / scratch / frag: measured_peak - sum(above)
-    _TEXT_ENCODER_GB = 11.0     # disk: text_encoder/ ~ 11 GB; fp16/bf16 weights, loaded on GPU
+    # Phase 41: text encoder is CPU-offloaded so it contributes 0 to GPU peak
+    # at steady state. The variable name is kept for plot-segment continuity
+    # but the value reflects the offload.
+    _TEXT_ENCODER_GB = 0.0
     _VAE_GB          = 2.7      # disk: vae/ ~ 2.7 GB
     _KV_CACHE_GB     = 8.92     # 30 layers * 2 (K+V) * B=1 * 24192 tokens * 24 H * 128 D * 2 bytes
     _N_PARAMS_XFMR   = N_PARAMS  # 5.09e9 (defined in roofline block above)
@@ -726,11 +732,17 @@ def _make_plots(
     _QUANT_META_GB = 0.03  # per-channel scales + smooth + Hadamard sign
 
     def _xfmr_weight_gb(tag: str) -> float:
-        # bf16: all params at 2 bytes/param
-        # W8A8: quant_frac * 1 byte + (1-quant_frac) * 2 bytes + metadata
-        if tag.lower() in ("bf16", "fp16"):
+        # bf16:  all params at 2 bytes/param
+        # W8A8:  quant_frac * 1 byte/param   + (1-quant_frac) * 2 byte/param
+        # W4A8:  quant_frac * 0.5 byte/param + (1-quant_frac) * 2 byte/param
+        t = tag.lower()
+        if "bf16" in t or "fp16" in t:
             return _N_PARAMS_XFMR * 2 / 1e9
-        return (_N_PARAMS_XFMR * _XFMR_QUANT_FRAC * 1 / 1e9
+        if "w4a8" in t or "w4" in t:
+            quant_bytes = 0.5    # int4, two nibbles per byte
+        else:
+            quant_bytes = 1.0    # int8
+        return (_N_PARAMS_XFMR * _XFMR_QUANT_FRAC * quant_bytes / 1e9
                 + _N_PARAMS_XFMR * (1 - _XFMR_QUANT_FRAC) * 2 / 1e9
                 + _QUANT_META_GB)
 
