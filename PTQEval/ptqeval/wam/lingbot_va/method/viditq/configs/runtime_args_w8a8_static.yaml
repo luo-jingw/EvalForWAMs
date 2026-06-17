@@ -1,0 +1,4 @@
+# Runtime args for --variant viditq, paper-namesake "ViDiT-Q" method with
+# static activation (Phase 33; smooth + quarot + static composed).
+layer_config: /home/arash/EvalForWAMs/PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/w8a8_static.yaml
+int_weights_ckpt: /home/arash/EvalForWAMs/results/viditq_w8a8_static/calib/int_weights.pth

@@ -30,16 +30,16 @@ ${PY} -m ptqeval.eval.run_eval --mode pool \
 
 # --- viditq dynamic (SmoothQuant + QuaRoT, no static act) --------------
 ${PY} -m ptqeval.eval.run_eval --mode pool --variant viditq \
-    --variant_args ${CFG_DIR}/runtime_args_w8a8_viditq.yaml \
+    --variant_args ${CFG_DIR}/runtime_args_w8a8_dynamic.yaml \
     --task_config ${TASK_CONFIG} --test_num ${TEST_NUM} \
-    --save_root ${REPO}/results/viditq_w8a8_viditq_speed \
+    --save_root ${REPO}/results/viditq_w8a8_dynamic_speed \
     --profile_ops --profile_n_calls ${PROFILE_N}
 
 # --- viditq static (SmoothQuant + QuaRoT + static activation) ----------
 ${PY} -m ptqeval.eval.run_eval --mode pool --variant viditq \
-    --variant_args ${CFG_DIR}/runtime_args_w8a8_viditq_static.yaml \
+    --variant_args ${CFG_DIR}/runtime_args_w8a8_static.yaml \
     --task_config ${TASK_CONFIG} --test_num ${TEST_NUM} \
-    --save_root ${REPO}/results/viditq_w8a8_viditq_static_speed \
+    --save_root ${REPO}/results/viditq_w8a8_static_speed \
     --profile_ops --profile_n_calls ${PROFILE_N}
 
 echo
@@ -47,7 +47,7 @@ echo "All three speed runs complete."
 echo "Next: aggregator each + cross_summary_speed with --op_profile, e.g."
 echo
 cat <<'POST'
-for d in bf16_speed viditq_w8a8_viditq_speed viditq_w8a8_viditq_static_speed; do
+for d in bf16_speed viditq_w8a8_dynamic_speed viditq_w8a8_static_speed; do
     python -m ptqeval.eval.aggregator \
         --save_root results/${d} \
         --perf_log_dir results/${d}/perf \
@@ -56,10 +56,10 @@ done
 
 python -m ptqeval.eval.calc_cross_ckpt \
     --variant bf16=results/bf16_speed/summary/summary.csv \
-    --variant viditq_w8a8_dynamic=results/viditq_w8a8_viditq_speed/summary/summary.csv \
-    --variant viditq_w8a8_static=results/viditq_w8a8_viditq_static_speed/summary/summary.csv \
+    --variant viditq_w8a8_dynamic=results/viditq_w8a8_dynamic_speed/summary/summary.csv \
+    --variant viditq_w8a8_static=results/viditq_w8a8_static_speed/summary/summary.csv \
     --op_profile bf16=results/bf16_speed/summary/op_profile.json \
-    --op_profile viditq_w8a8_dynamic=results/viditq_w8a8_viditq_speed/summary/op_profile.json \
-    --op_profile viditq_w8a8_static=results/viditq_w8a8_viditq_static_speed/summary/op_profile.json \
+    --op_profile viditq_w8a8_dynamic=results/viditq_w8a8_dynamic_speed/summary/op_profile.json \
+    --op_profile viditq_w8a8_static=results/viditq_w8a8_static_speed/summary/op_profile.json \
     --out_dir results/cross_summary_speed
 POST
