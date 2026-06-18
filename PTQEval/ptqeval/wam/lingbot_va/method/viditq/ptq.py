@@ -458,7 +458,7 @@ def main() -> int:
         "WanTransformer3DModel. Output: torch state_dict at --output."
     )
     parser.add_argument("--model_path", type=str,
-                        default="/home/arash/EvalForWAMs/models/lingbot-va-posttrain-robotwin/transformer",
+                        default="models/lingbot-va-posttrain-robotwin/transformer",
                         help="Path to the diffusers transformer dir (the one with config.json).")
     parser.add_argument("--layer_config", type=str, required=True,
                         help="YAML with weight_bits and remain_fp_regex.")

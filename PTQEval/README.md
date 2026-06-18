@@ -3,10 +3,10 @@
 PTQ evaluation harness for World-Action Models (WAMs) on RoboTwin.
 Hosts WAM-agnostic eval pipeline, per-method quantization code, and
 per-WAM server / client forks. Third-party subrepos under
-`/home/arash/EvalForWAMs/{lingbot-va, RoboTwin, ViDiT-Q}/` remain
+`{lingbot-va, RoboTwin, ViDiT-Q}/` remain
 upstream-equivalent.
 
-Authoritative design doc: `/home/arash/EvalForWAMs/plan.txt`
+Authoritative design doc: `plan.txt`
 (Section 24 = layout, Section 25 = interfaces, Section 26 = migration phases).
 
 ## Layout
@@ -43,51 +43,51 @@ PTQEval/
 ```bash
 # One-time install (run in each conda env that imports ptqeval)
 conda activate lingbot-jw
-pip install -e /home/arash/EvalForWAMs/PTQEval/
+pip install -e PTQEval/
 
 conda activate RoboTwin-jw
-pip install -e /home/arash/EvalForWAMs/PTQEval/
+pip install -e PTQEval/
 
 # Build CUDA kernel (qwan_extension._C). sm_86; needs torch + nvcc.
 conda activate lingbot-jw
 pip install --no-build-isolation -e \
-    /home/arash/EvalForWAMs/PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/
+    PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/
 
 # Smoke (bf16 baseline; 1 task, 1 episode, GPU 4)
-SAVE_ROOT=/home/arash/EvalForWAMs/results/smoke_bf16 \
-ROBOTWIN_ROOT=/home/arash/EvalForWAMs/RoboTwin \
+SAVE_ROOT=results/smoke_bf16 \
+ROBOTWIN_ROOT=RoboTwin \
   python -m ptqeval.eval.run_eval \
     --mode smoke --task_name adjust_bottle --test_num 1 --gpu_id 4
 
 # Pool (15 tasks, 25 episodes, all usable GPUs)
-SAVE_ROOT=/home/arash/EvalForWAMs/results/bf16 \
-ROBOTWIN_ROOT=/home/arash/EvalForWAMs/RoboTwin \
+SAVE_ROOT=results/bf16 \
+ROBOTWIN_ROOT=RoboTwin \
   python -m ptqeval.eval.run_eval \
     --mode pool --min_free_mb 40000
 
 # Quant variant (viditq W8A8 example)
-SAVE_ROOT=/home/arash/EvalForWAMs/results/viditq_w8a8_kernel \
-ROBOTWIN_ROOT=/home/arash/EvalForWAMs/RoboTwin \
+SAVE_ROOT=results/viditq_w8a8_kernel \
+ROBOTWIN_ROOT=RoboTwin \
 VARIANT=viditq \
-VARIANT_ARGS=/home/arash/EvalForWAMs/PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8.yaml \
+VARIANT_ARGS=PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8.yaml \
   python -m ptqeval.eval.run_eval \
     --mode pool
 
 # Calibration data collection (Phase 31; 50 task x 5 ep on bf16)
 TASK_LIST_NAME=CALIB_TASKS_ALL \
-CALIBRATE_OUT=/home/arash/EvalForWAMs/results/calib_data/calib_data.pth \
-SAVE_ROOT=/home/arash/EvalForWAMs/results/calib_capture \
+CALIBRATE_OUT=results/calib_data/calib_data.pth \
+SAVE_ROOT=results/calib_capture \
   python -m ptqeval.eval.run_eval --mode pool --test_num 5
 
 # Aggregate
 python -m ptqeval.eval.aggregator \
-  --save_root /home/arash/EvalForWAMs/results/bf16 \
-  --perf_log_dir /home/arash/EvalForWAMs/results/bf16/perf \
-  --out_dir /home/arash/EvalForWAMs/results/bf16/summary
+  --save_root results/bf16 \
+  --perf_log_dir results/bf16/perf \
+  --out_dir results/bf16/summary
 
 # Live dashboard
-SAVE_ROOT=/home/arash/EvalForWAMs/results/bf16 \
-  watch -n 1 bash /home/arash/EvalForWAMs/PTQEval/ptqeval/eval/monitor.sh
+SAVE_ROOT=results/bf16 \
+  watch -n 1 bash PTQEval/ptqeval/eval/monitor.sh
 ```
 
 ## Env vars consumed by run_eval.py
@@ -95,8 +95,8 @@ SAVE_ROOT=/home/arash/EvalForWAMs/results/bf16 \
 | Var | Default | Purpose |
 |---|---|---|
 | `WAM_NAME` | `lingbot_va` | Picks `ptqeval.wam.<WAM_NAME>.*` |
-| `WAM_MODEL_PATH` | `/home/arash/EvalForWAMs/models/lingbot-va-posttrain-robotwin` | FP checkpoint dir |
-| `ROBOTWIN_ROOT` | `/home/arash/EvalForWAMs/RoboTwin` | RoboTwin sim root |
+| `WAM_MODEL_PATH` | `models/lingbot-va-posttrain-robotwin` | FP checkpoint dir |
+| `ROBOTWIN_ROOT` | `RoboTwin` | RoboTwin sim root |
 | `SAVE_ROOT` | `results/<variant_tag>` | Output root |
 | `PERF_LOG_DIR` | `${SAVE_ROOT}/perf` | Per-call perf JSONL dir |
 | `VARIANT` | unset | Quant variant; resolves to `ptqeval.wam.<WAM>.method.<VARIANT>.loader` |

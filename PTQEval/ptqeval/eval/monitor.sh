@@ -4,7 +4,7 @@
 # the most recently active log dir under SAVE_ROOT/logs/.
 set -u
 
-SAVE_ROOT="${SAVE_ROOT:-/home/arash/EvalForWAMs/results/bf16}"
+SAVE_ROOT="${SAVE_ROOT:-results/bf16}"
 PERF_LOG_DIR="${PERF_LOG_DIR:-${SAVE_ROOT}/perf}"
 
 strip_ansi() {

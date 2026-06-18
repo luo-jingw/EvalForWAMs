@@ -16,17 +16,17 @@ else; see --help.
 Examples:
   python -m ptqeval.eval.run_eval \\
       --mode smoke \\
-      --save_root /home/arash/EvalForWAMs/results/smoke_bf16
+      --save_root results/smoke_bf16
 
   python -m ptqeval.eval.run_eval \\
       --mode pool --test_num 25 \\
-      --save_root /home/arash/EvalForWAMs/results/bf16
+      --save_root results/bf16
 
   python -m ptqeval.eval.run_eval \\
       --mode pool \\
       --variant viditq \\
       --variant_args .../runtime_args_w8a8_dynamic.yaml \\
-      --save_root /home/arash/EvalForWAMs/results/viditq_w8a8_dynamic
+      --save_root results/viditq_w8a8_dynamic
 """
 from __future__ import annotations
 
@@ -74,11 +74,11 @@ def parse_args() -> Config:
     p.add_argument("--wam_name", default="lingbot_va",
                    help="Picks ptqeval.wam.<wam_name>.*.")
     p.add_argument("--wam_model_path", type=Path,
-                   default=Path("/home/arash/EvalForWAMs/models/"
+                   default=Path("models/"
                                 "lingbot-va-posttrain-robotwin"),
                    help="FP checkpoint dir passed to server.py --model_path.")
     p.add_argument("--robotwin_root", type=Path,
-                   default=Path("/home/arash/EvalForWAMs/RoboTwin"),
+                   default=Path("RoboTwin"),
                    help="RoboTwin simulator root.")
 
     # --- output ---

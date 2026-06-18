@@ -18,6 +18,6 @@ weight_pack: int8
 # Phase 36 SmoothQuant + Phase 37 QuaRoT, composed.
 smooth_quant: true
 smooth_alpha: 0.99
-calib_data_path: /home/arash/EvalForWAMs/results/calib_data/calib_data.pth
+calib_data_path: results/calib_data/calib_data.pth
 quarot: true
 quarot_seed_base: 0

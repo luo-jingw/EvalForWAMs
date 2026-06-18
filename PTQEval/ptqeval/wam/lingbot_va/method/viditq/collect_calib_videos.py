@@ -56,7 +56,7 @@ def parse_args() -> Config:
 
     # --- output ---
     p.add_argument("--save_root", type=Path,
-                   default=Path("/home/arash/EvalForWAMs/results/calib_capture"),
+                   default=Path("results/calib_capture"),
                    help="Calib corpus root: visualization + perf + logs.")
     p.add_argument("--perf_log_dir", type=Path, default=None,
                    help="Per-call perf JSONL dir. Default: <save_root>/perf.")
@@ -70,10 +70,10 @@ def parse_args() -> Config:
     # --- WAM + RoboTwin paths ---
     p.add_argument("--wam_name", default="lingbot_va")
     p.add_argument("--wam_model_path", type=Path,
-                   default=Path("/home/arash/EvalForWAMs/models/"
+                   default=Path("models/"
                                 "lingbot-va-posttrain-robotwin"))
     p.add_argument("--robotwin_root", type=Path,
-                   default=Path("/home/arash/EvalForWAMs/RoboTwin"))
+                   default=Path("RoboTwin"))
 
     # --- conda envs ---
     p.add_argument("--server_env", default="lingbot-jw")

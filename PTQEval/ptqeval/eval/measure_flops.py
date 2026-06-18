@@ -41,9 +41,9 @@ KV cache stayed empty).
 
 Usage (one shot, ~5-10 min including 36-chunk warmup):
     python -m ptqeval.eval.measure_flops \\
-        --videos_root /home/arash/EvalForWAMs/results/bf16 \\
+        --videos_root results/bf16 \\
         --warmup 36 --n_calls 3 \\
-        --output /home/arash/EvalForWAMs/results/measured_flops.json
+        --output results/measured_flops.json
 
 Output JSON schema:
     {
@@ -273,7 +273,7 @@ def main() -> int:
                         "frame_chunk_size=2), enough to fill the KV cache "
                         "to steady-state capacity.")
     p.add_argument("--model_path",
-                   default="/home/arash/EvalForWAMs/models/lingbot-va-posttrain-robotwin")
+                   default="models/lingbot-va-posttrain-robotwin")
     p.add_argument("--save_root", type=Path,
                    default=Path("/tmp/measure_flops_scratch"))
     p.add_argument("--output", required=True,

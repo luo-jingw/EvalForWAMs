@@ -8,7 +8,7 @@ from pathlib import Path
 
 # M5 fork: read RoboTwin root from env var instead of hardcoded path.
 robowin_root = Path(os.environ.get(
-    "ROBOTWIN_ROOT", "/home/arash/EvalForWAMs/RoboTwin"))
+    "ROBOTWIN_ROOT", "RoboTwin"))
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 

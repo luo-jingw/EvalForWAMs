@@ -1365,7 +1365,7 @@ def main() -> int:
                    help="Output directory. Writes cross_summary.csv, "
                         "cross_summary.json, report.md.")
     p.add_argument("--step_limit_yaml",
-                   default="/home/arash/EvalForWAMs/RoboTwin/task_config/_eval_step_limit.yml",
+                   default="RoboTwin/task_config/_eval_step_limit.yml",
                    help="Path to RoboTwin's _eval_step_limit.yml. When "
                         "readable, the per-task table gains a `Steps` "
                         "column and rows are sorted by step limit. Set "
@@ -1375,7 +1375,7 @@ def main() -> int:
                         "latency+speedup, speedup per task). Set if "
                         "matplotlib is unavailable or unwanted.")
     p.add_argument("--int_weights_ckpt",
-                   default="/home/arash/EvalForWAMs/results/viditq_w8a8_kernel/calib/int_weights.pth",
+                   default="results/viditq_w8a8_kernel/calib/int_weights.pth",
                    help="Path to a PTQ-produced int_weights.pth. When "
                         "readable, the report's Quantization Scope "
                         "section gains per-category parameter counts "

@@ -19,4 +19,4 @@ weight_pack: int8
 # Phase 36 SmoothQuant.
 smooth_quant: true
 smooth_alpha: 0.99
-calib_data_path: /home/arash/EvalForWAMs/results/calib_data/calib_data.pth
+calib_data_path: results/calib_data/calib_data.pth

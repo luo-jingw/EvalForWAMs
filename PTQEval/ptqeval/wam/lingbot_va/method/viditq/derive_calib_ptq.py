@@ -475,7 +475,7 @@ def main() -> int:
     )
     p.add_argument(
         "--videos_root", type=Path,
-        default=Path("/home/arash/EvalForWAMs/results/calib_capture"),
+        default=Path("results/calib_capture"),
         help="Root saved by collect_calib_videos.py "
              "(contains visualization/real/<prompt>_<ts>/ and "
              "stseed-*/visualization/<task>/...).",
@@ -497,7 +497,7 @@ def main() -> int:
     )
     p.add_argument(
         "--calib_out", type=Path,
-        default=Path("/home/arash/EvalForWAMs/results/calib_data/calib_data.pth"),
+        default=Path("results/calib_data/calib_data.pth"),
         help="Per-channel absmax dump path. Overwrites in place.",
     )
     p.add_argument(
@@ -514,7 +514,7 @@ def main() -> int:
     )
     p.add_argument(
         "--model_path",
-        default="/home/arash/EvalForWAMs/models/lingbot-va-posttrain-robotwin",
+        default="models/lingbot-va-posttrain-robotwin",
         help="FP bf16 transformer dir.",
     )
     p.add_argument(
