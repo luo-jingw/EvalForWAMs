@@ -39,7 +39,9 @@ datasets/
 **/.git_orig/
 
 # RoboTwin large simulation assets (meshes, urdfs, objaverse models)
-RoboTwin/assets/
+RoboTwin/assets/*
+!RoboTwin/assets/files
+!RoboTwin/assets/_download.py
 
 # Misc upstream noise
 RoboTwin/=0.49.1
