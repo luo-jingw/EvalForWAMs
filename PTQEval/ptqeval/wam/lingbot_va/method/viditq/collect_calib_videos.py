@@ -80,8 +80,16 @@ def parse_args() -> Config:
     p.add_argument("--client_env", default="RoboTwin-jw")
 
     args = p.parse_args()
-    save_root = args.save_root
-    perf_log_dir = args.perf_log_dir if args.perf_log_dir else save_root / "perf"
+
+    # Resolve to absolute paths immediately. eval_client.py does
+    # os.chdir(ROBOTWIN_ROOT) on import, so any relative --save_root passed
+    # to the client subprocess would land under RoboTwin/ instead of the
+    # repo root (silently splitting res.json + visualization across the
+    # wrong tree from server-side perf JSONL written by the server cwd).
+    # Same fix as run_eval.py:139 (eval workflow audit 2026-06-17);
+    # collect_calib_videos.py was missed in that pass.
+    save_root = args.save_root.resolve()
+    perf_log_dir = (args.perf_log_dir if args.perf_log_dir else save_root / "perf").resolve()
     save_root.mkdir(parents=True, exist_ok=True)
     perf_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -96,8 +104,8 @@ def parse_args() -> Config:
         gpu_poll_interval=args.gpu_poll_interval,
         rerun_all=args.rerun_all,
         wam_name=args.wam_name,
-        wam_model_path=str(args.wam_model_path),
-        robotwin_root=str(args.robotwin_root),
+        wam_model_path=str(args.wam_model_path.resolve()),
+        robotwin_root=str(args.robotwin_root.resolve()),
         variant="",                 # bf16: variant intentionally empty
         variant_args="",
         task_list_name=args.task_list_name,
