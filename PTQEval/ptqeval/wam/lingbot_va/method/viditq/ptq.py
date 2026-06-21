@@ -305,6 +305,34 @@ def _quantize_one(
     )
 
 
+def _resolve_layer_bits(
+    name: str,
+    bit_alloc: Optional[dict[int, list[str]]],
+    weight_bits_default: int,
+) -> int:
+    """Resolve per-Linear bits via bit_alloc prefix-match table.
+
+    bit_alloc maps int (4 or 8) -> list of name prefixes. First prefix
+    match wins (deterministic via insertion order; dicts in Python 3.7+
+    preserve insertion). Layers not matching any prefix get weight_bits_
+    default. When bit_alloc is None or empty, every layer gets the
+    default (homogeneous fallback, same as legacy single-bits configs).
+
+    Phase 40: paper-aligned mixed precision. Upstream ViDiT-Q
+    examples/opensora1.2/configs/w4a8_mixed_precision.yaml hardcodes
+    block 11-14 as W4 + everything else W8 (28-block OpenSORA); we use
+    block 13-16 (30-block LingBot-VA, same ~14% ratio). See plan.txt
+    Phase 40 section.
+    """
+    if not bit_alloc:
+        return weight_bits_default
+    for bits, prefixes in bit_alloc.items():
+        for prefix in prefixes:
+            if prefix in name:
+                return int(bits)
+    return weight_bits_default
+
+
 def compute_int_state_dict(
     model: nn.Module,
     remain_fp_regex: str,
@@ -315,6 +343,7 @@ def compute_int_state_dict(
     smooth_alpha: float = 0.99,
     static_act_enabled: bool = False,
     calib_data: Optional[dict[str, torch.Tensor]] = None,
+    bit_alloc: Optional[dict[int, list[str]]] = None,
 ) -> dict[str, IntLayerEntry]:
     """Walk model. For every nn.Linear whose full name does NOT match
     remain_fp_regex, compute its IntLayerEntry.
@@ -338,6 +367,12 @@ def compute_int_state_dict(
     When stacked with smooth_quant, the static scale is computed on the
     POST-smooth distribution (act_absmax / channel_mask) so it bounds
     what x_smooth actually sees at runtime.
+
+    Phase 40: bit_alloc dict {4: [prefixes...], 8: [...]} overrides
+    weight_bits per-Linear via prefix match (see _resolve_layer_bits).
+    weight_bits parameter then serves as the default for unmatched
+    layers. When bit_alloc is None, all target Linears use weight_bits
+    (homogeneous path = pre-Phase-40 behavior).
     """
     from ptqeval.wam.lingbot_va.method.viditq.quarot import random_sign_vector
     from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_smooth_scale
@@ -353,12 +388,16 @@ def compute_int_state_dict(
     entries: dict[str, IntLayerEntry] = {}
     layer_index = 0
     missing_calib: list[str] = []
+    bits_histogram: dict[int, int] = {}
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
         if pattern.search(name):
             logger.debug(f"skip FP-kept {name}")
             continue
+
+        layer_bits = _resolve_layer_bits(name, bit_alloc, weight_bits)
+        bits_histogram[layer_bits] = bits_histogram.get(layer_bits, 0) + 1
 
         smooth_mask = None
         if smooth_quant_enabled:
@@ -411,7 +450,7 @@ def compute_int_state_dict(
 
         entries[name] = _quantize_one(
             module,
-            weight_bits,
+            layer_bits,
             smooth_channel_mask=smooth_mask,
             quarot_sign=quarot_sign,
         )
@@ -423,6 +462,11 @@ def compute_int_state_dict(
             f"smooth_quant: {len(missing_calib)} layers had no calib entry "
             f"(quantized without SmoothQuant; e.g. cross-attn). First 3: "
             f"{missing_calib[:3]}"
+        )
+    if bit_alloc:
+        logger.info(
+            f"bit allocation histogram (target layers): "
+            f"{dict(sorted(bits_histogram.items()))}"
         )
     return entries
 
@@ -477,10 +521,30 @@ def main() -> int:
     )
 
     cfg = OmegaConf.load(args.layer_config)
-    weight_bits = int(cfg.weight_bits)
     remain_fp_regex = str(cfg.remain_fp_regex)
+    # Phase 40: mixed-precision configs declare `weight_bits_default` +
+    # `bit_alloc` instead of `weight_bits`. Homogeneous (legacy) configs
+    # only set `weight_bits`. Accept either; if both set, mixed wins.
+    bit_alloc_raw = cfg.get("bit_alloc", None)
+    bit_alloc: Optional[dict[int, list[str]]] = None
+    if bit_alloc_raw:
+        # OmegaConf keys are strings; coerce to int for the {bits: prefixes}
+        # convention we use throughout (matches _resolve_layer_bits).
+        bit_alloc = {int(k): list(v) for k, v in OmegaConf.to_container(bit_alloc_raw).items()}
+        weight_bits = int(cfg.get("weight_bits_default", cfg.get("weight_bits", 8)))
+    else:
+        weight_bits = int(cfg.weight_bits)
     if weight_bits not in (4, 8):
-        raise ValueError(f"weight_bits must be 8 or 4, got {weight_bits}")
+        raise ValueError(
+            f"weight_bits (default) must be 8 or 4, got {weight_bits}"
+        )
+    if bit_alloc:
+        for b in bit_alloc:
+            if b not in (4, 8):
+                raise ValueError(
+                    f"bit_alloc keys must be 4 or 8, got {b} "
+                    f"in {args.layer_config}"
+                )
     # Sanity: Phase 24d implements asymmetric weight quant only. Configs
     # MUST declare weight_sym: false. Asserting fails loud if a future
     # config flips this without code support.
@@ -528,8 +592,15 @@ def main() -> int:
     model.eval()
 
     n_linear_total = sum(1 for _, m in model.named_modules() if isinstance(m, nn.Linear))
-    logger.info(f"weight_bits={weight_bits} weight_sym=False (asym per-channel) "
-                f"remain_fp_regex={remain_fp_regex!r}")
+    if bit_alloc:
+        logger.info(
+            f"weight_bits_default={weight_bits} bit_alloc={bit_alloc} "
+            f"weight_sym=False (asym per-channel) "
+            f"remain_fp_regex={remain_fp_regex!r}"
+        )
+    else:
+        logger.info(f"weight_bits={weight_bits} weight_sym=False (asym per-channel) "
+                    f"remain_fp_regex={remain_fp_regex!r}")
     logger.info(
         f"smooth_quant={smooth_quant_enabled} alpha={smooth_alpha} "
         f"quarot={quarot_enabled} seed_base={quarot_seed_base} "
@@ -549,6 +620,7 @@ def main() -> int:
         smooth_alpha=smooth_alpha,
         static_act_enabled=static_act_enabled,
         calib_data=calib_data,
+        bit_alloc=bit_alloc,
     )
     n_quant = len(entries)
     n_kept_fp = n_linear_total - n_quant

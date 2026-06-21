@@ -73,17 +73,33 @@ def load_quant_model(
         raise ValueError("variant_args must include 'int_weights_ckpt'.")
 
     layer_cfg = OmegaConf.load(layer_config_path)
-    weight_bits = int(layer_cfg.weight_bits)
-    if weight_bits not in _WEIGHT_BITS_TO_CLS:
+    # Phase 40: mixed-precision configs declare `weight_bits_default` +
+    # `bit_alloc`. Homogeneous (legacy) configs only set `weight_bits`.
+    bit_alloc_raw = layer_cfg.get("bit_alloc", None)
+    bit_alloc: dict[int, list[str]] = {}
+    if bit_alloc_raw:
+        bit_alloc = {int(k): list(v) for k, v in OmegaConf.to_container(bit_alloc_raw).items()}
+        weight_bits_default = int(layer_cfg.get("weight_bits_default",
+                                                layer_cfg.get("weight_bits", 8)))
+    else:
+        weight_bits_default = int(layer_cfg.weight_bits)
+
+    if weight_bits_default not in _WEIGHT_BITS_TO_CLS:
         raise ValueError(
-            f"weight_bits={weight_bits} not supported; supported: "
-            f"{sorted(_WEIGHT_BITS_TO_CLS.keys())}."
+            f"weight_bits (default) ={weight_bits_default} not supported; "
+            f"supported: {sorted(_WEIGHT_BITS_TO_CLS.keys())}."
         )
-    quant_linear_cls = _WEIGHT_BITS_TO_CLS[weight_bits]
+    for b in bit_alloc:
+        if b not in _WEIGHT_BITS_TO_CLS:
+            raise ValueError(
+                f"bit_alloc bits {b} not supported; supported: "
+                f"{sorted(_WEIGHT_BITS_TO_CLS.keys())}."
+            )
 
     logger.info(
         f"loading FP transformer from {wan_model_path} "
-        f"(dtype={dtype}, device={device}, weight_bits={weight_bits})"
+        f"(dtype={dtype}, device={device}, weight_bits_default={weight_bits_default}, "
+        f"bit_alloc={bit_alloc or 'homogeneous'})"
     )
     model = load_transformer(
         wan_model_path,
@@ -94,11 +110,35 @@ def load_quant_model(
     model.eval()
 
     n_blocks = len(model.blocks)
-    logger.info(f"wrapping {n_blocks} blocks with "
-                f"QuantWanTransformerBlockWithCudaKernel ({quant_linear_cls.__name__})")
+    # Phase 40: per-block class dispatch. Resolve bits per block via
+    # prefix match against bit_alloc ({4: ["blocks.13.", ...]}); the
+    # whole block (all 6 swap targets) gets the same class. Matches
+    # ViDiT-Q upstream w4a8_mixed_precision.yaml: bit policy is per-
+    # block, not per-Linear within a block.
+    block_classes: list[type[QuantWanLinearBase]] = []
+    for i in range(n_blocks):
+        block_name = f"blocks.{i}."
+        bits = weight_bits_default
+        for b, prefixes in bit_alloc.items():
+            if any(p in block_name for p in prefixes):
+                bits = b
+                break
+        block_classes.append(_WEIGHT_BITS_TO_CLS[bits])
+
+    if bit_alloc:
+        block_bits_view = [next(b for b, c in _WEIGHT_BITS_TO_CLS.items() if c is cls)
+                           for cls in block_classes]
+        logger.info(
+            f"per-block bit assignment ({n_blocks} blocks): {block_bits_view}"
+        )
+    else:
+        logger.info(f"wrapping {n_blocks} blocks with "
+                    f"QuantWanTransformerBlockWithCudaKernel "
+                    f"({block_classes[0].__name__}) homogeneous")
+
     for i in range(n_blocks):
         model.blocks[i] = QuantWanTransformerBlockWithCudaKernel(
-            model.blocks[i], quant_linear_cls
+            model.blocks[i], block_classes[i]
         )
     # Free CUDA fragments created by from_fp_linear scratch.
     torch.cuda.empty_cache()

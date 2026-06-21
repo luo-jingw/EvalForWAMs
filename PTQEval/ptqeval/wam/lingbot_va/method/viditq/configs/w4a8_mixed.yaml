@@ -1,0 +1,50 @@
+# Phase 40: ViDiT-Q paper-aligned W4A8 mixed-precision
+# (paper Sec 4.3 + Table 1 video; upstream
+# ViDiT-Q/examples/opensora1.2/configs/w4a8_mixed_precision.yaml).
+#
+# Policy: blocks 13-16 (middle 4 of 30, ~14%) go W4; everything else
+# in the quantized scope goes W8. Upstream OpenSORA 28-block uses
+# "11|12|13|14" (~14%); we keep the same ratio + middle position.
+#
+# Bit dispatch is per-block (whole block W4 or whole block W8), not
+# per-Linear within a block. Matches upstream + paper Fig 4 (Sec 4.3
+# allocates by block-level sensitivity).
+#
+# Quant convention: per-channel ASYMMETRIC weight (W8 signed + int16
+# zp_weight; W4 unsigned + bf16 szeros_weight). Per-token symmetric
+# dynamic INT8 activation (same as both _dynamic variants).
+#
+# Preprocessing: SmoothQuant + QuaRoT stacked (same Phase 36/37/38 path
+# as w4a8_dynamic / w8a8_dynamic). SmoothQuant alpha aligned to
+# upstream OpenSORA w4a8_mixed_precision.yaml `viditq.alpha: 0.5665`
+# (paper Table 1 video W4A8 mixed actual value). w4a8_dynamic /
+# w8a8_dynamic keep alpha=0.99 to preserve their existing eval data.
+
+remain_fp_regex: "patch_embedding_mlp|action_embedder|proj_out|action_proj_out|condition_embedder|condition_embedder_action|scale_shift_table|time_proj"
+
+# Phase 40 per-block bit allocation. weight_bits_default applies to
+# every quantized Linear unless its block prefix matches a bit_alloc
+# entry. Resolution order = dict iteration order; first match wins.
+weight_bits_default: 8
+bit_alloc:
+  4:
+    - "blocks.13."
+    - "blocks.14."
+    - "blocks.15."
+    - "blocks.16."
+weight_sym: false
+act_bits: 8
+act_sym: true
+# weight_pack is resolved per-Linear at PTQ time (int8 for W8 layers,
+# qserve_w4 for W4 layers); ptq.py picks the right path via
+# _quantize_one(layer_bits).
+
+# Phase 36 SmoothQuant + Phase 37 QuaRoT, composed.
+# alpha=0.5665 = paper OpenSORA W4A8 mixed value (upstream
+# w4a8_mixed_precision.yaml). Different from our _dynamic configs
+# (alpha=0.99) by design.
+smooth_quant: true
+smooth_alpha: 0.5665
+calib_data_path: results/calib_data/calib_data.pth
+quarot: true
+quarot_seed_base: 0
