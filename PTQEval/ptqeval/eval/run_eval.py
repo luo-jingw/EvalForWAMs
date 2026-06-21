@@ -197,6 +197,13 @@ def _ensure_kv_cache_measurement(cfg: Config) -> None:
         "--output", str(target),
         "--device", "cuda:0",
     ]
+    # When this eval run quantizes (--variant given), measure the
+    # quantized model footprint instead of bf16 baseline. Captures real
+    # per-variant transformer weight + activation peak.
+    if cfg.variant:
+        cmd += ["--variant", cfg.variant]
+        if cfg.variant_args:
+            cmd += ["--variant_args", cfg.variant_args]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"[run_eval] WARNING: KV cache measurement failed "

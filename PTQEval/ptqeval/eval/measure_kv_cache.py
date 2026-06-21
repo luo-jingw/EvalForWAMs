@@ -59,7 +59,9 @@ def _peak_mb() -> float:
 
 
 def measure(model_path: str, device: torch.device,
-            dtype: torch.dtype) -> dict:
+            dtype: torch.dtype,
+            variant: str = "",
+            variant_args_path: str = "") -> dict:
     from wan_va.modules.utils import load_transformer
     from diffusers import AutoencoderKLWan
 
@@ -72,19 +74,41 @@ def measure(model_path: str, device: torch.device,
     logger.info(f"baseline alloc: {samples['baseline_mb']:.1f} MB")
 
     # ---- 2. transformer weight load ----
-    transformer = load_transformer(
-        os.path.join(model_path, "transformer"),
-        torch_dtype=dtype,
-        torch_device=device,
-        attn_mode="torch",
-    )
+    # If variant given, load quantized model via the variant's loader so
+    # the measurement reflects the actual deployed weight size (W8/W4/
+    # mixed instead of bf16 baseline). Otherwise load fp baseline.
+    if variant:
+        import importlib
+        from omegaconf import OmegaConf
+        loader_mod = importlib.import_module(
+            f"ptqeval.wam.lingbot_va.method.{variant}.loader"
+        )
+        variant_args = {}
+        if variant_args_path:
+            variant_args = OmegaConf.to_container(
+                OmegaConf.load(variant_args_path), resolve=True
+            )
+        transformer = loader_mod.load_quant_model(
+            wan_model_path=os.path.join(model_path, "transformer"),
+            variant_args=variant_args,
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        transformer = load_transformer(
+            os.path.join(model_path, "transformer"),
+            torch_dtype=dtype,
+            torch_device=device,
+            attn_mode="torch",
+        )
     transformer.eval()
     samples["after_transformer_mb"] = _alloc_mb()
     samples["transformer_weight_mb"] = (
         samples["after_transformer_mb"] - samples["baseline_mb"]
     )
     logger.info(
-        f"transformer weight: {samples['transformer_weight_mb']:.1f} MB "
+        f"transformer weight ({variant or 'bf16'}): "
+        f"{samples['transformer_weight_mb']:.1f} MB "
         f"(now {samples['after_transformer_mb']:.1f} MB total)"
     )
 
@@ -143,6 +167,17 @@ def measure(model_path: str, device: torch.device,
         f"(now {samples['after_kv_cache_mb']:.1f} MB total)"
     )
 
+    # ---- 5. activation peak ----
+    # Not directly measured here (requires rotary_emb / temb / encoder
+    # shapes matching the production _infer call, fragile). Instead the
+    # chart in calc_cross_ckpt derives activation+scratch = measured_
+    # peak_alloc_mb (from eval summary.csv, real production peak) - sum
+    # of (text + xfmr + KV + VAE) measured here. All subtrahends are now
+    # real torch.cuda.memory_allocated() deltas, so the derived
+    # activation IS a measurement (just expressed as a difference), not
+    # a reverse-fit.
+    samples["activation_peak_mb"] = None
+
     samples_meta = {
         "attn_window": attn_window,
         "frame_chunk_size": frame_chunk_size,
@@ -162,6 +197,7 @@ def measure(model_path: str, device: torch.device,
         "head_dim": transformer.attention_head_dim,
         "dtype": str(dtype),
         "kv_dtype_bytes": 2,
+        "variant": variant or "bf16",
     }
 
     # Sanity check: derived theoretical vs measured.
@@ -192,6 +228,13 @@ def main() -> int:
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dtype", type=str, default="bf16",
                         choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--variant", default="",
+                        help="Quant variant (resolves "
+                             "ptqeval.wam.lingbot_va.method.<variant>.loader). "
+                             "Empty -> bf16 baseline.")
+    parser.add_argument("--variant_args", type=str, default="",
+                        help="Variant runtime_args yaml (layer_config + "
+                             "int_weights_ckpt paths).")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -203,7 +246,9 @@ def main() -> int:
              "fp32": torch.float32}[args.dtype]
     device = torch.device(args.device)
 
-    result = measure(args.model_path, device, dtype)
+    result = measure(args.model_path, device, dtype,
+                     variant=args.variant,
+                     variant_args_path=args.variant_args)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w") as f:

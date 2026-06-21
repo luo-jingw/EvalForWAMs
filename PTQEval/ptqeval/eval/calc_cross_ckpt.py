@@ -40,6 +40,13 @@ _FLOAT_FIELDS = (
     "peak_alloc_mb",
     "peak_reserved_mb",
 )
+# Optional float fields added later (KV cache occupancy from
+# PerfProbe.kv_introspect; older summary.csv files don't have these).
+_OPTIONAL_FLOAT_FIELDS = (
+    "mean_kv_filled_slots",
+    "max_kv_filled_slots",
+    "kv_total_slots",
+)
 
 
 @dataclass
@@ -55,6 +62,9 @@ class SummaryRow:
     mean_action_head_ms: float
     peak_alloc_mb: float
     peak_reserved_mb: float
+    mean_kv_filled_slots: float = float("nan")
+    max_kv_filled_slots: float = float("nan")
+    kv_total_slots: float = float("nan")
 
 
 def load_summary(csv_path: str) -> dict[str, SummaryRow]:
@@ -65,6 +75,9 @@ def load_summary(csv_path: str) -> dict[str, SummaryRow]:
             data = {"task_name": raw["task_name"]}
             for k in _FLOAT_FIELDS:
                 data[k] = float(raw[k]) if raw.get(k) not in (None, "") else float("nan")
+            for k in _OPTIONAL_FLOAT_FIELDS:
+                v = raw.get(k)
+                data[k] = float(v) if v not in (None, "") else float("nan")
             rows[raw["task_name"]] = SummaryRow(**data)
     return rows
 
@@ -741,9 +754,26 @@ def _make_plots(
     _kv_cache_gb = _DEFAULT_KV_CACHE_GB
     _vae_gb = _DEFAULT_VAE_GB
     _xfmr_bf16_gb = _DEFAULT_XFMR_WEIGHT_BF16_GB
+    _xfmr_per_variant_gb: dict[str, float] = {}
+    _activation_per_variant_gb: dict[str, float] = {}
     _kv_source_note = "theoretical max @ attn_window=72 batch=2 (CFG)"
+    # measured_kv_cache_path may be a single JSON path, or a dict-string
+    # tag=path,tag2=path2 if multiple per-variant measurements are provided.
+    _kv_paths: dict[str, str] = {}
     if measured_kv_cache_path is not None:
-        with open(measured_kv_cache_path) as f:
+        if "=" in measured_kv_cache_path:
+            for entry in measured_kv_cache_path.split(","):
+                t, _, p = entry.partition("=")
+                _kv_paths[t.strip()] = p.strip()
+        else:
+            # Bare path: applies to all variants (kv + vae same, but
+            # transformer + activation will be the BF16 baseline values).
+            _kv_paths["_default"] = measured_kv_cache_path
+    if _kv_paths:
+        # Prefer "_default" (bf16) for KV/VAE/xfmr_bf16 baseline. KV
+        # is bf16-invariant across variants; VAE same.
+        baseline_path = _kv_paths.get("_default") or next(iter(_kv_paths.values()))
+        with open(baseline_path) as f:
             _kv_data = json.load(f)
         _kv_cache_gb = _kv_data["samples"]["kv_cache_mb"] / 1024.0
         _vae_gb = _kv_data["samples"]["vae_weight_mb"] / 1024.0
@@ -754,6 +784,16 @@ def _make_plots(
             f"batch={_kv_data['meta']['batch_size']}, "
             f"total_tolen={_kv_data['meta']['total_tolen']})"
         )
+        # Per-variant transformer + activation, when JSON was tagged.
+        for t, p in _kv_paths.items():
+            if t == "_default":
+                continue
+            with open(p) as f:
+                d = json.load(f)
+            _xfmr_per_variant_gb[t] = d["samples"]["transformer_weight_mb"] / 1024.0
+            act = d["samples"].get("activation_peak_mb")
+            if act is not None:
+                _activation_per_variant_gb[t] = float(act) / 1024.0
     _N_PARAMS_XFMR   = N_PARAMS  # 5.09e9 (defined in roofline block above)
     # Fraction of transformer params that get quantized (everything
     # inside the 30 WanTransformerBlocks; embedders / condition_embedder
@@ -762,6 +802,10 @@ def _make_plots(
     _QUANT_META_GB = 0.03  # per-channel scales + smooth + Hadamard sign
 
     def _xfmr_weight_gb(tag: str) -> float:
+        # If per-variant measurement available, use that (most accurate).
+        # Otherwise derive from bf16 footprint via quant ratio formula.
+        if tag in _xfmr_per_variant_gb:
+            return _xfmr_per_variant_gb[tag]
         # Anchor on the measured bf16 transformer weight footprint
         # (_xfmr_bf16_gb) when measure_kv_cache.py JSON was supplied;
         # otherwise fall back to N_PARAMS * 2 bytes.
@@ -879,6 +923,82 @@ def _make_plots(
     charts.append(("VRAM peak spatial breakdown per variant "
                    "(text encoder / transformer / KV / VAE / scratch)",
                    "plots/memory_breakdown.png"))
+
+    # ------ Chart 7: per-task KV cache occupancy ------
+    # Bar chart: x=task, y=KV cache GB actually used (mean during eval).
+    # PerfProbe.kv_introspect logs mask.sum() per stage; aggregator
+    # writes mean_kv_filled_slots / max_kv_filled_slots / kv_total_slots
+    # into summary.csv. We convert filled-slot fractions into actual
+    # GB by scaling against the measured KV container size (_kv_cache_gb).
+    #
+    # Same value across all variants (KV is bf16 regardless of quant);
+    # render baseline variant only, with the theoretical 100%-full line
+    # for context. Skipped silently when summary.csv lacks the KV fill
+    # columns (pre-instrumentation runs).
+    base_tag = tags[0]
+    kv_rows = [(t, summaries[base_tag][t]) for t in sorted_tasks]
+    has_kv = any(not (row.mean_kv_filled_slots != row.mean_kv_filled_slots)  # not NaN
+                 for _, row in kv_rows)
+    if has_kv:
+        x = list(range(len(kv_rows)))
+        mean_filled = [r.mean_kv_filled_slots for _, r in kv_rows]
+        max_filled = [r.max_kv_filled_slots for _, r in kv_rows]
+        # Total slots from any non-NaN row; assume constant across tasks
+        # (same attn_window config).
+        total_slots = next((r.kv_total_slots for _, r in kv_rows
+                            if r.kv_total_slots == r.kv_total_slots), 18432.0)
+        # Convert to GB by linear scale: GB = filled / total * _kv_cache_gb.
+        # Justification: K and V tensors are pre-allocated [batch, total,
+        # heads, head_dim] bf16; the "filled" portion (mask=True) is the
+        # active K/V slice attention actually reads. Allocator footprint
+        # = full container (== _kv_cache_gb), but the "effectively used"
+        # bytes = filled fraction of that container.
+        mean_gb = [(f / total_slots) * _kv_cache_gb for f in mean_filled]
+        max_gb = [(f / total_slots) * _kv_cache_gb for f in max_filled]
+
+        fig, ax = plt.subplots(figsize=(max(8.0, 0.55 * len(kv_rows) + 4.0), 5.0))
+        bar_w = 0.42
+        x_mean = [xi - bar_w / 2 for xi in x]
+        x_max = [xi + bar_w / 2 for xi in x]
+        ax.bar(x_mean, mean_gb, bar_w, label=f"mean KV used (avg over stages)",
+               color="#1f78b4", edgecolor="white", linewidth=0.8)
+        ax.bar(x_max, max_gb, bar_w, label=f"max KV used (per-task peak)",
+               color="#ff7f00", edgecolor="white", linewidth=0.8)
+        ax.axhline(_kv_cache_gb, color="#b22222", linestyle="--", linewidth=1.2,
+                   alpha=0.7,
+                   label=(f"container size = {_kv_cache_gb:.2f} GB "
+                          f"(attn_window full, batch=2 CFG)"))
+        for i, (mg, xg) in enumerate(zip(mean_gb, max_gb)):
+            ax.text(x_mean[i], mg + _kv_cache_gb * 0.012,
+                    f"{mg:.1f}", ha="center", va="bottom", fontsize=7.5)
+            ax.text(x_max[i], xg + _kv_cache_gb * 0.012,
+                    f"{xg:.1f}", ha="center", va="bottom", fontsize=7.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels([t for t, _ in kv_rows], rotation=45, ha="right",
+                           fontsize=8)
+        ax.set_ylabel("KV cache used (GB)")
+        ax.set_title("Per-task KV cache occupancy "
+                     f"(baseline={base_tag}, identical across variants since "
+                     "KV is bf16 unquantized)",
+                     fontsize=11, pad=8)
+        ax.set_ylim(0, _kv_cache_gb * 1.08)
+        ax.legend(loc="upper left", fontsize=8.5, framealpha=0.92)
+        ax.grid(True, axis="y", alpha=0.20)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        fig.text(0.5, 0.012,
+                 f"KV cache is allocated as a fixed {_kv_cache_gb:.2f} GB container "
+                 f"({_kv_source_note}); during eval only the slots written by "
+                 f"completed chunks are valid. Short tasks never saturate the "
+                 f"container; long tasks slide-evict oldest slots once full.",
+                 ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
+        fig.subplots_adjust(bottom=0.28)
+        p_kv = os.path.join(plots_dir, "kv_occupancy_by_task.png")
+        fig.savefig(p_kv, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+        charts.append(("Per-task KV cache occupancy (measured via PerfProbe "
+                       "kv_introspect, GB used of container)",
+                       "plots/kv_occupancy_by_task.png"))
 
     return charts
 

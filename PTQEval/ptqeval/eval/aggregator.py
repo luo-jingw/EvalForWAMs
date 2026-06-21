@@ -69,6 +69,13 @@ class TaskPerf:
     per_stage_peak_reserved_mb: dict[str, float] = field(default_factory=dict)
     overall_peak_alloc_mb: Optional[float] = None
     overall_peak_reserved_mb: Optional[float] = None
+    # KV cache occupancy across all stage records in this task's run.
+    # `kv_total_slots` is fixed (= attn_window-derived container size);
+    # `mean_kv_filled_slots` / `max_kv_filled_slots` show how the actual
+    # sliding-window fill varies during real eval.
+    mean_kv_filled_slots: Optional[float] = None
+    max_kv_filled_slots: Optional[int] = None
+    kv_total_slots: Optional[int] = None
 
 
 @dataclass
@@ -84,6 +91,9 @@ class SummaryRow:
     mean_action_head_ms: Optional[float]
     peak_alloc_mb: Optional[float]
     peak_reserved_mb: Optional[float]
+    mean_kv_filled_slots: Optional[float] = None
+    max_kv_filled_slots: Optional[int] = None
+    kv_total_slots: Optional[int] = None
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -149,6 +159,8 @@ def compute_task_perf(task_name: str, records: list[dict]) -> TaskPerf:
     stage_ms: dict[str, list[float]] = {s: [] for s in _KNOWN_STAGES}
     stage_alloc: dict[str, list[float]] = {s: [] for s in _KNOWN_STAGES}
     stage_reserved: dict[str, list[float]] = {s: [] for s in _KNOWN_STAGES}
+    kv_filled_list: list[int] = []
+    kv_total: Optional[int] = None
 
     for rec in records:
         for stage_rec in rec.get("stages", []):
@@ -160,6 +172,15 @@ def compute_task_perf(task_name: str, records: list[dict]) -> TaskPerf:
             stage_reserved[stage].append(float(stage_rec.get("peak_reserved_mb", 0.0)))
             if stage == "init" and init_peak_mb is None:
                 init_peak_mb = float(stage_rec.get("peak_alloc_mb", 0.0))
+            # KV occupancy: ignore init stage (cache not yet allocated)
+            # and reset stage (mask cleared, would skew average down).
+            if stage in ("transformer", "action_head", "vae_encode"):
+                kv_filled = stage_rec.get("kv_filled_slots")
+                kv_total_rec = stage_rec.get("kv_total_slots")
+                if kv_filled is not None and kv_total_rec is not None:
+                    kv_filled_list.append(int(kv_filled))
+                    if kv_total is None:
+                        kv_total = int(kv_total_rec)
         if any(s.get("stage") != "init" for s in rec.get("stages", [])):
             total_ms_list.append(float(rec.get("total_ms", 0.0)))
 
@@ -187,6 +208,11 @@ def compute_task_perf(task_name: str, records: list[dict]) -> TaskPerf:
         per_stage_peak_reserved_mb=per_stage_reserved,
         overall_peak_alloc_mb=overall_peak_alloc,
         overall_peak_reserved_mb=overall_peak_reserved,
+        mean_kv_filled_slots=(statistics.fmean(kv_filled_list)
+                              if kv_filled_list else None),
+        max_kv_filled_slots=(max(kv_filled_list)
+                             if kv_filled_list else None),
+        kv_total_slots=kv_total,
     )
 
 
@@ -229,6 +255,9 @@ def build_summary(perf: dict[str, TaskPerf], sr: dict[str, TaskSR]) -> list[Summ
             mean_action_head_ms=p.per_stage_mean_ms.get("action_head") if p else None,
             peak_alloc_mb=p.overall_peak_alloc_mb if p else None,
             peak_reserved_mb=p.overall_peak_reserved_mb if p else None,
+            mean_kv_filled_slots=p.mean_kv_filled_slots if p else None,
+            max_kv_filled_slots=p.max_kv_filled_slots if p else None,
+            kv_total_slots=p.kv_total_slots if p else None,
         ))
     return rows
 
@@ -242,6 +271,7 @@ def write_csv(rows: list[SummaryRow], path: str) -> None:
             "init_peak_mb", "mean_total_ms", "p50_total_ms", "p95_total_ms",
             "mean_transformer_ms", "mean_action_head_ms",
             "peak_alloc_mb", "peak_reserved_mb",
+            "mean_kv_filled_slots", "max_kv_filled_slots", "kv_total_slots",
         ])
         for r in rows:
             writer.writerow([
@@ -249,6 +279,7 @@ def write_csv(rows: list[SummaryRow], path: str) -> None:
                 r.init_peak_mb, r.mean_total_ms, r.p50_total_ms, r.p95_total_ms,
                 r.mean_transformer_ms, r.mean_action_head_ms,
                 r.peak_alloc_mb, r.peak_reserved_mb,
+                r.mean_kv_filled_slots, r.max_kv_filled_slots, r.kv_total_slots,
             ])
 
 

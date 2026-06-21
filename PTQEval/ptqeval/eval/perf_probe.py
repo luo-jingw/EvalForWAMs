@@ -11,7 +11,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -25,6 +25,14 @@ class StageRecord:
     elapsed_ms: float
     peak_alloc_mb: float
     peak_reserved_mb: float
+    # KV cache occupancy snapshot at stage exit (queried via
+    # PerfProbe.kv_introspect; None if probe was not given an introspect
+    # callable). filled / total are slot counts inside the K/V mask
+    # tensor for the first transformer block (representative — all
+    # blocks share the same allocation pattern). Used by aggregator +
+    # cross_ckpt to render per-task KV cache occupancy chart.
+    kv_filled_slots: Optional[int] = None
+    kv_total_slots: Optional[int] = None
 
 
 @dataclass
@@ -65,11 +73,23 @@ class StageContext:
         peak_reserved_mb: float = (
             torch.cuda.max_memory_reserved(self._probe.device) / _BYTES_PER_MB
         )
+        # Optional KV cache fill snapshot. Callable returns (filled, total)
+        # slot counts; None if probe was not given an introspect callable.
+        kv_filled: Optional[int] = None
+        kv_total: Optional[int] = None
+        if self._probe.kv_introspect is not None:
+            try:
+                kv_filled, kv_total = self._probe.kv_introspect()
+            except Exception:  # noqa: BLE001
+                # Don't let introspect bugs break the eval timing path.
+                kv_filled, kv_total = None, None
         record = StageRecord(
             stage=self._name,
             elapsed_ms=elapsed_ms,
             peak_alloc_mb=peak_alloc_mb,
             peak_reserved_mb=peak_reserved_mb,
+            kv_filled_slots=kv_filled,
+            kv_total_slots=kv_total,
         )
         self._probe.append_stage(record)
 
@@ -84,6 +104,10 @@ class PerfProbe:
         self._call_id: int = 0
         self._call_start_ms: Optional[float] = None
         self._stages: list[StageRecord] = []
+        # KV cache introspect callable: () -> (filled_slots, total_slots).
+        # Set by server.py after the model is loaded. None disables
+        # kv_filled_slots / kv_total_slots fields on StageRecord.
+        self.kv_introspect: Optional[Callable[[], tuple[int, int]]] = None
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         self._fp = open(log_path, "a", buffering=1)
 

@@ -588,6 +588,25 @@ class VA_Server:
                                             batch_size = 2 if self.use_cfg else 1
                                             )
 
+        # Wire up KV occupancy introspection for PerfProbe. After
+        # create_empty_cache, every block's attn1 owns an attn_caches
+        # dict keyed by cache_name. The 'mask' tensor has 1 element per
+        # slot; mask.sum() is the # of valid (currently-attended) slots.
+        # All blocks share the same allocation pattern, so reporting
+        # block[0] is representative. Cheap query (~1 us per stage).
+        if self.probe is not None:
+            cache_name = self.cache_name
+            first_block_attn = self.transformer.blocks[0].attn1
+
+            def _kv_introspect() -> tuple[int, int]:
+                cache = first_block_attn.attn_caches.get(cache_name)
+                if cache is None or cache.get('mask') is None:
+                    return (0, 0)
+                mask = cache['mask']
+                return (int(mask.sum().item()), int(mask.numel()))
+
+            self.probe.kv_introspect = _kv_introspect
+
         self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
         self.action_mask[self.job_config.used_action_channel_ids] = True
 
