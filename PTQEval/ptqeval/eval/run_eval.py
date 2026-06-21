@@ -167,6 +167,45 @@ def parse_args() -> Config:
     )
 
 
+def _ensure_kv_cache_measurement(cfg: Config) -> None:
+    """One-shot baseline GPU memory measurement (~30 sec) before the
+    pool spawns server processes. Writes <save_root>/measured_kv_cache.json
+    consumed by calc_cross_ckpt's memory_breakdown chart (replaces the
+    earlier hardcoded reverse-fit constants for KV / VAE / xfmr_bf16
+    with real torch.cuda.memory_allocated() deltas).
+
+    Skipped when the JSON already exists (idempotent resume) or when the
+    user passed --skip_kv_measurement. Errors are logged but do not
+    abort the eval (chart falls back to theoretical defaults).
+
+    Runs in a subprocess to isolate the measurement's CUDA context from
+    the pool servers; otherwise the lingering allocator state would
+    leak ~25 GB into GPU 0 before any worker starts.
+    """
+    import subprocess
+    target = cfg.save_root / "measured_kv_cache.json"
+    if target.exists():
+        print(f"[run_eval] measured_kv_cache.json already at {target}, skipping")
+        return
+    if getattr(cfg, "skip_kv_measurement", False):
+        print(f"[run_eval] skipping KV cache measurement (--skip_kv_measurement)")
+        return
+    print(f"[run_eval] running KV cache measurement -> {target} (~30 sec)")
+    cmd = [
+        sys.executable, "-m", "ptqeval.eval.measure_kv_cache",
+        "--model_path", cfg.wam_model_path,
+        "--output", str(target),
+        "--device", "cuda:0",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[run_eval] WARNING: KV cache measurement failed "
+              f"(continuing; chart will fall back to theoretical defaults):\n"
+              f"  stderr tail: {result.stderr[-400:]}")
+    else:
+        print(f"[run_eval] measurement OK; wrote {target}")
+
+
 def main() -> int:
     # Line-buffer stdout/stderr so progress prints appear in the redirected
     # nohup log file in real time. Default Python buffering is block-mode
@@ -182,6 +221,13 @@ def main() -> int:
     _set_cleanup_context(cfg)
     install_signal_handlers()
     try:
+        # Phase: one-shot baseline KV cache + weight measurement before
+        # pool/single/smoke launch a server. Idempotent (skips if JSON
+        # already at save_root). Smoke skips by default (too short for
+        # the cost to matter; smoke output isn't consumed by cross_ckpt).
+        if cfg.mode in ("single", "pool"):
+            _ensure_kv_cache_measurement(cfg)
+
         if cfg.mode == "smoke":
             run_smoke(cfg)
         elif cfg.mode == "single":

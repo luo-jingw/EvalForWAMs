@@ -297,6 +297,7 @@ def _make_plots(
     measured_flops_tf: float | None = None,
     measured_kv_bytes: float | None = None,
     measured_act_bytes: float | None = None,
+    measured_kv_cache_path: str | None = None,
 ) -> list[tuple[str, str]]:
     """Renders charts under <out_dir>/plots/:
       1. sr_by_task.png           per-task SR per variant
@@ -699,31 +700,60 @@ def _make_plots(
                    "plots/roofline.png"))
 
     # ------ Chart 6: Memory breakdown (spatial, analytical) ------
-    # Decompose the observed VRAM peak into the four physical
-    # components that actually occupy it (per PI question: "how is the
-    # breakdown of the 32 GB peak VRAM"). Quantities are computed from
-    # model architecture + KV-cache config, then validated against the
-    # measured peak; the gap goes to a residual "activations + scratch"
-    # segment so the bar lengths match summary.csv exactly.
+    # First-principles spatial decomposition: each segment derived from
+    # model architecture + KV-cache config, NOT reverse-fit to any
+    # particular measured peak. The residual segment ("Activations +
+    # scratch") is clamped to >= 0; if theoretical sum exceeds measured
+    # peak, the residual is 0 and the bar total exceeds the measured
+    # peak (over-estimate from theoretical-max KV vs allocator caching).
     #
     #   Text encoder (UMT5-XXL)    : 0 GB (Phase 41 CPU offload; was 11 GB)
     #   Transformer weights        : per-variant from tag (bf16 2 byte/param,
     #                                W8A8 1 byte/param quantized + 2 byte/param
     #                                kept FP, W4A8 0.5 byte/param quantized +
-    #                                2 byte/param kept FP)
-    #   KV cache                   : 8.92 GB const  (attn_window=72,
-    #                                                frame_chunk_size=2,
-    #                                                latent 32x40, action=16,
-    #                                                30 layers, 24 heads,
-    #                                                head_dim=128, bf16)
+    #                                2 byte/param kept FP, mixed = weighted)
+    #   KV cache                   : 13.59 GB theoretical max @ attn_window=72
+    #                                sliding-window saturation, batch_size=2
+    #                                from CFG (guidance_scale=5 > 1 ->
+    #                                use_cfg=True -> init_kv_cache(batch=2)),
+    #                                bf16. Quantization does NOT touch KV;
+    #                                same value across all variants. Earlier
+    #                                hardcoded 8.92 GB was reverse-fit from a
+    #                                casually-stated 32 GB peak (collaborator,
+    #                                not a measurement); first-principles
+    #                                value preferred per 2026-06-21 audit.
     #   VAE (AutoencoderKLWan)     : 2.7 GB const
-    #   Activations / scratch / frag: measured_peak - sum(above)
+    #   Activations / scratch / frag: measured_peak - sum(above), clamp >= 0
     # Phase 41: text encoder is CPU-offloaded so it contributes 0 to GPU peak
     # at steady state. The variable name is kept for plot-segment continuity
     # but the value reflects the offload.
     _TEXT_ENCODER_GB = 0.0
-    _VAE_GB          = 2.7      # disk: vae/ ~ 2.7 GB
-    _KV_CACHE_GB     = 8.92     # 30 layers * 2 (K+V) * B=1 * 24192 tokens * 24 H * 128 D * 2 bytes
+    _DEFAULT_VAE_GB = 2.7        # disk: vae/ ~ 2.7 GB
+    # Default KV: 30 layers * 2 (K+V) * batch=2 (CFG) * 18432 tokens
+    # * 24 heads * 128 head_dim * 2 bytes = 13.59 GB (theoretical max).
+    # If --measured_kv_cache is supplied, overrides with the
+    # ptqeval.eval.measure_kv_cache.py output (recommended: that
+    # script captures real torch.cuda.memory_allocated() delta from
+    # init_kv_cache call, not theoretical sum-of-tensors).
+    _DEFAULT_KV_CACHE_GB = 13.59
+    _DEFAULT_XFMR_WEIGHT_BF16_GB = N_PARAMS * 2 / 1e9   # ~10.18 GB
+
+    _kv_cache_gb = _DEFAULT_KV_CACHE_GB
+    _vae_gb = _DEFAULT_VAE_GB
+    _xfmr_bf16_gb = _DEFAULT_XFMR_WEIGHT_BF16_GB
+    _kv_source_note = "theoretical max @ attn_window=72 batch=2 (CFG)"
+    if measured_kv_cache_path is not None:
+        with open(measured_kv_cache_path) as f:
+            _kv_data = json.load(f)
+        _kv_cache_gb = _kv_data["samples"]["kv_cache_mb"] / 1024.0
+        _vae_gb = _kv_data["samples"]["vae_weight_mb"] / 1024.0
+        _xfmr_bf16_gb = _kv_data["samples"]["transformer_weight_mb"] / 1024.0
+        _kv_source_note = (
+            f"measured via measure_kv_cache.py "
+            f"(attn_window={_kv_data['meta']['attn_window']}, "
+            f"batch={_kv_data['meta']['batch_size']}, "
+            f"total_tolen={_kv_data['meta']['total_tolen']})"
+        )
     _N_PARAMS_XFMR   = N_PARAMS  # 5.09e9 (defined in roofline block above)
     # Fraction of transformer params that get quantized (everything
     # inside the 30 WanTransformerBlocks; embedders / condition_embedder
@@ -732,19 +762,23 @@ def _make_plots(
     _QUANT_META_GB = 0.03  # per-channel scales + smooth + Hadamard sign
 
     def _xfmr_weight_gb(tag: str) -> float:
+        # Anchor on the measured bf16 transformer weight footprint
+        # (_xfmr_bf16_gb) when measure_kv_cache.py JSON was supplied;
+        # otherwise fall back to N_PARAMS * 2 bytes.
         # bf16:  all params at 2 bytes/param
         # W8A8:  quant_frac * 1 byte/param   + (1-quant_frac) * 2 byte/param
         # W4A8:  quant_frac * 0.5 byte/param + (1-quant_frac) * 2 byte/param
         t = tag.lower()
         if "bf16" in t or "fp16" in t:
-            return _N_PARAMS_XFMR * 2 / 1e9
+            return _xfmr_bf16_gb
         if "w4a8" in t or "w4" in t:
             quant_bytes = 0.5    # int4, two nibbles per byte
         else:
             quant_bytes = 1.0    # int8
-        return (_N_PARAMS_XFMR * _XFMR_QUANT_FRAC * quant_bytes / 1e9
-                + _N_PARAMS_XFMR * (1 - _XFMR_QUANT_FRAC) * 2 / 1e9
-                + _QUANT_META_GB)
+        # Scale bf16 footprint by per-byte ratio.
+        bf16_ratio = (_XFMR_QUANT_FRAC * quant_bytes
+                      + (1 - _XFMR_QUANT_FRAC) * 2) / 2.0
+        return _xfmr_bf16_gb * bf16_ratio + _QUANT_META_GB
 
     measured_peak_gb = [
         statistics.mean(summaries[tag][t].peak_alloc_mb for t in sorted_tasks) / 1024.0
@@ -760,8 +794,8 @@ def _make_plots(
     for idx, tag in enumerate(tags):
         text = _TEXT_ENCODER_GB
         xfmr = _xfmr_weight_gb(tag)
-        kv   = _KV_CACHE_GB
-        vae  = _VAE_GB
+        kv   = _kv_cache_gb
+        vae  = _vae_gb
         residual = max(0.0, measured_peak_gb[idx] - (text + xfmr + kv + vae))
         seg_data.append([text, xfmr, kv, vae, residual])
 
@@ -821,16 +855,16 @@ def _make_plots(
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
     fig.subplots_adjust(left=0.18, bottom=0.18)
-    floor_gb = _TEXT_ENCODER_GB + _KV_CACHE_GB + _VAE_GB
-    xfmr_cap_gb = _N_PARAMS_XFMR * 2 / 1e9 - _xfmr_weight_gb('viditq_w8a8')
+    floor_gb = _TEXT_ENCODER_GB + _kv_cache_gb + _vae_gb
+    xfmr_cap_gb = _xfmr_bf16_gb - _xfmr_weight_gb('viditq_w8a8')
     fig.text(
         0.5, 0.04,
-        f"Text encoder, VAE, KV cache: unquantized.  "
-        f"KV cache analytical: attn_window=72, 30 layers, 24 heads × 128 d, "
-        f"24192 tokens/layer, bf16.  "
+        f"Text encoder (Phase 41 CPU-offload = 0 GB), VAE, KV cache: unquantized.  "
+        f"KV cache = {_kv_cache_gb:.2f} GB ({_kv_source_note}).  "
         f"Transformer: N_PARAMS={_N_PARAMS_XFMR/1e9:.2f}B, W8A8 quantizes "
         f"~{_XFMR_QUANT_FRAC*100:.0f}% (remain_fp_regex).  "
-        f"Activations+scratch = residual.",
+        f"Activations+scratch = max(0, measured_peak - sum); bar may exceed "
+        f"measured peak when KV alloc < allocator-tracked peak (overflow case).",
         ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
     fig.text(
         0.5, 0.008,
@@ -1396,6 +1430,14 @@ def main() -> int:
                         "value instead of the architecture-estimated "
                         "linear+attention sum -- gives true dispatcher-"
                         "level FLOPs/call.")
+    p.add_argument("--measured_kv_cache", default="",
+                   help="Path to measure_kv_cache JSON {samples, meta}. "
+                        "When supplied, memory_breakdown chart uses the "
+                        "real torch.cuda.memory_allocated() delta from "
+                        "init_kv_cache call (and matching VAE / "
+                        "transformer-bf16 sizes) instead of theoretical "
+                        "13.59 GB hardcoded value. Produced by "
+                        "ptqeval.eval.measure_kv_cache.")
     args = p.parse_args()
 
     variant_specs = [_parse_variant_arg(v) for v in args.variant]
@@ -1487,6 +1529,10 @@ def main() -> int:
                              tasks, summaries, step_limits,
                              op_data=op_data,
                              measured_flops_tf=measured_flops_tf,
+                             measured_kv_cache_path=(args.measured_kv_cache
+                                                     if args.measured_kv_cache
+                                                     and os.path.exists(args.measured_kv_cache)
+                                                     else None),
                              measured_kv_bytes=measured_kv_bytes,
                              measured_act_bytes=measured_act_bytes)
 
