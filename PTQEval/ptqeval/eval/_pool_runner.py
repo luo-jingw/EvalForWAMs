@@ -65,6 +65,13 @@ class Config:
     perf_log_dir: Path
     profile_ops: bool = False
     profile_n_calls: int = 5
+    # Optional pool GPU selection (default = scan all 8 + filter by free
+    # memory). When gpu_ids is set, only those GPUs are considered (still
+    # subject to min_free_mb filter). When max_gpus is set, after the
+    # usable set is determined, only the first N are used. Both may be
+    # combined.
+    gpu_ids: Optional[list[int]] = None
+    max_gpus: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -487,16 +494,28 @@ def run_pool(cfg: Config) -> None:
     for t in pending:
         print(f"  - {t}")
 
+    # GPU selection: scan candidates, filter by free memory, optionally
+    # cap by max_gpus. Candidates come from cfg.gpu_ids if given,
+    # otherwise the full range(8).
+    candidates = cfg.gpu_ids if cfg.gpu_ids else list(range(8))
+    if cfg.gpu_ids:
+        print(f"[pool] candidate GPUs (from --gpus): {candidates}")
     usable: list[int] = []
-    for g in range(8):
+    for g in candidates:
         mb = gpu_free_mb(g)
         if mb >= cfg.min_free_mb:
             usable.append(g)
         else:
             print(f"[pool] skipping GPU {g}: free={mb}MB < {cfg.min_free_mb}MB")
     if not usable:
-        print(f"[pool] no GPU has >= {cfg.min_free_mb} MB free.", file=sys.stderr)
+        print(f"[pool] no GPU in {candidates} has >= {cfg.min_free_mb} MB free.",
+              file=sys.stderr)
         sys.exit(1)
+    if cfg.max_gpus is not None and cfg.max_gpus > 0:
+        if len(usable) > cfg.max_gpus:
+            print(f"[pool] usable={usable}, capping to first {cfg.max_gpus} "
+                  f"per --max_gpus")
+            usable = usable[:cfg.max_gpus]
     n_workers = min(len(usable), len(pending))
     print(f"[pool] using GPUs: {usable[:n_workers]}")
 

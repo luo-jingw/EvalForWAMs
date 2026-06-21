@@ -69,6 +69,14 @@ def parse_args() -> Config:
     p.add_argument("--gpu_poll_interval", type=int, default=30)
     p.add_argument("--rerun_all", action="store_true",
                    help="pool: include all tasks regardless of prior res.json.")
+    p.add_argument("--gpus", type=str, default="",
+                   help="pool: comma-separated GPU ids to consider "
+                        "(e.g. '0,2,5'). Default = scan all 8. "
+                        "Still subject to --min_free_mb filter.")
+    p.add_argument("--max_gpus", type=int, default=None,
+                   help="pool: cap to at most N GPUs (taken from the "
+                        "front of the usable-list after --gpus + "
+                        "--min_free_mb filtering). Default = no cap.")
 
     # --- WAM + RoboTwin paths ---
     p.add_argument("--wam_name", default="lingbot_va",
@@ -141,6 +149,12 @@ def parse_args() -> Config:
     save_root.mkdir(parents=True, exist_ok=True)
     perf_log_dir.mkdir(parents=True, exist_ok=True)
 
+    gpu_ids: list[int] | None = None
+    if args.gpus:
+        gpu_ids = [int(g.strip()) for g in args.gpus.split(",") if g.strip()]
+        if not gpu_ids:
+            raise ValueError(f"--gpus parsed to empty list from '{args.gpus}'")
+
     return Config(
         mode=args.mode,
         task_name=args.task_name,
@@ -164,6 +178,8 @@ def parse_args() -> Config:
         perf_log_dir=perf_log_dir,
         profile_ops=args.profile_ops,
         profile_n_calls=args.profile_n_calls,
+        gpu_ids=gpu_ids,
+        max_gpus=args.max_gpus,
     )
 
 
