@@ -693,7 +693,19 @@ def parse_args_and_config():
 
 
 if __name__ == "__main__":
-    
+    # Kernel-level orphan prevention (PR_SET_PDEATHSIG=SIGTERM): if the
+    # orchestrator (run_eval) dies for any reason -- including SIGKILL
+    # where no Python finalizer runs -- the kernel sends us SIGTERM,
+    # preventing sapien sim processes from holding GPU memory
+    # indefinitely. PDEATHSIG is cleared on fork (we are forked from a
+    # bash launcher), so each leaf process re-registers. See 2026-06-21
+    # orphan incident notes in plan.txt.
+    import ctypes as _ct
+    try:
+        _ct.CDLL("libc.so.6", use_errno=True).prctl(1, 15, 0, 0, 0)
+    except OSError:
+        pass
+
     Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)

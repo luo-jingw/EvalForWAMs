@@ -1001,10 +1001,28 @@ def run(args):
     else:
         raise ValueError(f"Unknown infer mode: {config.infer_mode}")
 
+def _install_pdeathsig() -> None:
+    """Kernel-level orphan prevention: ask Linux to SIGTERM us the
+    moment our parent dies. PR_SET_PDEATHSIG is cleared on fork (and
+    we are forked from torch.distributed.run, which itself is forked
+    from a bash launcher); so each leaf process has to re-register.
+    Without this, killing the orchestrator (or it OOM-crashing) would
+    leave the server holding 20+ GB of GPU memory until manually
+    killed -- the 2026-06-21 incident."""
+    import ctypes as _ct
+    try:
+        _libc = _ct.CDLL("libc.so.6", use_errno=True)
+        # PR_SET_PDEATHSIG = 1
+        _libc.prctl(1, 15, 0, 0, 0)   # SIGTERM = 15
+    except OSError:
+        pass
+
+
 def main():
     """
     TODO
     """
+    _install_pdeathsig()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config-name",

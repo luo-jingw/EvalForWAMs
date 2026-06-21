@@ -21,6 +21,7 @@ top-level os.killpg is insufficient -- the /proc walk catches that).
 """
 from __future__ import annotations
 
+import ctypes
 import importlib
 import json
 import os
@@ -31,10 +32,43 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Orphan-prevention: PR_SET_PDEATHSIG (Linux)
+# ---------------------------------------------------------------------------
+# Tell the Linux kernel to send SIGTERM to a child process automatically
+# when its parent dies. This works even when the parent is SIGKILLed (no
+# Python signal handler runs), unlike `kill_session()` which depends on
+# Python-level cleanup to walk /proc and tear down descendants. PRCTL 1
+# is PR_SET_PDEATHSIG. Used as preexec_fn in launch_in_session below.
+#
+# Before this hook: orchestrator killed -> children reparent to init ->
+# orphan servers/clients eat GPU memory until manually killed. This was
+# the 2026-06-21 incident that prompted this fix.
+#
+# After this hook: kernel guarantees children get SIGTERM the moment the
+# orchestrator exits (signal-killed, OOM, panic, anything). Python-level
+# kill_session() still runs on graceful exit as defense in depth.
+
+_PR_SET_PDEATHSIG = 1
+
+
+def _set_pdeathsig() -> None:
+    """preexec_fn for subprocess.Popen. Runs in the child between fork
+    and exec, registering kernel-level orphan prevention. No-op on
+    non-Linux (libc.so.6 missing) since other platforms aren't supported
+    by our eval pipeline anyway."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    except OSError:
+        # Non-Linux fallback: silently skip. Defensive only; we never
+        # ship to a non-Linux platform.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +190,14 @@ def conda_base() -> str:
 
 
 def launch_in_session(bash_cmd: str, log_path: Path) -> subprocess.Popen:
-    """Spawn `bash -c bash_cmd` in a new POSIX session. The returned PID
-    is the new session/group leader; kill_session() walks /proc from it
-    to clean up the whole launcher + torch.distributed.run + worker tree.
+    """Spawn `bash -c bash_cmd` in a new POSIX session, with
+    PR_SET_PDEATHSIG=SIGTERM so the kernel auto-kills this child the
+    moment we (the orchestrator) die for any reason -- including
+    SIGKILL where no Python finalizer would run.
+
+    The returned PID is the new session/group leader; kill_session()
+    can still walk /proc to clean up the launcher + torch.distributed.
+    run + worker tree on the graceful-exit path.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logf = open(log_path, "w")
@@ -167,6 +206,7 @@ def launch_in_session(bash_cmd: str, log_path: Path) -> subprocess.Popen:
         stdout=logf, stderr=subprocess.STDOUT,
         env=os.environ.copy(),
         start_new_session=True, close_fds=True,
+        preexec_fn=_set_pdeathsig,
     )
 
 
