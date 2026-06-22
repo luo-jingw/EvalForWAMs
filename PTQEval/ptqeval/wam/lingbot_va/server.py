@@ -222,7 +222,7 @@ class VA_Server:
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'text_encoder'),
                 torch_dtype=self.dtype,
-                torch_device='cpu',
+                torch_device='cuda',
             )
 
             variant: Optional[str] = getattr(job_config, 'variant', None)
