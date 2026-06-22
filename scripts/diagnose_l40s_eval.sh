@@ -17,7 +17,7 @@
 #
 # Usage:  bash scripts/diagnose_l40s_eval.sh
 # Env:    REPO_ROOT (auto), CONDA_BASE (auto), GPU (default 0)
-set -uo pipefail
+set -o pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 CONDA_BASE="${CONDA_BASE:-$(conda info --base 2>/dev/null)}"
