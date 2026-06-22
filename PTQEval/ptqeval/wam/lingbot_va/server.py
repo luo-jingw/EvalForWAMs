@@ -214,19 +214,24 @@ class VA_Server:
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'tokenizer'), )
 
-            # Phase 41 (revised 2026-06-22): text encoder follows
-            # enable_offload like VAE. Earlier hardcoded 'cpu' was an
-            # A6000-shared-GPU defensive default; on dedicated 48 GB cards
-            # (L40s) the CPU UMT5-XXL forward (~30-75 s first reset) blocks
-            # the asyncio event loop long enough that some watchdog tears
-            # down the connection, killing the run before any task can
-            # start. With enable_offload=False the encoder lives on GPU
-            # and reset's encode runs in ~0.3 s.
+            # Phase 41 reverted 2026-06-22: text encoder always lives
+            # on GPU. CPU offload was the original Phase 41 design to
+            # save 11 GB on shared A6000 GPUs, but on dedicated 48 GB
+            # cards (L40s) the CPU UMT5-XXL forward inside reset()
+            # takes 30-75 s and blocks the asyncio event loop. The
+            # blocked loop misses websocket reads -> client recv
+            # eventually fails with ConnectionClosedError -> client
+            # process exits -> pool marks task FAILED before reset ever
+            # finishes. There is no watchdog setting we can dial up
+            # that survives a multi-second sync forward inside the
+            # event loop, so the only safe fix is to keep encode on
+            # GPU (~0.3 s). VAE still honors enable_offload because it
+            # is off the websocket critical path.
             self.text_encoder = load_text_encoder(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'text_encoder'),
                 torch_dtype=self.dtype,
-                torch_device='cpu' if self.enable_offload else self.device,
+                torch_device=self.device,
             )
 
             variant: Optional[str] = getattr(job_config, 'variant', None)
