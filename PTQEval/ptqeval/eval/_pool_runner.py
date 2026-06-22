@@ -323,7 +323,16 @@ def run_client_blocking(cfg: Config, gpu: int, task_name: str, port: int,
         f"conda activate {cfg.client_env}\n"
         f"export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:${{LD_LIBRARY_PATH:-}}\n"
         f"export ROBOTWIN_ROOT={cfg.robotwin_root}\n"
+        # SAPIEN_USE_VULKAN_DEVICE_ID pins sapien's vulkan renderer to the
+        # same physical GPU as torch. Without this, sapien defaults to
+        # vulkan device 0 for every worker -- 8 concurrent pool workers
+        # then all hit GPU 0's vulkan surface, slowing each sapien step
+        # ~17x and triggering reset-stall + ConnectionClosedError. Sapien
+        # does NOT honor CUDA_VISIBLE_DEVICES for its vulkan path. The
+        # diagnostic script (scripts/diagnose_l40s_eval.sh) confirmed
+        # single-worker runs work end-to-end on L40s.
         f"exec env CUDA_VISIBLE_DEVICES={gpu}"
+        f"         SAPIEN_USE_VULKAN_DEVICE_ID={gpu}"
         f"         PYTHONWARNINGS=ignore::UserWarning"
         f"         XLA_PYTHON_CLIENT_MEM_FRACTION=0.9"
         f"  python -m ptqeval.wam.{cfg.wam_name}.eval_client"
