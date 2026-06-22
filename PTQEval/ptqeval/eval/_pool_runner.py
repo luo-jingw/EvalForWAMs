@@ -601,10 +601,23 @@ def run_pool(cfg: Config) -> None:
                           file=sys.stderr)
                     worker_failed_counts[gpu] += 1
                     continue
-                run_client_blocking(cfg, gpu, task, port, test_num, client_log)
-                worker_done_counts[gpu] += 1
-                print(f"[pool worker gpu={gpu}] task={task} done "
-                      f"(worker total done={worker_done_counts[gpu]})")
+                rc = run_client_blocking(cfg, gpu, task, port, test_num, client_log)
+                if rc != 0:
+                    # Previously this branch silently incremented done -- a
+                    # crashed client (e.g. websockets ConnectionClosedError
+                    # because server hung in reset and got SIGTERMed) looked
+                    # identical to a successful run in the orchestrator log.
+                    # Now: report the actual rc so the user sees real failure
+                    # counts instead of a misleading "done".
+                    print(f"[pool worker gpu={gpu}] task={task} FAILED "
+                          f"(client rc={rc}; see {client_log} and "
+                          f"{server_log.parent / f'server_{gpu}_{task}.log'})",
+                          file=sys.stderr)
+                    worker_failed_counts[gpu] += 1
+                else:
+                    worker_done_counts[gpu] += 1
+                    print(f"[pool worker gpu={gpu}] task={task} done "
+                          f"(worker total done={worker_done_counts[gpu]})")
             finally:
                 kill_session(sp.pid)
                 with _SESSIONS_LOCK:

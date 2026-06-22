@@ -214,15 +214,19 @@ class VA_Server:
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'tokenizer'), )
 
-            # Phase 41: text encoder always loads on CPU regardless of
-            # enable_offload. _reset() swaps to GPU only for the one-shot
-            # encode pass per prompt, then back to CPU. Drops the 11 GB
-            # text encoder from init_peak + transient peak.
+            # Phase 41 (revised 2026-06-22): text encoder follows
+            # enable_offload like VAE. Earlier hardcoded 'cpu' was an
+            # A6000-shared-GPU defensive default; on dedicated 48 GB cards
+            # (L40s) the CPU UMT5-XXL forward (~30-75 s first reset) blocks
+            # the asyncio event loop long enough that some watchdog tears
+            # down the connection, killing the run before any task can
+            # start. With enable_offload=False the encoder lives on GPU
+            # and reset's encode runs in ~0.3 s.
             self.text_encoder = load_text_encoder(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'text_encoder'),
                 torch_dtype=self.dtype,
-                torch_device='cuda',
+                torch_device='cpu' if self.enable_offload else self.device,
             )
 
             variant: Optional[str] = getattr(job_config, 'variant', None)
@@ -553,7 +557,17 @@ class VA_Server:
             return video_latent.to(self.device)
 
     def _reset(self, prompt=None):
+        # Per-step timestamps so a hung reset shows up in the log instead
+        # of a 36-second silence followed by an external SIGTERM.
+        _rt = time.time()
+        def _step(msg):
+            nonlocal _rt
+            now = time.time()
+            logger.info(f'[reset {now - _rt:5.2f}s] {msg}')
+            _rt = now
+
         logger.info('Reset.')
+        _step('begin')
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
@@ -561,6 +575,7 @@ class VA_Server:
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
+        _step('clear_cache done')
 
         self.action_per_frame = self.job_config.action_per_frame
         self.height, self.width = self.job_config.height, self.job_config.width
@@ -587,6 +602,8 @@ class VA_Server:
                                             device=self.device,
                                             batch_size = 2 if self.use_cfg else 1
                                             )
+        torch.cuda.synchronize(self.device)
+        _step('create_empty_cache done (KV buffer allocated)')
 
         # Wire up KV occupancy introspection for PerfProbe. After
         # create_empty_cache, every block's attn1 owns an attn_caches
@@ -631,6 +648,8 @@ class VA_Server:
             # VRAM peak drops 31.2 -> 20.2 GB (bf16) / 27.7 -> 16.7 GB
             # (W8A8). No GPU swap means the offload survives even when
             # the GPU is too crowded to temporarily host 11 GB more.
+            _step(f'encode_prompt begin (text_encoder.device='
+                  f'{next(self.text_encoder.parameters()).device})')
             with self._stage('text_encoder'):
                 self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                     prompt=prompt,
@@ -643,11 +662,13 @@ class VA_Server:
                     device=self.device,
                     dtype=self.dtype,
                 )
+            _step('encode_prompt done')
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
+        _step('reset complete')
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
