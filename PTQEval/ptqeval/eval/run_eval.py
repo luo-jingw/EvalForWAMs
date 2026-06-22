@@ -62,8 +62,13 @@ def parse_args() -> Config:
     p.add_argument("--seed", type=int, default=0)
 
     # --- pool / GPU detection ---
-    p.add_argument("--min_free_mb", type=int, default=40000,
-                   help="GPU is usable when free memory >= this (MB).")
+    p.add_argument("--min_free_mb", type=int, default=33000,
+                   help="GPU is usable when free memory >= this (MB). "
+                        "Default 33 GB matches bf16 init_peak (~12 GB) + "
+                        "KV cache (~13 GB) + activations (~7 GB) headroom. "
+                        "Used to need ~40 GB while the text encoder was "
+                        "resident; the v3 swap pattern frees those 11 GB "
+                        "so 33 GB is a comfortable floor.")
     p.add_argument("--gpu_wait_timeout", type=int, default=0,
                    help="Seconds to wait for GPU memory before failing; 0 = forever.")
     p.add_argument("--gpu_poll_interval", type=int, default=30)

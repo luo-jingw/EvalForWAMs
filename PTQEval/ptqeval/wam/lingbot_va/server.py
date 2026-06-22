@@ -214,24 +214,21 @@ class VA_Server:
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'tokenizer'), )
 
-            # Phase 41 reverted 2026-06-22: text encoder always lives
-            # on GPU. CPU offload was the original Phase 41 design to
-            # save 11 GB on shared A6000 GPUs, but on dedicated 48 GB
-            # cards (L40s) the CPU UMT5-XXL forward inside reset()
-            # takes 30-75 s and blocks the asyncio event loop. The
-            # blocked loop misses websocket reads -> client recv
-            # eventually fails with ConnectionClosedError -> client
-            # process exits -> pool marks task FAILED before reset ever
-            # finishes. There is no watchdog setting we can dial up
-            # that survives a multi-second sync forward inside the
-            # event loop, so the only safe fix is to keep encode on
-            # GPU (~0.3 s). VAE still honors enable_offload because it
-            # is off the websocket critical path.
+            # Phase 41 v3 (2026-06-22): text encoder loads on CPU but
+            # _reset() swaps it to GPU for the encode then immediately
+            # offloads back. CPU-only forward (v1) took 30-75 s and
+            # blocked the asyncio event loop -> ConnectionClosedError.
+            # GPU-resident (v2) worked but burned 11 GB VRAM the whole
+            # episode. Transient swap costs ~0.3 s encode + 2x ~3 s
+            # 11 GB HBM<->host copy per reset; total ~6-7 s on the
+            # websocket critical path, well under the multi-minute
+            # reset budget. Steady-state VRAM saving matches the
+            # original Phase 41 (11 GB freed).
             self.text_encoder = load_text_encoder(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'text_encoder'),
                 torch_dtype=self.dtype,
-                torch_device=self.device,
+                torch_device='cpu',
             )
 
             variant: Optional[str] = getattr(job_config, 'variant', None)
@@ -642,19 +639,15 @@ class VA_Server:
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
-            # Phase 41: text encoder (UMT5-XXL, ~11 GB) stays on CPU
-            # permanently. encode_prompt runs on whatever device the
-            # encoder lives on (see _get_t5_prompt_embeds at line ~300)
-            # and only the small ~0.6 MB prompt_embeds tensors get moved
-            # to GPU before cross-attention consumes them.
-            # Per-_reset cost: ~5-15s for the CPU encode of 77-512 text
-            # tokens through UMT5-XXL — negligible vs the multi-second
-            # rollout that follows.
-            # VRAM peak drops 31.2 -> 20.2 GB (bf16) / 27.7 -> 16.7 GB
-            # (W8A8). No GPU swap means the offload survives even when
-            # the GPU is too crowded to temporarily host 11 GB more.
-            _step(f'encode_prompt begin (text_encoder.device='
-                  f'{next(self.text_encoder.parameters()).device})')
+            # Phase 41 v3: transient GPU swap. text_encoder lives on
+            # CPU; here we move it to GPU just for the encode then
+            # immediately offload back. GPU forward 0.3 s, swap costs
+            # ~3 s each direction for 11 GB over PCIe. Net per-reset
+            # cost ~6-7 s. Steady-state VRAM saving: 11 GB.
+            _step('text_encoder.to(cuda) begin (11 GB H2D)')
+            self.text_encoder.to(self.device)
+            torch.cuda.synchronize(self.device)
+            _step('text_encoder.to(cuda) done')
             with self._stage('text_encoder'):
                 self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                     prompt=prompt,
@@ -668,6 +661,9 @@ class VA_Server:
                     dtype=self.dtype,
                 )
             _step('encode_prompt done')
+            self.text_encoder.to('cpu')
+            torch.cuda.empty_cache()
+            _step('text_encoder.to(cpu) done (VRAM reclaimed)')
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
