@@ -38,6 +38,75 @@ PTQEval/
           qwan_extension/           Python wrappers + bench + nn.Module
 ```
 
+## Model download
+
+The LingBot-VA bf16 checkpoint and the RoboTwin simulator assets must be
+fetched once. Expected on-disk layout when finished:
+
+```
+models/lingbot-va-posttrain-robotwin/  (~25 GB, bf16)
+├── transformer/              5.09 B params (30 WanTransformerBlock, dim=3072)
+├── text_encoder/             UMT5-XXL (~11 GB)
+├── vae/                      AutoencoderKLWan
+├── tokenizer/
+├── assets/
+└── README.md
+RoboTwin/aaa_assets/          RoboTwin 2.0 sim assets (URDF / SDF / meshes)
+```
+
+### LingBot-VA ckpt
+
+```bash
+# inside lingbot-jw env (uses huggingface_hub)
+huggingface-cli download robbyant/lingbot-va-posttrain-robotwin \
+    --local-dir models/lingbot-va-posttrain-robotwin
+
+# attn_mode must be "torch" (or "flashattn"). Upstream ships "flex"
+# which only works for training; inference crashes on it. The current
+# release already ships "torch", verify with:
+python -c "
+import json
+c = json.load(open('models/lingbot-va-posttrain-robotwin/transformer/config.json'))
+assert c['attn_mode'] in ('torch','flashattn'), c['attn_mode']
+print('attn_mode =', c['attn_mode'])
+"
+```
+
+Available checkpoints (HF / ModelScope, pick the one you need):
+
+| Variant | HF repo | Notes |
+|---|---|---|
+| **lingbot-va-posttrain-robotwin** | `robbyant/lingbot-va-posttrain-robotwin` | Used in this project; post-trained on RoboTwin |
+| lingbot-va-base | `robbyant/lingbot-va-base` | Pre-trained backbone (no task post-train) |
+| lingbot-va-posttrain-libero-long | `robbyant/lingbot-va-posttrain-libero-long` | LIBERO-LONG post-train |
+
+### RoboTwin sim assets
+
+```bash
+# inside RoboTwin-jw env, follow upstream INSTALLATION.md, or:
+cd RoboTwin && bash script/_download_assets.sh && cd ..
+# Pulls embodiment URDFs + object meshes for the 50 tasks.
+```
+
+### Calibration data (optional, for skipping bf16 calib eval)
+
+We publish derived calibration data so a downstream user can reproduce
+quant variants without re-running the bf16 RoboTwin rollouts:
+
+```bash
+# (read-only — no token needed)
+huggingface-cli download JingwuLuo/LingBot-VA_RoboTwin_clibration_data \
+    --repo-type dataset --local-dir results/calib_capture
+```
+
+Contents:
+- `calib_data.pth` (1.8 MB) — per-channel input absmax over 180 target
+  Linears (30 block × 6), derived from 50 task × 5 ep bf16 rollouts. Feed
+  directly into `ptq.py`.
+- raw obs / latent / action chunks (~12 GB) — for replaying through a
+  different WAM transformer to derive that WAM's own absmax.
+- `configs/*.yaml` — quant configs used to produce each variant.
+
 ## Setup
 
 Two separate conda envs are required: one for the WAM server (`lingbot-jw`),
@@ -180,6 +249,86 @@ python -m ptqeval.eval.aggregator \
 # Live dashboard
 SAVE_ROOT=results/bf16 \
     watch -n 1 bash PTQEval/ptqeval/eval/monitor.sh
+```
+
+## Eval configurations
+
+Two eval scales coexist in `ptqeval/wam/lingbot_va/tasks.py`. Pick by
+`--task_list_name`:
+
+| Tier | Attribute | Tasks | Typical `--test_num` | Use for |
+|---|---|---|---|---|
+| **Production SR** | `SELECTED_15_TASKS` | 15 | 25 | Cross-variant SR comparison (cross_summary). 1 long + 4 medium-long + 10 short, ~3-4 h on 8 GPU |
+| **Full bench / calibration** | `CALIB_TASKS_ALL` | 50 | 5 (calib) or 100 (full sweep) | bf16 rollout collection for static-act calib; or a comprehensive variant sweep |
+
+Task config (RoboTwin scene randomization) — `--task_config`:
+
+| Value | Behavior | Use for |
+|---|---|---|
+| `demo_clean` | Fixed background / lighting / table height | legacy baseline only |
+| **`demo_randomized`** | Per-episode randomized background / lighting / table | **production default** — all variants in this repo's cross_summary use it |
+
+### Standard 15-task SR sweep (~3-4 h on 8 GPU)
+
+```bash
+for save in \
+    bf16 \
+    "viditq_w8a8_dynamic --variant viditq --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8_dynamic.yaml" \
+    "viditq_w4a8_dynamic --variant viditq --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w4a8_dynamic.yaml" \
+    "viditq_w4a8_mixed   --variant viditq --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w4a8_mixed.yaml"
+do
+    tag=${save%% *}; rest=${save#* }; [ "$rest" = "$tag" ] && rest=""
+    python -m ptqeval.eval.run_eval --mode pool \
+        --task_list_name SELECTED_15_TASKS --task_config demo_randomized \
+        --test_num 25 --save_root results/${tag} $rest
+done
+```
+
+### Full 50-task sweep (~12-20 h on 8 GPU per variant)
+
+```bash
+python -m ptqeval.eval.run_eval --mode pool \
+    --task_list_name CALIB_TASKS_ALL --task_config demo_randomized \
+    --test_num 100 --save_root results/bf16_full
+```
+
+Use the same command with `--variant viditq --variant_args ...` for each
+quant variant. CALIB_TASKS_ALL covers all 50 RoboTwin 2.0 tasks; with
+`--test_num 100` it produces 5000 episodes per variant — the most
+statistically robust SR estimate but ~5× longer than the 15-task sweep.
+
+### Cross-summary (after aggregator runs per variant)
+
+```bash
+python -m ptqeval.eval.calc_cross_ckpt \
+    --variant bf16=results/bf16/summary/summary.csv \
+    --variant viditq_w8a8_dynamic=results/viditq_w8a8_dynamic/summary/summary.csv \
+    --variant viditq_w4a8_dynamic=results/viditq_w4a8_dynamic/summary/summary.csv \
+    --variant viditq_w4a8_mixed=results/viditq_w4a8_mixed/summary/summary.csv \
+    --op_profile bf16=results/bf16/summary/op_profile.json \
+    --op_profile viditq_w8a8_dynamic=results/viditq_w8a8_dynamic/summary/op_profile.json \
+    --op_profile viditq_w4a8_dynamic=results/viditq_w4a8_dynamic/summary/op_profile.json \
+    --op_profile viditq_w4a8_mixed=results/viditq_w4a8_mixed/summary/op_profile.json \
+    --measured_flops results/measured_flops.json \
+    --measured_kv_cache results/measured_kv_cache.json \
+    --int_weights_ckpt results/viditq_w4a8_dynamic/calib/int_weights.pth \
+    --out_dir results/cross_summary
+```
+
+Produces `cross_summary.{csv,json}` + `report.md` + 7 plots:
+SR per task, total_ms+speedup, speedup per task, latency distribution,
+memory breakdown (uses measured KV cache), op breakdown (measured
+profiler kernel time), roofline (FlopCounterMode FLOPs + memcpy bytes).
+The first `--variant` is treated as baseline.
+
+### GPU selection
+
+```bash
+# Limit to specific GPU ids
+python -m ptqeval.eval.run_eval --mode pool --gpus 0,2,5 ...
+
+# Cap worker count (after min_free_mb filter)
+python -m ptqeval.eval.run_eval --mode pool --max_gpus 4 ...
 ```
 
 ## CLI flags consumed by run_eval.py
