@@ -38,71 +38,172 @@ PTQEval/
           qwan_extension/           Python wrappers + bench + nn.Module
 ```
 
-## Quick start
+## Setup
+
+Two separate conda envs are required: one for the WAM server (`lingbot-jw`),
+one for the RoboTwin client (`RoboTwin-jw`). They MUST be separate because
+RoboTwin pins `torch==2.4.1 + sapien==3.0.0b1` while LingBot-VA needs
+`torch==2.9.0 + diffusers==0.36.0`. Server and client communicate over a
+local websocket.
+
+### 1. `lingbot-jw` (server, PTQ, kernel build)
 
 ```bash
-# One-time install (run in each conda env that imports ptqeval)
+conda create -n lingbot-jw python=3.10.16 -y
 conda activate lingbot-jw
+
+# Torch first (CUDA 12.6 wheels)
+pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# LingBot-VA upstream Python deps
+pip install -r lingbot-va/requirements.txt
+pip install flash-attn --no-build-isolation
+
+# Editable install of our research package
 pip install -e PTQEval/
 
+# fast_hadamard_transform: required for the QuaRoT runtime CUDA path
+# (Python butterfly fallback works but is ~800 ms/call slower per Linear).
+# pip's sdist is missing csrc/, so build from GitHub source:
+git clone --depth 1 https://github.com/Dao-AILab/fast-hadamard-transform.git
+cd fast-hadamard-transform
+FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.6" \
+    pip install --no-build-isolation .
+cd ..
+```
+
+Replace `TORCH_CUDA_ARCH_LIST="8.6"` with `"8.9"` on L40 / L40S, `"9.0"`
+on H100, etc.
+
+`attn_mode` must be `"torch"` (or `"flashattn"`) in
+`models/lingbot-va-posttrain-robotwin/transformer/config.json`. The
+upstream default `"flex"` only works for training and crashes at
+inference; the bundled checkpoint already ships with the correct value.
+
+### 2. `RoboTwin-jw` (client, sapien sim)
+
+```bash
+conda create -n RoboTwin-jw python=3.10 -y
 conda activate RoboTwin-jw
+
+# Run RoboTwin's own installer for python deps + sapien + mplib patches +
+# Curobo. Per upstream README ~20 minutes. Takes care of sed-patching
+# sapien's urdf_loader.py and mplib's planner.py.
+cd RoboTwin && bash script/_install.sh && cd ..
+
+# pytorch3d (RoboTwin _install.sh handles this, but if it fails:)
+pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" \
+    --no-build-isolation
+
+# Editable install of our research package (so eval_client can resolve
+# `ptqeval.wam.lingbot_va.eval_client`)
 pip install -e PTQEval/
 
-# Build CUDA kernel (qwan_extension._C). sm_86; needs torch + nvcc.
+# (one-time) download RoboTwin assets per upstream INSTALLATION.md
+```
+
+### 3. CUDA kernel build (`qwan_extension._C`)
+
+Required only for `viditq` quant variants (W8A8 / W4A8). Skip for bf16
+baseline runs. Builds inside the `lingbot-jw` env.
+
+```bash
 conda activate lingbot-jw
+
+# setup.py hardcodes -gencode=arch=compute_86,code=sm_86. To target a
+# different SM, either edit setup.py or pass TORCH_CUDA_ARCH_LIST and
+# strip the hardcoded -gencode flag.
 pip install --no-build-isolation -e \
     PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/
+```
 
+Build inputs (`csrc/`):
+- `pybind.cpp` — Python bindings (12+ launchers).
+- `act_quant_bf16.cu` — per-token act quant: dynamic (`with_sum`) +
+  static (`with_sum_static`) variants.
+- `w8a8/w8a8_gemm.cu` — verbatim ViDiT-Q upstream + `typename OutT`
+  templating to support `bf16` output (upstream is `fp16`-only).
+- `w4a8/w4a8_gemm.cu` — verbatim QServe upstream + same templating.
+- `toy_mma_int8.cu` — bench/sanity launchers.
+- `infra/` — verbatim ViDiT-Q headers (mma/cp_async/permuted_smem etc.).
+
+Verify the build:
+
+```bash
+python -c "import qwan_extension._C; print('ok')"
+python PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/qwan_extension/check_part6.py
+```
+
+`check_part6.py` runs the 6-variant numerical correctness suite
+(baseline / smooth / quarot / viditq / static / viditq_static); all
+should pass within `tol=5e-2`.
+
+Rebuilding on a different SM (e.g. moving an existing tree from
+A6000 sm_86 to L40S sm_89): edit `setup.py:51` to
+`-gencode=arch=compute_89,code=sm_89`, then `pip install -e .` again to
+re-emit `_C.cpython-*.so`. A stale `.so` from a different SM imports
+fine but every kernel launch returns
+`CUDA error: no kernel image is available for execution on the device`.
+
+## Run
+
+```bash
 # Smoke (bf16 baseline; 1 task, 1 episode, GPU 4)
-SAVE_ROOT=results/smoke_bf16 \
-ROBOTWIN_ROOT=RoboTwin \
-  python -m ptqeval.eval.run_eval \
-    --mode smoke --task_name adjust_bottle --test_num 1 --gpu_id 4
+python -m ptqeval.eval.run_eval \
+    --mode smoke --task_name adjust_bottle --gpu_id 4 \
+    --save_root results/smoke_bf16
 
 # Pool (15 tasks, 25 episodes, all usable GPUs)
-SAVE_ROOT=results/bf16 \
-ROBOTWIN_ROOT=RoboTwin \
-  python -m ptqeval.eval.run_eval \
-    --mode pool --min_free_mb 40000
+python -m ptqeval.eval.run_eval \
+    --mode pool --task_config demo_randomized --test_num 25 \
+    --save_root results/bf16
 
-# Quant variant (viditq W8A8 example)
-SAVE_ROOT=results/viditq_w8a8_kernel \
-ROBOTWIN_ROOT=RoboTwin \
-VARIANT=viditq \
-VARIANT_ARGS=PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8.yaml \
-  python -m ptqeval.eval.run_eval \
-    --mode pool
+# Quant variant (viditq W8A8 dynamic example)
+python -m ptqeval.eval.run_eval \
+    --mode pool --variant viditq \
+    --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8_dynamic.yaml \
+    --task_config demo_randomized --test_num 25 \
+    --save_root results/viditq_w8a8_dynamic
 
-# Calibration data collection (Phase 31; 50 task x 5 ep on bf16)
-TASK_LIST_NAME=CALIB_TASKS_ALL \
-CALIBRATE_OUT=results/calib_data/calib_data.pth \
-SAVE_ROOT=results/calib_capture \
-  python -m ptqeval.eval.run_eval --mode pool --test_num 5
+# Calibration data collection (50 task x 5 ep on bf16, for viditq static
+# activation quant)
+python -m ptqeval.wam.lingbot_va.method.viditq.collect_calib_videos \
+    --save_root results/calib_capture
 
-# Aggregate
+# Aggregate (auto-merges per-task op_profile.json when --profile_ops was on)
 python -m ptqeval.eval.aggregator \
-  --save_root results/bf16 \
-  --perf_log_dir results/bf16/perf \
-  --out_dir results/bf16/summary
+    --save_root results/bf16 \
+    --perf_log_dir results/bf16/perf \
+    --out_dir results/bf16/summary
 
 # Live dashboard
 SAVE_ROOT=results/bf16 \
-  watch -n 1 bash PTQEval/ptqeval/eval/monitor.sh
+    watch -n 1 bash PTQEval/ptqeval/eval/monitor.sh
 ```
 
-## Env vars consumed by run_eval.py
+## CLI flags consumed by run_eval.py
 
-| Var | Default | Purpose |
+`run_eval.py` is fully CLI-driven (no env vars). See `--help` for the
+complete list; the most common ones:
+
+| Flag | Default | Purpose |
 |---|---|---|
-| `WAM_NAME` | `lingbot_va` | Picks `ptqeval.wam.<WAM_NAME>.*` |
-| `WAM_MODEL_PATH` | `models/lingbot-va-posttrain-robotwin` | FP checkpoint dir |
-| `ROBOTWIN_ROOT` | `RoboTwin` | RoboTwin sim root |
-| `SAVE_ROOT` | `results/<variant_tag>` | Output root |
-| `PERF_LOG_DIR` | `${SAVE_ROOT}/perf` | Per-call perf JSONL dir |
-| `VARIANT` | unset | Quant variant; resolves to `ptqeval.wam.<WAM>.method.<VARIANT>.loader` |
-| `VARIANT_ARGS` | unset | YAML with `layer_config` + `int_weights_ckpt` paths |
-| `SERVER_ENV` | `lingbot-jw` | Conda env for server |
-| `CLIENT_ENV` | `RoboTwin-jw` | Conda env for client |
+| `--mode` | required | `smoke` / `single` / `pool` |
+| `--save_root` | required | Eval output root |
+| `--wam_name` | `lingbot_va` | Picks `ptqeval.wam.<wam_name>.*` |
+| `--wam_model_path` | `models/lingbot-va-posttrain-robotwin` | FP ckpt dir |
+| `--robotwin_root` | `RoboTwin` | RoboTwin sim root |
+| `--variant` | unset | Quant variant; resolves to `ptqeval.wam.<wam>.method.<variant>.loader` |
+| `--variant_args` | unset | YAML with `layer_config` + `int_weights_ckpt` paths |
+| `--task_config` | `demo_clean` | RoboTwin task config (`demo_clean` / `demo_randomized`); production eval uses `demo_randomized` |
+| `--task_list_name` | `SELECTED_15_TASKS` | Task list attribute in `tasks.py` |
+| `--test_num` | smoke=1, else=25 | Episodes per task |
+| `--server_env` / `--client_env` | `lingbot-jw` / `RoboTwin-jw` | Conda env names |
+| `--min_free_mb` | 33000 | GPU usable when free memory >= this |
+| `--gpus` | unset | Comma-separated GPU ids to consider (e.g. `0,2,5`) |
+| `--max_gpus` | unset | Cap to at most N GPUs after filtering |
+| `--profile_ops` | on | Wrap first N infer calls in torch.profiler -> op_profile.json |
 
 ## Add a new quantization method (per existing WAM)
 
