@@ -19,8 +19,13 @@
 # ~= 30-60 min per variant on a single A6000.
 set -euo pipefail
 
-REPO=/home/arash/EvalForWAMs
-PY=/home/arash/.conda/envs/lingbot-jw/bin/python
+# Derive REPO from this script's location so the same script works on
+# both the A6000 box and the L40s server without per-host edits.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Use whatever python is on PATH (caller is responsible for `conda
+# activate lingbot-jw` before running this script).
+PY=python
 CFG_DIR=${REPO}/PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs
 
 TEST_NUM=5

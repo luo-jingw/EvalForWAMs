@@ -26,6 +26,22 @@ def _sources() -> list[str]:
     ]
 
 
+# Default = multi-arch fatbinary covering the two GPUs we run on (A6000
+# sm_86, L40 / L40S sm_89). One .so works on either host without per-
+# machine edits; build is ~2x slower but only happens once per machine.
+# Honor TORCH_CUDA_ARCH_LIST when explicitly set (e.g. "9.0" for H100):
+# torch.utils.cpp_extension's CUDAExtension reads that env var and emits
+# -gencode for each entry automatically, so we skip our own list.
+_TARGET_SMS_DEFAULT = ("86", "89")
+
+
+def _nvcc_arch_flags() -> list[str]:
+    if os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        return []
+    return [f"-gencode=arch=compute_{sm},code=sm_{sm}"
+            for sm in _TARGET_SMS_DEFAULT]
+
+
 setup(
     name="qwan_extension",
     version="0.1.0",
@@ -49,7 +65,7 @@ setup(
                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                     "-U__CUDA_NO_BFLOAT162_OPERATORS__",
                     "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-                    "-gencode=arch=compute_86,code=sm_86",
+                    *_nvcc_arch_flags(),
                 ],
             },
         ),

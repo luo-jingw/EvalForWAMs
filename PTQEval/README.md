@@ -137,13 +137,14 @@ pip install -e PTQEval/
 # pip's sdist is missing csrc/, so build from GitHub source:
 git clone --depth 1 https://github.com/Dao-AILab/fast-hadamard-transform.git
 cd fast-hadamard-transform
-FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.6" \
+FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.6;8.9" \
     pip install --no-build-isolation .
 cd ..
 ```
 
-Replace `TORCH_CUDA_ARCH_LIST="8.6"` with `"8.9"` on L40 / L40S, `"9.0"`
-on H100, etc.
+`TORCH_CUDA_ARCH_LIST="8.6;8.9"` emits a fatbinary covering both A6000
+(sm_86) and L40 / L40S (sm_89) in one wheel. For other GPUs append /
+replace: `"9.0"` for H100, `"12.0"` for RTX 5090, etc.
 
 `attn_mode` must be `"torch"` (or `"flashattn"`) in
 `models/lingbot-va-posttrain-robotwin/transformer/config.json`. The
@@ -180,9 +181,10 @@ baseline runs. Builds inside the `lingbot-jw` env.
 ```bash
 conda activate lingbot-jw
 
-# setup.py hardcodes -gencode=arch=compute_86,code=sm_86. To target a
-# different SM, either edit setup.py or pass TORCH_CUDA_ARCH_LIST and
-# strip the hardcoded -gencode flag.
+# setup.py defaults to a multi-arch fatbinary covering sm_86 (A6000) and
+# sm_89 (L40 / L40S), so the same build works on both. For any other GPU
+# pass TORCH_CUDA_ARCH_LIST (e.g. "9.0" for H100, "12.0" for RTX 5090);
+# when set it overrides the default list.
 pip install --no-build-isolation -e \
     PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/
 ```
@@ -208,11 +210,10 @@ python PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel/qwan_extension/check_
 (baseline / smooth / quarot / viditq / static / viditq_static); all
 should pass within `tol=5e-2`.
 
-Rebuilding on a different SM (e.g. moving an existing tree from
-A6000 sm_86 to L40S sm_89): edit `setup.py:51` to
-`-gencode=arch=compute_89,code=sm_89`, then `pip install -e .` again to
-re-emit `_C.cpython-*.so`. A stale `.so` from a different SM imports
-fine but every kernel launch returns
+Rebuilding when the host's GPU is neither sm_86 nor sm_89: set
+`TORCH_CUDA_ARCH_LIST` to your target list (e.g. `"8.6;8.9;9.0"`) and
+re-run `pip install -e .` to re-emit `_C.cpython-*.so`. A stale `.so`
+without the host's SM imports fine but every kernel launch returns
 `CUDA error: no kernel image is available for execution on the device`.
 
 ## Run
