@@ -269,6 +269,67 @@ Task config (RoboTwin scene randomization) — `--task_config`:
 | `demo_clean` | Fixed background / lighting / table height | legacy baseline only |
 | **`demo_randomized`** | Per-episode randomized background / lighting / table | **production default** — all variants in this repo's cross_summary use it |
 
+### Generating quantized weights for a variant
+
+Each viditq variant needs its own `int_weights.pth`. The pipeline is:
+
+```
+calib_capture/                # raw bf16 rollouts (obs + latents)
+    └── derive_calib_ptq.py   # replay through bf16 transformer + hook abs-max
+        └── calib_data.pth    # 180 Linear x per-channel absmax (1.8 MB, variant-agnostic)
+            └── ptq.py        # apply smooth + quarot + per-channel quant
+                └── int_weights.pth  (per-variant; 2.3 - 4.6 GB)
+                    └── run_eval --variant viditq --variant_args runtime_args_<variant>.yaml
+```
+
+`calib_data.pth` is **variant-agnostic** (raw absmax) — derive once, reuse
+for every variant. `int_weights.pth` is **per-variant** (encodes bit
+allocation + smooth/quarot transforms baked into weights).
+
+Prereq: `results/calib_capture/` exists (either pulled from HF — see
+"Calibration data" above — or generated locally via
+`collect_calib_videos.py`).
+
+```bash
+conda activate lingbot-jw
+CFG=PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs
+
+# Step 1: derive calib_data.pth (~30-60 min on 4-8 GPU; one-shot, all variants share it)
+python -m ptqeval.wam.lingbot_va.method.viditq.derive_calib_ptq \
+    --videos_root results/calib_capture \
+    --all --skip_ptq --gpus auto
+# -> results/calib_data/calib_data.pth
+
+# Step 2: build int_weights.pth per variant (~5 min each on 1 GPU)
+for v in w8a8_dynamic w8a8_static w4a8_dynamic w4a8_mixed; do
+    python -m ptqeval.wam.lingbot_va.method.viditq.ptq \
+        --layer_config ${CFG}/${v}.yaml \
+        --output results/viditq_${v}/calib/int_weights.pth
+done
+
+# Step 3: eval (uses runtime_args_<v>.yaml, which points to int_weights.pth above)
+for v in w8a8_dynamic w4a8_mixed; do
+    python -m ptqeval.eval.run_eval --mode pool --variant viditq \
+        --variant_args ${CFG}/runtime_args_${v}.yaml \
+        --task_config demo_randomized --test_num 25 \
+        --save_root results/viditq_${v}
+done
+```
+
+The `<variant>.yaml` vs `runtime_args_<variant>.yaml` split:
+- `<variant>.yaml` (e.g. `w4a8_mixed.yaml`) — PTQ-time config:
+  `bit_alloc` + `smooth_alpha` + `quarot` switches + which Linears to
+  skip (cross-attn `attn2` stays FP). Consumed by `ptq.py`.
+- `runtime_args_<variant>.yaml` — server-side pointer: `layer_config:`
+  (path to the above) + `int_weights_ckpt:` (path to the step-2 output).
+  Consumed by `run_eval --variant_args`.
+
+Skipping step 1 + 2 entirely: if you only need to evaluate the
+LingBot-VA variants we already published, pull the prebuilt
+`int_weights.pth` from the HF dataset
+(`JingwuLuo/LingBot-VA_RoboTwin_clibration_data`, see "Calibration data"
+section above) and jump straight to step 3.
+
 ### Standard 15-task SR sweep (~3-4 h on 8 GPU)
 
 ```bash
