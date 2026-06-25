@@ -7,6 +7,20 @@ name = "ptqeval"
 version = "0.1.0"
 description = "PTQ evaluation harness for WAMs (lingbot-va, future WAMs) on RoboTwin."
 requires-python = ">=3.10"
+# Runtime deps NOT covered by upstream lingbot-va / RoboTwin requirements
+# files. Both server-side (lingbot-jw) and client-side (RoboTwin-jw) envs
+# run `pip install -e PTQEval/`, so listing here once removes the
+# per-node ModuleNotFoundError trap. omegaconf is needed by server.py +
+# loader to read variant YAMLs; websockets + msgpack are the
+# client/server transport (lingbot-va's own requirements lists them
+# unpinned but RoboTwin-jw doesn't read that file).
+# CUDA kernel (qwan_extension._C) is not pip-installable from here —
+# it's a separate per-host nvcc build under method/viditq/kernel/.
+dependencies = [
+    "omegaconf>=2.3",
+    "websockets>=11",
+    "msgpack>=1.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["ptqeval*"]

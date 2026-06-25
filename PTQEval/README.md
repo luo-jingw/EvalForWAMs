@@ -129,7 +129,9 @@ pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
 pip install -r lingbot-va/requirements.txt
 pip install flash-attn --no-build-isolation
 
-# Editable install of our research package
+# Editable install of our research package (auto-pulls omegaconf +
+# websockets + msgpack which neither lingbot-va/requirements.txt nor
+# RoboTwin-jw provisioning covers)
 pip install -e PTQEval/
 
 # fast_hadamard_transform: required for the QuaRoT runtime CUDA path
@@ -166,11 +168,51 @@ cd RoboTwin && bash script/_install.sh && cd ..
 pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" \
     --no-build-isolation
 
-# Editable install of our research package (so eval_client can resolve
-# `ptqeval.wam.lingbot_va.eval_client`)
+# Editable install of our research package (resolves eval_client +
+# auto-pulls websockets + msgpack which RoboTwin's _install.sh doesn't)
 pip install -e PTQEval/
 
 # (one-time) download RoboTwin assets per upstream INSTALLATION.md
+```
+
+### Per-node provisioning (multi-host clusters)
+
+On clusters where `/home` (and thus `~/miniconda3`) is **node-local** —
+not NFS-shared — every node needs its own full env setup. Conda envs do
+NOT follow you across nodes; `pip install -e PTQEval/` and the kernel
+build (next section) must both rerun per node.
+
+`pyproject.toml` now declares the dependencies that earlier slipped
+through (`omegaconf` for server YAML loading, `websockets` + `msgpack`
+for the client transport), so a fresh `pip install -e PTQEval/` in each
+env pulls them automatically. If you upgrade from an older checkout that
+skipped these, just rerun `pip install -e PTQEval/` to backfill.
+
+**Symptom of a missed step.** Every pool worker dies instantly at
+startup and `results/<run>/logs/pool/server_*.log` (or `client_*.log`)
+shows `ModuleNotFoundError`. This is distinct from CUDA-OOM, which
+shows a `Killed` line and the worker survives just past server init.
+
+Smoke-test before any long run — surfaces every missing dep in ~5 min
+instead of after a multi-hour pool failure:
+
+```bash
+python -m ptqeval.eval.run_eval --mode smoke --variant viditq \
+    --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8_dynamic.yaml \
+    --gpu_id 0 --save_root results/_smoke_w8a8
+```
+
+If a node still misbehaves after the above, diff package names against
+a known-good node (do NOT bulk-install the exact-version diff — it
+would churn the pinned torch / sapien stack):
+
+```bash
+# on the working node:
+pip freeze > /tmp/ref_freeze.txt   # then copy to the new node
+
+# on the new node, in the env being debugged:
+comm -23 <(sed 's/[ =@].*//' /tmp/ref_freeze.txt | sort -u) \
+         <(pip freeze | sed 's/[ =@].*//' | sort -u)
 ```
 
 ### 3. CUDA kernel build (`qwan_extension._C`)
