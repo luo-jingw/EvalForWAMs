@@ -293,17 +293,71 @@ def write_json(rows: list[SummaryRow], perf: dict[str, TaskPerf], path: str) -> 
         json.dump(payload, fp, indent=2)
 
 
+_OTHER_SUBCAT_PATTERNS = (
+    # (label, substring-match list against kernel name; first match wins)
+    ("norm",       ("layer_norm", "rms_norm", "native_batch_norm",
+                    "native_layer_norm")),
+    ("softmax",    ("softmax_warp_forward", "_softmax", "Softmax")),
+    ("reduction",  ("reduce_kernel", "ReduceOp", "sum_kernel",
+                    "mean_kernel", "max_kernel", "min_kernel")),
+    ("index_gather", ("index_elementwise_kernel", "IndexKernel",
+                     "gather", "scatter", "index_select")),
+    ("copy",       ("direct_copy_kernel_cuda", "_copy_kernel",
+                    "CopyKernel", "fill_kernel")),
+    ("elementwise", ("elementwise_kernel", "gpu_kernel_impl",
+                     "binary_internal", "unary_internal")),
+)
+
+# One-line description per sub-cat for figure legends / report blurbs.
+# Embedded in the merged op_profile.json so downstream chart renderers
+# can show it without hardcoding the list. `beyond_top50` is the
+# residual bucket: per-task profilers cap at the top-50 most-expensive
+# kernels by self_cuda_time, so any kernel below rank 50 contributes
+# to `op_per_call_ms.other` but cannot be sub-attributed.
+_OTHER_SUBCAT_DOC = {
+    "elementwise":  "pointwise math (add / mul / sub / silu / gelu / cast)",
+    "copy":         "direct_copy_kernel_cuda (residual saves, cache writes)",
+    "index_gather": "indexing / gather / scatter / index_select",
+    "norm":         "layer_norm / rms_norm forward",
+    "softmax":      "attention softmax kernels",
+    "reduction":    "sum / mean / max reduction kernels",
+    "other_misc":   "matched 'other' but no sub-cat pattern hit",
+    "beyond_top50": ("kernels ranked > 50 per task (each <1 ms but many; "
+                     "names truncated at profile time, only the total ms "
+                     "is recoverable)"),
+}
+
+
+def _classify_other_subcat(name: str) -> str:
+    """Sub-classify a kernel previously bucketed as 'other' by matching
+    its mangled CUDA name against a list of substring patterns. Returns
+    'other_misc' if no pattern matches (preserves the catch-all)."""
+    for label, pats in _OTHER_SUBCAT_PATTERNS:
+        for p in pats:
+            if p in name:
+                return label
+        # Fast path: exact-prefix match via the label itself (covers
+        # short kernel names without templates).
+    return "other_misc"
+
+
 def merge_op_profiles(perf_log_dir: str, out_dir: str) -> None:
     """Merge per-task <task>_op_profile.json files (written by server
     when --profile_ops is on) into a single <out_dir>/op_profile.json
-    containing the mean op-share across tasks. No-op if no per-task
-    file exists."""
+    containing the mean op-share across tasks. Also emits
+    `_other_subcats` decomposing the 'other' bucket by kernel-name
+    pattern when per-task files carry `_per_kernel_top50`; older
+    per-task files without that field still aggregate the 4-class
+    `op_per_call_ms` unchanged. No-op if no per-task file exists."""
     import glob
     files = sorted(glob.glob(os.path.join(perf_log_dir, "*_op_profile.json")))
     if not files:
         return
     per_call_ms = {"linear": 0.0, "attention": 0.0,
                     "memcpy": 0.0, "other": 0.0}
+    # Sub-decomposition of 'other' by kernel-name pattern. Same per-call
+    # ms semantics: sum across tasks, divide by n at the end.
+    other_subcats: dict[str, float] = {}
     n = 0
     sources = []
     for f in files:
@@ -319,23 +373,58 @@ def merge_op_profiles(perf_log_dir: str, out_dir: str) -> None:
         # by treating their `other` as `other` and leaving memcpy at 0.
         for k in per_call_ms:
             per_call_ms[k] += float(slot.get(k, 0.0))
+        # Per-task n_calls divisor used in server.py:
+        #     per_call_ms[cat] = sum(self_cuda_us[cat]) / 1000 / n_calls
+        # so `_per_kernel_top50` entries are *summed cuda_us across all
+        # profiled calls*. Divide by n_calls to get per-call us.
+        n_calls = max(1, int(p.get("_meta", {}).get("n_calls", 1)))
+        for kr in p.get("_per_kernel_top50", []):
+            if kr.get("cat") != "other":
+                continue
+            sub = _classify_other_subcat(kr.get("name", ""))
+            per_call_us = float(kr.get("self_cuda_us", 0.0)) / n_calls
+            other_subcats[sub] = other_subcats.get(sub, 0.0) + per_call_us / 1000.0
         n += 1
         sources.append(os.path.basename(f))
     if n == 0:
         return
     per_call_ms = {k: v / n for k, v in per_call_ms.items()}
+    other_subcats = {k: v / n for k, v in other_subcats.items()}
     out_path = os.path.join(out_dir, "op_profile.json")
     os.makedirs(out_dir, exist_ok=True)
+    payload = {
+        "_meta": {
+            "unit": "ms",
+            "source": "torch.profiler (per-task averaged)",
+            "n_tasks": n,
+            "task_files": sources,
+        },
+        "op_per_call_ms": per_call_ms,
+    }
+    # Only emit the sub-decomposition when at least one per-task file
+    # actually carried _per_kernel_top50 (otherwise the dict is empty
+    # and the consumer would print confusing zero rows). Verified
+    # _other_subcats covers only the 'other' bucket — sum should
+    # approximately equal per_call_ms['other'] modulo the top-50 cap
+    # per task (kernels outside top50 stay in `other` headline but
+    # don't get sub-attributed; this gap is the implicit
+    # 'beyond_top50' sub-bucket which we expose explicitly).
+    if other_subcats:
+        attributed = sum(other_subcats.values())
+        gap = max(0.0, per_call_ms["other"] - attributed)
+        if gap > 0.01:
+            other_subcats["beyond_top50"] = gap
+        payload["_other_subcats"] = dict(sorted(other_subcats.items(),
+                                                 key=lambda kv: -kv[1]))
+        # Only ship docs for sub-cats actually present (keeps the JSON
+        # tight; downstream renderer can show them as legend tooltips
+        # or figure footer).
+        payload["_other_subcats_doc"] = {
+            k: _OTHER_SUBCAT_DOC[k]
+            for k in other_subcats if k in _OTHER_SUBCAT_DOC
+        }
     with open(out_path, "w") as f:
-        json.dump({
-            "_meta": {
-                "unit": "ms",
-                "source": "torch.profiler (per-task averaged)",
-                "n_tasks": n,
-                "task_files": sources,
-            },
-            "op_per_call_ms": per_call_ms,
-        }, f, indent=2)
+        json.dump(payload, f, indent=2)
     print(f"wrote {out_path} (averaged across {n} tasks)")
 
 

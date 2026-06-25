@@ -1020,8 +1020,12 @@ def _make_plots(
 
 def _load_op_profile_for_tag(path: str) -> dict[str, float] | None:
     """Read a single aggregator op_profile.json:
-        {"_meta": {...}, "op_per_call_ms": {"linear": .., "attention": .., "other": ..}}
-    Returns the op_per_call_ms dict or None when unreadable / malformed."""
+        {"_meta": {...}, "op_per_call_ms": {"linear": .., "attention": .., "other": ..},
+         "_other_subcats": {...}  (optional, post-2026-06-25 aggregator)}
+    Returns a flat dict of `op_per_call_ms` keys plus any
+    `_other_subcats:<sub>` keys (when present) so a downstream stacked
+    bar can decompose the 'other' bucket inline. The original 'other'
+    key still holds the un-decomposed total for back-compat."""
     if not path or not os.path.exists(path):
         return None
     try:
@@ -1032,9 +1036,21 @@ def _load_op_profile_for_tag(path: str) -> dict[str, float] | None:
     slot = payload.get("op_per_call_ms")
     if not isinstance(slot, dict):
         return None
-    # Legacy 3-key profiles (no memcpy) fall back to 0 for memcpy.
-    return {k: float(slot.get(k, 0.0))
-            for k in ("linear", "attention", "memcpy", "other")}
+    out: dict[str, float] = {
+        k: float(slot.get(k, 0.0))
+        for k in ("linear", "attention", "memcpy", "other")
+    }
+    subs = payload.get("_other_subcats")
+    if isinstance(subs, dict):
+        for k, v in subs.items():
+            out[f"other__{k}"] = float(v)
+    doc = payload.get("_other_subcats_doc")
+    if isinstance(doc, dict):
+        # Smuggle docs through as `_doc__<sub>` keys; chart strips them
+        # before bar rendering and consumes them for the footer caption.
+        for k, v in doc.items():
+            out[f"_doc__{k}"] = v  # type: ignore[assignment]
+    return out
 
 
 def _collect_op_profile(specs: list[str]) -> dict[str, dict[str, float]] | None:
@@ -1077,10 +1093,49 @@ def _render_op_breakdown(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    op_keys = ["linear", "attention", "memcpy", "other"]
-    op_labels = {"linear": "Linear", "attention": "Attention",
-                 "memcpy": "Memcpy (KV cache)", "other": "Other"}
-    op_colors = ["#a14b6b", "#5db1a8", "#7e8fbf", "#f1d49a"]
+    # Detect optional `other__<subcat>` keys (emitted by the
+    # post-2026-06-25 aggregator from per-task _per_kernel_top50). When
+    # any variant carries them, expand the 'other' segment into colored
+    # sub-segments instead of one flat bar. Each variant may carry a
+    # different sub-cat set; missing sub-cats contribute 0 width.
+    sub_set: set[str] = set()
+    sub_docs: dict[str, str] = {}
+    for tag in tags:
+        for k, v in (data.get(tag) or {}).items():
+            if k.startswith("other__"):
+                sub_set.add(k)
+            elif k.startswith("_doc__") and isinstance(v, str):
+                sub_docs[f"other__{k.removeprefix('_doc__')}"] = v
+    has_sub = bool(sub_set)
+    # Preferred display order within "other"; unknown sub-cats appended.
+    PREFERRED = ("other__elementwise", "other__copy", "other__index_gather",
+                 "other__norm", "other__softmax", "other__reduction",
+                 "other__other_misc", "other__beyond_top50")
+    sub_keys = ([s for s in PREFERRED if s in sub_set]
+                + [s for s in sorted(sub_set) if s not in PREFERRED])
+
+    if has_sub:
+        # Replace the single 'other' segment with the sub-cats so the
+        # bar still sums to the same total.
+        op_keys = ["linear", "attention", "memcpy", *sub_keys]
+        op_labels = {"linear": "Linear", "attention": "Attention",
+                     "memcpy": "Memcpy (KV cache)"}
+        for s in sub_keys:
+            op_labels[s] = s.removeprefix("other__")
+        # Color palette: keep the original 3 for Linear/Attn/Memcpy;
+        # cycle through warm/yellow tones for the 'other' sub-cats so
+        # they read as a related family visually.
+        OTHER_PALETTE = ["#f1d49a", "#e8b56b", "#d9954e", "#c47a3a",
+                         "#a85f30", "#8a4626", "#6c321f", "#7d7259"]
+        op_colors = (["#a14b6b", "#5db1a8", "#7e8fbf"]
+                     + [OTHER_PALETTE[i % len(OTHER_PALETTE)]
+                        for i in range(len(sub_keys))])
+    else:
+        op_keys = ["linear", "attention", "memcpy", "other"]
+        op_labels = {"linear": "Linear", "attention": "Attention",
+                     "memcpy": "Memcpy (KV cache)", "other": "Other"}
+        op_colors = ["#a14b6b", "#5db1a8", "#7e8fbf", "#f1d49a"]
+
     seg = {k: [] for k in op_keys}
     totals: list[float] = []
     for tag in tags:
@@ -1188,8 +1243,24 @@ def _render_op_breakdown(
         ax.spines[s].set_visible(False)
     # Generous left margin so long variant tags (e.g.
     # `viditq_w8a8_dynamic`) are not clipped at the y-tick gutter.
-    fig.subplots_adjust(left=0.15, bottom=0.20)
-    fig.text(0.5, 0.02, caption,
+    # When the chart was decomposed into 'other' sub-cats, append a
+    # one-line definition per displayed sub-cat to the caption so the
+    # reader knows what each colored slice covers without grepping
+    # source.
+    full_caption = caption
+    if has_sub and sub_docs:
+        lines = []
+        for sk in sub_keys:
+            short = sk.removeprefix("other__")
+            desc = sub_docs.get(sk, "")
+            if desc:
+                lines.append(f"{short}: {desc}")
+        if lines:
+            full_caption = caption + "\n\nOther sub-cats — " + " | ".join(lines)
+    # Reserve more vertical room when the caption grew.
+    bottom_margin = 0.32 if (has_sub and sub_docs) else 0.20
+    fig.subplots_adjust(left=0.15, bottom=bottom_margin)
+    fig.text(0.5, 0.02, full_caption,
              ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
     p = os.path.join(plots_dir, out_name)
     fig.savefig(p, dpi=130)
