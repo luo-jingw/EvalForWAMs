@@ -198,7 +198,7 @@ instead of after a multi-hour pool failure:
 
 ```bash
 python -m ptqeval.eval.run_eval --mode smoke --variant viditq \
-    --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8_dynamic.yaml \
+    --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8.yaml \
     --gpu_id 0 --save_root results/_smoke_w8a8
 ```
 
@@ -271,15 +271,14 @@ python -m ptqeval.eval.run_eval \
     --mode pool --task_config demo_randomized --test_num 25 \
     --save_root results/bf16
 
-# Quant variant (viditq W8A8 dynamic example)
+# Quant variant (viditq W8A8 — SmoothQuant + QuaRoT + dynamic act)
 python -m ptqeval.eval.run_eval \
     --mode pool --variant viditq \
-    --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8_dynamic.yaml \
+    --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8.yaml \
     --task_config demo_randomized --test_num 25 \
     --save_root results/viditq_w8a8_dynamic
 
-# Calibration data collection (50 task x 5 ep on bf16, for viditq static
-# activation quant)
+# Calibration data collection (50 task x 5 ep on bf16, for viditq calib)
 python -m ptqeval.wam.lingbot_va.method.viditq.collect_calib_videos \
     --save_root results/calib_capture
 
@@ -342,27 +341,37 @@ python -m ptqeval.wam.lingbot_va.method.viditq.derive_calib_ptq \
     --all --skip_ptq --gpus auto
 # -> results/calib_data/calib_data.pth
 
-# Step 2: build int_weights.pth per variant (~5 min each on 1 GPU)
-for v in w8a8_dynamic w8a8_static w4a8_dynamic w4a8_mixed; do
-    python -m ptqeval.wam.lingbot_va.method.viditq.ptq \
-        --layer_config ${CFG}/${v}.yaml \
-        --output results/viditq_${v}/calib/int_weights.pth
-done
+# Step 2: build int_weights.pth per variant (~5 min each on 1 GPU).
+# results/ directory names are kept as `_dynamic` / `_mixed` for backwards
+# compatibility with prior cross_summary data and the published HF dataset;
+# the runtime_args yamls point at those existing paths.
+python -m ptqeval.wam.lingbot_va.method.viditq.ptq \
+    --layer_config ${CFG}/w8a8.yaml \
+    --output results/viditq_w8a8_dynamic/calib/int_weights.pth
+python -m ptqeval.wam.lingbot_va.method.viditq.ptq \
+    --layer_config ${CFG}/w4a8.yaml \
+    --output results/viditq_w4a8_mixed/calib/int_weights.pth
 
-# Step 3: eval (uses runtime_args_<v>.yaml, which points to int_weights.pth above)
-for v in w8a8_dynamic w4a8_mixed; do
-    python -m ptqeval.eval.run_eval --mode pool --variant viditq \
-        --variant_args ${CFG}/runtime_args_${v}.yaml \
-        --task_config demo_randomized --test_num 25 \
-        --save_root results/viditq_${v}
-done
+# Step 3: eval (runtime_args_<bits>.yaml points to int_weights.pth above)
+python -m ptqeval.eval.run_eval --mode pool --variant viditq \
+    --variant_args ${CFG}/runtime_args_w8a8.yaml \
+    --task_config demo_randomized --test_num 25 \
+    --save_root results/viditq_w8a8_dynamic
+python -m ptqeval.eval.run_eval --mode pool --variant viditq \
+    --variant_args ${CFG}/runtime_args_w4a8.yaml \
+    --task_config demo_randomized --test_num 25 \
+    --save_root results/viditq_w4a8_mixed
 ```
 
-The `<variant>.yaml` vs `runtime_args_<variant>.yaml` split:
-- `<variant>.yaml` (e.g. `w4a8_mixed.yaml`) — PTQ-time config:
-  `bit_alloc` + `smooth_alpha` + `quarot` switches + which Linears to
-  skip (cross-attn `attn2` stays FP). Consumed by `ptq.py`.
-- `runtime_args_<variant>.yaml` — server-side pointer: `layer_config:`
+The `<bits>.yaml` vs `runtime_args_<bits>.yaml` split:
+- `w8a8.yaml` / `w4a8.yaml` — PTQ-time config: `bit_alloc` +
+  `smooth_alpha` + `quarot` switches + which Linears to skip (cross-attn
+  `attn2` stays FP). Consumed by `ptq.py`. **W8A8** = SmoothQuant +
+  QuaRoT + per-token dynamic INT8 act (paper-namesake "ViDiT-Q"
+  method). **W4A8** = mixed-precision per paper Sec 4.3 / upstream
+  OpenSORA `w4a8_mixed_precision.yaml` (blocks 13-16 W4, rest W8,
+  alpha=0.5665).
+- `runtime_args_<bits>.yaml` — server-side pointer: `layer_config:`
   (path to the above) + `int_weights_ckpt:` (path to the step-2 output).
   Consumed by `run_eval --variant_args`.
 
@@ -375,17 +384,24 @@ section above) and jump straight to step 3.
 ### Standard 15-task SR sweep (~3-4 h on 8 GPU)
 
 ```bash
-for save in \
-    bf16 \
-    "viditq_w8a8_dynamic --variant viditq --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8_dynamic.yaml" \
-    "viditq_w4a8_dynamic --variant viditq --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w4a8_dynamic.yaml" \
-    "viditq_w4a8_mixed   --variant viditq --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w4a8_mixed.yaml"
-do
-    tag=${save%% *}; rest=${save#* }; [ "$rest" = "$tag" ] && rest=""
-    python -m ptqeval.eval.run_eval --mode pool \
-        --task_list_name SELECTED_15_TASKS --task_config demo_randomized \
-        --test_num 25 --save_root results/${tag} $rest
-done
+CFG=PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs
+
+# bf16 baseline
+python -m ptqeval.eval.run_eval --mode pool \
+    --task_list_name SELECTED_15_TASKS --task_config demo_randomized \
+    --test_num 25 --save_root results/bf16
+
+# viditq W8A8 (SmoothQuant + QuaRoT + dynamic act)
+python -m ptqeval.eval.run_eval --mode pool --variant viditq \
+    --variant_args ${CFG}/runtime_args_w8a8.yaml \
+    --task_list_name SELECTED_15_TASKS --task_config demo_randomized \
+    --test_num 25 --save_root results/viditq_w8a8_dynamic
+
+# viditq W4A8 mixed-precision
+python -m ptqeval.eval.run_eval --mode pool --variant viditq \
+    --variant_args ${CFG}/runtime_args_w4a8.yaml \
+    --task_list_name SELECTED_15_TASKS --task_config demo_randomized \
+    --test_num 25 --save_root results/viditq_w4a8_mixed
 ```
 
 ### Full 50-task sweep (~12-20 h on 8 GPU per variant)
@@ -407,15 +423,13 @@ statistically robust SR estimate but ~5× longer than the 15-task sweep.
 python -m ptqeval.eval.calc_cross_ckpt \
     --variant bf16=results/bf16/summary/summary.csv \
     --variant viditq_w8a8_dynamic=results/viditq_w8a8_dynamic/summary/summary.csv \
-    --variant viditq_w4a8_dynamic=results/viditq_w4a8_dynamic/summary/summary.csv \
     --variant viditq_w4a8_mixed=results/viditq_w4a8_mixed/summary/summary.csv \
     --op_profile bf16=results/bf16/summary/op_profile.json \
     --op_profile viditq_w8a8_dynamic=results/viditq_w8a8_dynamic/summary/op_profile.json \
-    --op_profile viditq_w4a8_dynamic=results/viditq_w4a8_dynamic/summary/op_profile.json \
     --op_profile viditq_w4a8_mixed=results/viditq_w4a8_mixed/summary/op_profile.json \
     --measured_flops results/measured_flops.json \
     --measured_kv_cache results/measured_kv_cache.json \
-    --int_weights_ckpt results/viditq_w4a8_dynamic/calib/int_weights.pth \
+    --int_weights_ckpt results/viditq_w4a8_mixed/calib/int_weights.pth \
     --out_dir results/cross_summary
 ```
 

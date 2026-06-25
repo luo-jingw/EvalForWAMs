@@ -1,4 +1,8 @@
-# Runtime args for --variant viditq, W8A8 kernel path.
-# Consumed by ptqeval.wam.lingbot_va.method.viditq.loader.load_quant_model.
+# Runtime args for --variant viditq, paper-namesake "ViDiT-Q" method
+# (SmoothQuant + QuaRoT composed; Phase 38).
 layer_config: PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/w8a8.yaml
-int_weights_ckpt: results/viditq_w8a8_kernel/calib/int_weights.pth
+# int_weights output path is intentionally preserved as
+# results/viditq_w8a8_dynamic/ to keep cross_summary data and HF dataset
+# layouts compatible after the 2026-06-24 config rename
+# (w8a8_dynamic.yaml -> w8a8.yaml).
+int_weights_ckpt: results/viditq_w8a8_dynamic/calib/int_weights.pth

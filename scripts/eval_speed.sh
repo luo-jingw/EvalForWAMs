@@ -38,33 +38,26 @@ ${PY} -m ptqeval.eval.run_eval --mode pool \
     --save_root ${REPO}/results/bf16_speed \
     --profile_ops --profile_n_calls ${PROFILE_N}
 
-# --- viditq dynamic (SmoothQuant + QuaRoT, no static act) --------------
+# --- viditq W8A8 (SmoothQuant + QuaRoT, dynamic act = standard W8A8) ---
 ${PY} -m ptqeval.eval.run_eval --mode pool --variant viditq \
-    --variant_args ${CFG_DIR}/runtime_args_w8a8_dynamic.yaml \
+    --variant_args ${CFG_DIR}/runtime_args_w8a8.yaml \
     --task_config ${TASK_CONFIG} --test_num ${TEST_NUM} \
     --save_root ${REPO}/results/viditq_w8a8_dynamic_speed \
     --profile_ops --profile_n_calls ${PROFILE_N}
 
-# --- viditq W8A8 static (SmoothQuant + QuaRoT + static activation) -----
+# --- viditq W4A8 mixed-precision (paper Sec 4.3 = standard W4A8) -------
 ${PY} -m ptqeval.eval.run_eval --mode pool --variant viditq \
-    --variant_args ${CFG_DIR}/runtime_args_w8a8_static.yaml \
+    --variant_args ${CFG_DIR}/runtime_args_w4a8.yaml \
     --task_config ${TASK_CONFIG} --test_num ${TEST_NUM} \
-    --save_root ${REPO}/results/viditq_w8a8_static_speed \
-    --profile_ops --profile_n_calls ${PROFILE_N}
-
-# --- viditq W4A8 dynamic (SmoothQuant + QuaRoT, W4 + dynamic act) ------
-${PY} -m ptqeval.eval.run_eval --mode pool --variant viditq \
-    --variant_args ${CFG_DIR}/runtime_args_w4a8_dynamic.yaml \
-    --task_config ${TASK_CONFIG} --test_num ${TEST_NUM} \
-    --save_root ${REPO}/results/viditq_w4a8_dynamic_speed \
+    --save_root ${REPO}/results/viditq_w4a8_mixed_speed \
     --profile_ops --profile_n_calls ${PROFILE_N}
 
 echo
-echo "All four speed runs complete."
+echo "All three speed runs complete."
 echo "Next: aggregator each + cross_summary_speed with --op_profile, e.g."
 echo
 cat <<'POST'
-for d in bf16_speed viditq_w8a8_dynamic_speed viditq_w8a8_static_speed viditq_w4a8_dynamic_speed; do
+for d in bf16_speed viditq_w8a8_dynamic_speed viditq_w4a8_mixed_speed; do
     python -m ptqeval.eval.aggregator \
         --save_root results/${d} \
         --perf_log_dir results/${d}/perf \
@@ -74,11 +67,9 @@ done
 python -m ptqeval.eval.calc_cross_ckpt \
     --variant bf16=results/bf16_speed/summary/summary.csv \
     --variant viditq_w8a8_dynamic=results/viditq_w8a8_dynamic_speed/summary/summary.csv \
-    --variant viditq_w8a8_static=results/viditq_w8a8_static_speed/summary/summary.csv \
-    --variant viditq_w4a8_dynamic=results/viditq_w4a8_dynamic_speed/summary/summary.csv \
+    --variant viditq_w4a8_mixed=results/viditq_w4a8_mixed_speed/summary/summary.csv \
     --op_profile bf16=results/bf16_speed/summary/op_profile.json \
     --op_profile viditq_w8a8_dynamic=results/viditq_w8a8_dynamic_speed/summary/op_profile.json \
-    --op_profile viditq_w8a8_static=results/viditq_w8a8_static_speed/summary/op_profile.json \
-    --op_profile viditq_w4a8_dynamic=results/viditq_w4a8_dynamic_speed/summary/op_profile.json \
+    --op_profile viditq_w4a8_mixed=results/viditq_w4a8_mixed_speed/summary/op_profile.json \
     --out_dir results/cross_summary_speed
 POST

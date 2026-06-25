@@ -25,7 +25,7 @@ Examples:
   python -m ptqeval.eval.run_eval \\
       --mode pool \\
       --variant viditq \\
-      --variant_args .../runtime_args_w8a8_dynamic.yaml \\
+      --variant_args .../runtime_args_w8a8.yaml \\
       --save_root results/viditq_w8a8_dynamic
 """
 from __future__ import annotations

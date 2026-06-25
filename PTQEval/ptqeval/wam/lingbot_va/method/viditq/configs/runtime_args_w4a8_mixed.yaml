@@ -1,4 +1,0 @@
-# Phase 40: runtime args for --variant viditq, W4A8 mixed-precision.
-# Loader reads layer_config to learn bit_alloc + smooth/quarot policy.
-layer_config: PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/w4a8_mixed.yaml
-int_weights_ckpt: results/viditq_w4a8_mixed/calib/int_weights.pth
