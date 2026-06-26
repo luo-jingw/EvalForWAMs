@@ -1,0 +1,5 @@
+# Phase 42: runtime args for --variant viditq, W4A4 mixed-precision
+# (paper Sec D.4; loader infers per-Linear wrapper class from
+# int_weights state_dict shapes — see loader._infer_cls_from_state_dict).
+layer_config: PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/w4a4.yaml
+int_weights_ckpt: results/viditq_w4a4/calib/int_weights.pth
