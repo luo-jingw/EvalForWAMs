@@ -233,6 +233,73 @@ __global__ void act_quant_bf16_with_sum_static_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 42 step 2: per-token per-group symmetric INT4 quant (group=128 along K).
+//
+// Output convention (NATURAL layout; the Atom-permuted layout the W4A4 GEMM
+// expects is applied by a separate downstream helper, not here, to keep
+// concerns split — see plan.txt G5 + the Phase 42 wrapper):
+//   x_int4_packed[n, k/2]  = (int4[2k+1] & 0xF) << 4 | (int4[2k] & 0xF)
+//   scale_x[n, g]          = amax(|x[n, g*128 : (g+1)*128]|) / 7
+//   int4 in [-8, 7], stored as raw 4-bit two's-complement.
+//
+// One CUDA block per (token, group). Warp = 32 threads, 4 elements per lane
+// (4 * 32 = 128 = GROUP). Warp-shuffle amax reduce, then quantize + pack;
+// each lane writes 2 packed bytes. Lane 0 writes the group scale.
+template <int GROUP>
+__global__ void act_quant_bf16_group_sym_kernel(
+    const __nv_bfloat16* __restrict__ x,    // [N, K]
+    uint8_t* __restrict__ x_int4_packed,    // [N, K/2]
+    __nv_bfloat16* __restrict__ scale_x,    // [N, K/GROUP]
+    int K
+) {
+    static_assert(GROUP == 128, "GROUP must be 128 (1 warp, 4 elems/lane)");
+    constexpr int PER_THREAD = GROUP / 32;  // 4
+
+    int n = blockIdx.x;
+    int g = blockIdx.y;
+    int K_groups = K / GROUP;
+
+    const __nv_bfloat16* x_grp = x + n * K + g * GROUP;
+    uint8_t* p_grp = x_int4_packed + n * (K / 2) + g * (GROUP / 2);
+
+    int tid = threadIdx.x;
+
+    float v[PER_THREAD];
+    float local_max = 0.f;
+    #pragma unroll
+    for (int i = 0; i < PER_THREAD; ++i) {
+        v[i] = __bfloat162float(x_grp[tid * PER_THREAD + i]);
+        local_max = fmaxf(local_max, fabsf(v[i]));
+    }
+
+    unsigned mask = 0xFFFFFFFFu;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_xor_sync(mask, local_max, offset));
+    }
+    float amax = local_max;
+    float scale = amax / 7.0f;
+    float inv_scale = (amax > 0.f) ? (7.0f / amax) : 0.f;
+
+    if (tid == 0) {
+        scale_x[n * K_groups + g] = __float2bfloat16(scale);
+    }
+
+    int8_t q[PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < PER_THREAD; ++i) {
+        int qi = __float2int_rn(v[i] * inv_scale);
+        qi = qi < -8 ? -8 : (qi > 7 ? 7 : qi);
+        q[i] = static_cast<int8_t>(qi);
+    }
+    uint8_t b0 = static_cast<uint8_t>((q[1] & 0xF) << 4) | static_cast<uint8_t>(q[0] & 0xF);
+    uint8_t b1 = static_cast<uint8_t>((q[3] & 0xF) << 4) | static_cast<uint8_t>(q[2] & 0xF);
+    int byte_off = tid * (PER_THREAD / 2);
+    p_grp[byte_off + 0] = b0;
+    p_grp[byte_off + 1] = b1;
+}
+
 }  // anonymous namespace
 
 
@@ -347,4 +414,41 @@ act_quant_bf16_with_sum_static(torch::Tensor x_bf16, torch::Tensor scale_in) {
     );
     QWAN_CUDA_CHECK(cudaGetLastError());
     return {x_q, scale_x, sum_x};
+}
+
+
+// Phase 42 step 2: per-token per-group symmetric INT4 quant launcher
+// (group=128 along K, no zp, no sum_x per plan G5; output in NATURAL
+// layout — the Atom-permuted layout the W4A4 GEMM expects is applied by
+// a separate downstream helper).
+std::tuple<torch::Tensor, torch::Tensor> act_quant_bf16_group128(
+    torch::Tensor x_bf16
+) {
+    TORCH_CHECK(x_bf16.is_cuda(), "x_bf16 must be on CUDA");
+    TORCH_CHECK(x_bf16.dtype() == torch::kBFloat16, "x_bf16 must be bfloat16");
+    TORCH_CHECK(x_bf16.is_contiguous(), "x_bf16 must be contiguous");
+    TORCH_CHECK(x_bf16.dim() == 2, "x_bf16 must be 2D [N, K]");
+
+    constexpr int GROUP = 128;
+    int N = static_cast<int>(x_bf16.size(0));
+    int K = static_cast<int>(x_bf16.size(1));
+    TORCH_CHECK(K % GROUP == 0, "K must be multiple of 128");
+    int K_groups = K / GROUP;
+
+    auto opts_u8   = torch::TensorOptions().dtype(torch::kUInt8).device(x_bf16.device());
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(x_bf16.device());
+    auto x_int4    = torch::empty({N, K / 2}, opts_u8);
+    auto scale_x   = torch::empty({N, K_groups}, opts_bf16);
+
+    dim3 grid(N, K_groups);
+    dim3 block(32);
+    act_quant_bf16_group_sym_kernel<GROUP>
+        <<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16.data_ptr()),
+            reinterpret_cast<uint8_t*>(x_int4.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(scale_x.data_ptr()),
+            K
+        );
+    QWAN_CUDA_CHECK(cudaGetLastError());
+    return {x_int4, scale_x};
 }

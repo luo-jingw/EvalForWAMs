@@ -8,6 +8,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
     act_quant_bf16_with_sum(torch::Tensor x_bf16);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
     act_quant_bf16_with_sum_static(torch::Tensor x_bf16, torch::Tensor scale_in);
+// Phase 42 step 2: per-token per-group sym INT4 (group=128 along K).
+std::tuple<torch::Tensor, torch::Tensor> act_quant_bf16_group128(torch::Tensor x_bf16);
 
 // toy_mma_int8.cu
 void toy_mma_int8_gemm(
@@ -151,6 +153,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "sum_x[n] = scale_x[n] * sum_k(x_int8[n, k]) cast bf16.\n"
           "Same algorithm as ViDiT-Q QuantKernel<bf16, _, kPostQuant>;\n"
           "grid-stride structure handles arbitrary K (no <=8192 cap).",
+          py::arg("x_bf16"));
+
+    m.def("act_quant_bf16_group128",
+          &act_quant_bf16_group128,
+          "Phase 42 W4A4 per-token per-group sym INT4 quant (group=128).\n"
+          "Input:  x_bf16 [N, K]. K must be a multiple of 128.\n"
+          "Output: (x_int4_packed uint8 [N, K/2], scale_x bf16 [N, K/128]).\n"
+          "Per group g of token n: scale = amax(|x|)/7, int4 = clamp(round(x/scale),\n"
+          "  -8, 7); pack byte = (q[2k+1] & 0xF) << 4 | (q[2k] & 0xF).\n"
+          "Output scale is NATURAL layout [N, K/128] row-major; the Atom-\n"
+          "permuted layout the W4A4 GEMM expects is applied by a separate\n"
+          "downstream helper (concern separation per plan G5).",
           py::arg("x_bf16"));
 
     m.def("act_quant_bf16_with_sum_static",
