@@ -74,16 +74,15 @@ logger = logging.getLogger("ptqeval.wam.lingbot_va.method.viditq.ptq")
 
 @dataclass
 class IntLayerEntry:
-    int_weight: torch.Tensor      # int8 [C_out, C_in] (W8A8) or [C_out, C_in/2]
-                                  # in QServe-packed layout (W4A8)
-    scale_weight: torch.Tensor    # bf16 [C_out]
+    int_weight: torch.Tensor      # int8  [C_out, C_in]    (W8A8)
+                                  # int8  [C_out, C_in/2]  (W4A8, QServe-packed)
+                                  # uint8 [C_out, C_in/2]  (W4A4, nibble pack)
+    scale_weight: torch.Tensor    # bf16 [C_out]               (W8A8 / W4A8: per-channel)
+                                  # bf16 [C_out, C_in/group]   (W4A4: per-group along K)
     bias: Optional[torch.Tensor]  # bf16 [C_out] or None
-    # Exactly one of zp_weight (W8A8) and szeros_weight (W4A8) is set.
-    # The W4A8 epilogue (`- szeros * a_sum`, ViDiT-Q/QServe convention)
-    # uses scale_w * zp_unsigned precomputed at PTQ time; the W8A8
-    # epilogue (`+ a_sum * zp * b_scale`, ViDiT-Q signed convention)
-    # uses the raw int16 zero-point. Different kernels demand different
-    # types; loader matches the buffer name to the active subclass.
+    # Exactly one of zp_weight (W8A8) / szeros_weight (W4A8) is set for
+    # asymmetric weight quant; both None for the W4A4 per-group SYMMETRIC
+    # path (kernel is sym-only per plan G5, no zp / szeros in signature).
     zp_weight: Optional[torch.Tensor] = None         # int16 [C_out] (W8A8 only)
     szeros_weight: Optional[torch.Tensor] = None     # bf16 [C_out]  (W4A8 only)
     quarot_sign: Optional[torch.Tensor] = None       # int8 [C_in] or None
@@ -192,6 +191,65 @@ def _per_channel_asym_quant_unsigned(
     return int_w, scale_bf16, zp_uns
 
 
+def _per_group_sym_quant_w4a4(
+    w_f32: torch.Tensor,
+    group_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Phase 42 W4A4 per-group SYMMETRIC INT4 weight quant (group axis = K).
+
+    Returns:
+      int_w_packed : uint8 [C_out, C_in/2]; low nibble = col 2c, high
+                     nibble = col 2c+1. Both signed 4-bit two's complement
+                     stored in the 4-bit unsigned field via & 0xF.
+      scale_w      : bf16 [C_out, C_in/group_size]
+
+    Per group g of row c (group of `group_size` consecutive input channels):
+        delta_g = w[c, g].abs().amax() / 7
+        int4_g  = clamp(round(w[c, g] / delta_g), -8, 7)
+    Symmetric (no zero point) per plan G5 — the atom.cu W4A4 kernel's
+    dequant epilogue is `accu += c_frag * scale_a * scale_b` with no zp
+    buffer in its signature, so an asym path here would not be runnable.
+    """
+    C_out, C_in = w_f32.shape
+    if C_in % group_size != 0:
+        raise ValueError(
+            f"C_in ({C_in}) must be a multiple of group_size ({group_size})"
+        )
+    n_groups = C_in // group_size
+    int_min, int_max = -8, 7
+
+    w_g = w_f32.view(C_out, n_groups, group_size)
+    delta = (w_g.abs().amax(dim=2) / int_max).clamp_min(1e-8)   # [C_out, G]
+    scale_bf16 = delta.to(torch.bfloat16)
+    scale_eff = scale_bf16.to(torch.float32)
+    int_w = (
+        torch.round(w_g / scale_eff.unsqueeze(2))
+        .clamp(int_min, int_max)
+        .to(torch.int8)
+    )
+    int_w_flat = int_w.view(C_out, C_in)
+    packed = _pack_int4_sym_w4a4(int_w_flat)
+    return packed, scale_bf16.contiguous()
+
+
+def _pack_int4_sym_w4a4(int_w_signed: torch.Tensor) -> torch.Tensor:
+    """Pack signed int4 nibbles into uint8 bytes.
+
+    int_w_signed: int8 [M, K], values in [-8, 7], K even.
+    Returns:    uint8 [M, K/2]; per byte: bits[3:0] = col 2c, bits[7:4] = col 2c+1.
+    Signed values encoded via & 0xF (two's complement: -1 = 0xF, -8 = 0x8).
+    The W4A4 GEMM kernel sign-extends back when unpacking inside loadAFrag /
+    loadBFrag in w4a4_gemm.cu.
+    """
+    M, K = int_w_signed.shape
+    if K % 2 != 0:
+        raise ValueError(f"K must be even for int4 packing, got {K}")
+    w32 = int_w_signed.to(torch.int32)
+    low = w32[:, 0::2] & 0xF
+    high = w32[:, 1::2] & 0xF
+    return (((high << 4) | low) & 0xFF).to(torch.uint8).contiguous()
+
+
 def _pack_int4_qserve(w_int_unsigned: torch.Tensor) -> torch.Tensor:
     """QServe W4 weight pack. Verbatim from omniserve W4A8 from_linear
     per-channel branch (lines 295-327 of
@@ -233,24 +291,31 @@ def _pack_int4_qserve(w_int_unsigned: torch.Tensor) -> torch.Tensor:
 def _quantize_one(
     linear: nn.Linear,
     weight_bits: int,
+    act_bits: int = 8,
     smooth_channel_mask: Optional[torch.Tensor] = None,
     quarot_sign: Optional[torch.Tensor] = None,
 ) -> IntLayerEntry:
-    """Pure-tensor asym quantize of a single nn.Linear. Bias copied as bf16.
+    """Pure-tensor weight quantize of a single nn.Linear. Bias copied as bf16.
+
+    Branches by the (weight_bits, act_bits) pair:
+      (8, 8) — Phase 24d signed per-channel asymmetric INT8.
+      (4, 8) — Phase 28 ViDiT-Q/QServe unsigned per-channel asymmetric W4A8.
+      (4, 4) — Phase 42 W4A4 per-group SYMMETRIC INT4 (group=128 along K,
+               kernel-faithful per plan G5; no zp / szeros).
+    The act_bits arg only picks which weight pack/sym path to use here;
+    activation quant itself happens at runtime in the matching wrapper.
 
     Optional preprocessing stages, in order:
       1. SmoothQuant (Phase 36):  W <- W * channel_mask[None, :]
       2. QuaRoT      (Phase 37):  W <- (W * sign) @ H / sqrt(C_in)
-    Then per-channel asym quant on the final W. The matching runtime
-    inverses (x / channel_mask, then (x * sign) @ H / sqrt(C_in)) are
-    applied in base.py forward.
+    Then weight quant. The matching runtime inverses (x / channel_mask,
+    (x * sign) @ H / sqrt(C_in)) are applied in base.py forward.
 
     Both preprocessing stages preserve the unquantized result exactly:
       y = x @ W.T == (x / mask) @ (W * mask).T
                   == (x_rot)    @ (W_rot).T   [H orthogonal]
-    The benefit shows up after quantization (post-Phase-24d): outliers
-    are redistributed across channels, letting per-channel scales fit a
-    tighter range.
+    Benefit shows up after quantization: rotation decorrelates outliers
+    so per-channel / per-group scales fit a tighter range.
     """
     from ptqeval.wam.lingbot_va.method.viditq.quarot import rotate_weight
 
@@ -267,6 +332,19 @@ def _quantize_one(
                   if quarot_sign is not None else None)
     smooth_out = (smooth_channel_mask.detach().to(torch.bfloat16).contiguous()
                   if smooth_channel_mask is not None else None)
+
+    if weight_bits == 4 and act_bits == 4:
+        # Phase 42 W4A4: per-group SYM INT4 (kernel-faithful per G5).
+        packed, scale_w_g = _per_group_sym_quant_w4a4(w_f32, group_size=128)
+        return IntLayerEntry(
+            int_weight=packed,                # uint8 [C_out, C_in/2]
+            scale_weight=scale_w_g,           # bf16  [C_out, C_in/128]
+            bias=bias,
+            zp_weight=None,
+            szeros_weight=None,
+            quarot_sign=quarot_out,
+            act_channel_div=smooth_out,
+        )
 
     if weight_bits == 4:
         # Phase 28: ViDiT-Q/QServe W4A8 path. Unsigned per-channel asym
@@ -300,44 +378,58 @@ def _quantize_one(
     )
 
 
-def _resolve_layer_bits(
+def _parse_bit_alloc_key(k) -> tuple[int, Optional[int]]:
+    """Parse a bit_alloc dict key into (weight_bits, act_bits_or_None).
+
+    Two formats coexist in yaml:
+      int  k=4 / k=8                       -> (k, None)  (act = default)
+      str  k="4_4" / "4_8" / "8_8" ...      -> (w, a)
+    The None sentinel means "use act_bits_default from the yaml". Phase 40
+    (W4A8 mixed-precision) yaml uses the int form; Phase 42 (W4A4 mixed-
+    precision) yaml uses the "4_4" form because the W4A4 tier differs
+    from the W4A8 tier in both weight pack and activation precision.
+    """
+    s = str(k)
+    if "_" in s:
+        w, a = s.split("_")
+        return (int(w), int(a))
+    return (int(s), None)
+
+
+def _resolve_layer_qconfig(
     name: str,
-    bit_alloc: Optional[dict[int, list[str]]],
+    bit_alloc: Optional[dict],
     weight_bits_default: int,
-) -> int:
-    """Resolve per-Linear bits via bit_alloc prefix-match table.
+    act_bits_default: int,
+) -> tuple[int, int]:
+    """Resolve per-Linear (weight_bits, act_bits) via prefix-match table.
 
-    bit_alloc maps int (4 or 8) -> list of name prefixes. First prefix
-    match wins (deterministic via insertion order; dicts in Python 3.7+
-    preserve insertion). Layers not matching any prefix get weight_bits_
-    default. When bit_alloc is None or empty, every layer gets the
-    default (homogeneous fallback, same as legacy single-bits configs).
-
-    Phase 40: paper-aligned mixed precision. Upstream ViDiT-Q
-    examples/opensora1.2/configs/w4a8_mixed_precision.yaml hardcodes
-    block 11-14 as W4 + everything else W8 (28-block OpenSORA); we use
-    block 13-16 (30-block LingBot-VA, same ~14% ratio). See plan.txt
-    Phase 40 section.
+    bit_alloc is the parsed dict {(w, a_or_None): [prefix, ...]} (key
+    pre-processed by _parse_bit_alloc_key). First prefix match wins
+    (deterministic via insertion order). Layers not matching any prefix
+    fall back to (weight_bits_default, act_bits_default).
     """
     if not bit_alloc:
-        return weight_bits_default
-    for bits, prefixes in bit_alloc.items():
+        return (weight_bits_default, act_bits_default)
+    for (w, a_opt), prefixes in bit_alloc.items():
         for prefix in prefixes:
             if prefix in name:
-                return int(bits)
-    return weight_bits_default
+                return (w, a_opt if a_opt is not None else act_bits_default)
+    return (weight_bits_default, act_bits_default)
 
 
 def compute_int_state_dict(
     model: nn.Module,
     remain_fp_regex: str,
     weight_bits: int,
+    act_bits: int = 8,
     quarot_enabled: bool = False,
     quarot_seed_base: int = 0,
+    quarot_layer_regex: str = ".*",
     smooth_quant_enabled: bool = False,
     smooth_alpha: float = 0.99,
     calib_data: Optional[dict[str, torch.Tensor]] = None,
-    bit_alloc: Optional[dict[int, list[str]]] = None,
+    bit_alloc: Optional[dict] = None,
 ) -> dict[str, IntLayerEntry]:
     """Walk model. For every nn.Linear whose full name does NOT match
     remain_fp_regex, compute its IntLayerEntry.
@@ -355,11 +447,19 @@ def compute_int_state_dict(
     method. Order matches viditq_quant_layer.py:47-48 exactly: smooth
     first, then rotate, then quant.
 
-    Phase 40: bit_alloc dict {4: [prefixes...], 8: [...]} overrides
-    weight_bits per-Linear via prefix match (see _resolve_layer_bits).
-    weight_bits parameter then serves as the default for unmatched
-    layers. When bit_alloc is None, all target Linears use weight_bits
-    (homogeneous path = pre-Phase-40 behavior).
+    Phase 40: bit_alloc dict {(w, a): [prefixes...]} overrides
+    (weight_bits, act_bits) per-Linear via prefix match (see
+    _resolve_layer_qconfig). weight_bits / act_bits parameters then
+    serve as the default for unmatched layers. When bit_alloc is None,
+    all target Linears use the defaults (homogeneous path = pre-Phase-
+    40 behavior).
+
+    Phase 42: quarot_layer_regex filters which Linears the rotation
+    is applied to (defaults to ".*" = all matched, matching pre-Phase-
+    42 behavior). The W4A4-MP yaml subsets QuaRoT to 5-of-6 layers per
+    block ({to_q, to_k, to_v, ffn.net[0].proj, ffn.net[2]}; to_out
+    excluded because its input is post-attention head-concat, already
+    structured).
     """
     from ptqeval.wam.lingbot_va.method.viditq.quarot import random_sign_vector
     from ptqeval.wam.lingbot_va.method.viditq.smooth_quant import compute_smooth_scale
@@ -371,10 +471,11 @@ def compute_int_state_dict(
         )
 
     pattern = re.compile(remain_fp_regex)
+    quarot_pattern = re.compile(quarot_layer_regex) if quarot_enabled else None
     entries: dict[str, IntLayerEntry] = {}
     layer_index = 0
     missing_calib: list[str] = []
-    bits_histogram: dict[int, int] = {}
+    qconfig_histogram: dict[tuple[int, int], int] = {}
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
@@ -382,8 +483,12 @@ def compute_int_state_dict(
             logger.debug(f"skip FP-kept {name}")
             continue
 
-        layer_bits = _resolve_layer_bits(name, bit_alloc, weight_bits)
-        bits_histogram[layer_bits] = bits_histogram.get(layer_bits, 0) + 1
+        layer_w, layer_a = _resolve_layer_qconfig(
+            name, bit_alloc, weight_bits, act_bits
+        )
+        qconfig_histogram[(layer_w, layer_a)] = (
+            qconfig_histogram.get((layer_w, layer_a), 0) + 1
+        )
 
         smooth_mask = None
         if smooth_quant_enabled:
@@ -414,14 +519,15 @@ def compute_int_state_dict(
                 )
 
         quarot_sign = None
-        if quarot_enabled:
+        if quarot_enabled and quarot_pattern.search(name):
             quarot_sign = random_sign_vector(
                 module.in_features, seed=quarot_seed_base + layer_index
             )
 
         entries[name] = _quantize_one(
             module,
-            layer_bits,
+            weight_bits=layer_w,
+            act_bits=layer_a,
             smooth_channel_mask=smooth_mask,
             quarot_sign=quarot_sign,
         )
@@ -435,8 +541,8 @@ def compute_int_state_dict(
         )
     if bit_alloc:
         logger.info(
-            f"bit allocation histogram (target layers): "
-            f"{dict(sorted(bits_histogram.items()))}"
+            f"qconfig histogram (target layers): "
+            f"{dict(sorted(qconfig_histogram.items()))}"
         )
     return entries
 
@@ -493,40 +599,64 @@ def main() -> int:
     # Phase 40: mixed-precision configs declare `weight_bits_default` +
     # `bit_alloc` instead of `weight_bits`. Homogeneous (legacy) configs
     # only set `weight_bits`. Accept either; if both set, mixed wins.
+    # Phase 42: bit_alloc keys may also be "W_A" strings (e.g. "4_4") to
+    # carry an act_bits override per tier. Plain int keys keep the
+    # Phase 40 contract (act = act_bits_default).
     bit_alloc_raw = cfg.get("bit_alloc", None)
-    bit_alloc: Optional[dict[int, list[str]]] = None
+    bit_alloc: Optional[dict] = None
     if bit_alloc_raw:
-        # OmegaConf keys are strings; coerce to int for the {bits: prefixes}
-        # convention we use throughout (matches _resolve_layer_bits).
-        bit_alloc = {int(k): list(v) for k, v in OmegaConf.to_container(bit_alloc_raw).items()}
+        bit_alloc = {
+            _parse_bit_alloc_key(k): list(v)
+            for k, v in OmegaConf.to_container(bit_alloc_raw).items()
+        }
         weight_bits = int(cfg.get("weight_bits_default", cfg.get("weight_bits", 8)))
     else:
         weight_bits = int(cfg.weight_bits)
+    act_bits = int(cfg.get("act_bits_default", cfg.get("act_bits", 8)))
     if weight_bits not in (4, 8):
         raise ValueError(
             f"weight_bits (default) must be 8 or 4, got {weight_bits}"
         )
+    if act_bits not in (4, 8):
+        raise ValueError(
+            f"act_bits (default) must be 8 or 4, got {act_bits}"
+        )
     if bit_alloc:
-        for b in bit_alloc:
-            if b not in (4, 8):
+        for (w, a_opt) in bit_alloc:
+            if w not in (4, 8):
                 raise ValueError(
-                    f"bit_alloc keys must be 4 or 8, got {b} "
+                    f"bit_alloc weight_bits must be 4 or 8, got {w} "
                     f"in {args.layer_config}"
+                )
+            if a_opt is not None and a_opt not in (4, 8):
+                raise ValueError(
+                    f"bit_alloc act_bits must be 4 or 8 or omitted, got {a_opt}"
                 )
     # Sanity: Phase 24d implements asymmetric weight quant only. Configs
     # MUST declare weight_sym: false. Asserting fails loud if a future
     # config flips this without code support.
+    # Phase 42 W4A4 uses per-group SYMMETRIC INT4 inside _quantize_one
+    # for (w=4, a=4) tier (G5; kernel is sym-only). Skip the asym-only
+    # guard when bit_alloc routes anything to W4A4 — the per-tier code
+    # path decides sym vs asym independently of the global flag.
     weight_sym = bool(cfg.get("weight_sym", True))
-    if weight_sym:
+    has_w4a4_tier = bit_alloc and any(
+        (w == 4 and (a_opt == 4)) for (w, a_opt) in bit_alloc.keys()
+    )
+    if weight_sym and not has_w4a4_tier:
         raise ValueError(
             f"layer_config {args.layer_config} has weight_sym=true (or unset, "
-            f"default true); Phase 24d only supports asymmetric quant. Set "
-            f"weight_sym: false in the yaml."
+            f"default true) but no W4A4 tier; Phase 24d/28 only support "
+            f"asymmetric quant. Set weight_sym: false in the yaml."
         )
     # Phase 36/37/38: optional preprocessing. Config drives the variant
     # (one ptq.py invocation per variant); CLI does not override config.
+    # Phase 42: quarot_layer_regex (optional) subsets QuaRoT scope for
+    # the W4A4-MP variant (5-of-6 layers per block, to_out excluded).
+    # Default ".*" preserves pre-Phase-42 behavior for W8A8 / W4A8 yaml.
     quarot_enabled = bool(cfg.get("quarot", False))
     quarot_seed_base = int(cfg.get("quarot_seed_base", 0))
+    quarot_layer_regex = str(cfg.get("quarot_layer_regex", ".*"))
     smooth_quant_enabled = bool(cfg.get("smooth_quant", False))
     smooth_alpha = float(cfg.get("smooth_alpha", 0.99))
     calib_data_path = cfg.get("calib_data_path", None)
@@ -560,16 +690,16 @@ def main() -> int:
     n_linear_total = sum(1 for _, m in model.named_modules() if isinstance(m, nn.Linear))
     if bit_alloc:
         logger.info(
-            f"weight_bits_default={weight_bits} bit_alloc={bit_alloc} "
-            f"weight_sym=False (asym per-channel) "
-            f"remain_fp_regex={remain_fp_regex!r}"
+            f"weight_bits_default={weight_bits} act_bits_default={act_bits} "
+            f"bit_alloc={bit_alloc} remain_fp_regex={remain_fp_regex!r}"
         )
     else:
-        logger.info(f"weight_bits={weight_bits} weight_sym=False (asym per-channel) "
+        logger.info(f"weight_bits={weight_bits} act_bits={act_bits} "
                     f"remain_fp_regex={remain_fp_regex!r}")
     logger.info(
         f"smooth_quant={smooth_quant_enabled} alpha={smooth_alpha} "
-        f"quarot={quarot_enabled} seed_base={quarot_seed_base}"
+        f"quarot={quarot_enabled} seed_base={quarot_seed_base} "
+        f"layer_regex={quarot_layer_regex!r}"
     )
     if calib_data is not None:
         logger.info(f"calib_data: {calib_data_path} ({len(calib_data)} layers)")
@@ -579,8 +709,10 @@ def main() -> int:
         model,
         remain_fp_regex,
         weight_bits,
+        act_bits=act_bits,
         quarot_enabled=quarot_enabled,
         quarot_seed_base=quarot_seed_base,
+        quarot_layer_regex=quarot_layer_regex,
         smooth_quant_enabled=smooth_quant_enabled,
         smooth_alpha=smooth_alpha,
         calib_data=calib_data,
