@@ -632,7 +632,14 @@ static void w4a8_dispatch(torch::Tensor _in_feats,
   auto a_ssums = reinterpret_cast<OutT *>(_a_ssums.data_ptr());
   auto wscales = reinterpret_cast<Packed2 *>(_wscales.data_ptr());
   auto ascales = reinterpret_cast<OutT *>(_ascales.data_ptr());
-  Packed2 *bias = has_bias ? reinterpret_cast<Packed2 *>(_bias.data_ptr()) : nullptr;
+  // Use if constexpr so `_bias.data_ptr()` is never compiled into the
+  // nobias path (defensive: undefined Tensor().data_ptr() behaviour varies
+  // across torch versions; the regression test happens to be benign on
+  // the current build but we should not depend on it).
+  Packed2 *bias = nullptr;
+  if constexpr (has_bias) {
+      bias = reinterpret_cast<Packed2 *>(_bias.data_ptr());
+  }
   int num_out_feats = _out_feats.size(-2);
   int num_out_channels = _out_feats.size(-1);
   auto out_feats = reinterpret_cast<OutT *>(_out_feats.data_ptr());
