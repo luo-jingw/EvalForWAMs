@@ -52,11 +52,11 @@
                   (num_blocks_m + tile_shift - 1) / tile_shift);                                             \
   dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                                                              \
   auto kernel_func =                                                                                         \
-      dense_kernel0<OutT, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;                           \
+      dense_kernel0<OutT, has_bias, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;                 \
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,                             \
                        kSmemByteSize);                                                                       \
   kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(                                             \
-      in_feats, kernel, wscales, ascales, w_szs, a_ssums, out_feats, num_in_feats, num_out_channels,       \
+      in_feats, kernel, wscales, ascales, w_szs, a_ssums, bias, out_feats, num_in_feats, num_out_channels,   \
        num_in_channels);
 
 template <int N>
@@ -305,13 +305,14 @@ share_to_reg_one_stage_B(int8_t *src, int8_t *dst, int8_t *zeros, int8_t *scales
   }
 }
 
-template <typename OutT, int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K,
+template <typename OutT, bool has_bias, int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K,
           int STAGES, int G>
 __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
                               typename DtypeTraits<OutT>::Packed2 *__restrict__ wscales,
                               OutT *__restrict__ ascales,
                               typename DtypeTraits<OutT>::Packed2 *__restrict__ w_szs,
                               OutT *__restrict__ a_ssums,
+                              typename DtypeTraits<OutT>::Packed2 *__restrict__ bias,  // nullptr if !has_bias
                               OutT *__restrict__ C, int M, int64_t N, int64_t K)
 {
   constexpr int SPLITK = 1;
@@ -594,6 +595,12 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
             float2 psums = make_float2(__int2float_rn(C_warp_local[local_id]), __int2float_rn(C_warp_local[local_id + 1]));
             psums.x = psums.x * wscale.x * ascale - w_sz.x * a_ssum;
             psums.y = psums.y * wscale.y * ascale - w_sz.y * a_ssum;
+            // Phase 42 G4: bias-fusion (register-level add before fp cast).
+            if constexpr (has_bias) {
+              float2 b = Traits::to_float2(*(bias + col_wb / 2));
+              psums.x += b.x;
+              psums.y += b.y;
+            }
             *reinterpret_cast<Packed2 *>(C + row_wb * N + col_wb) = Traits::from_float2_rn(psums);
           }
         };
@@ -602,17 +609,18 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
   }
 }
 
-// Phase 28: template dispatch over OutT (fp16 / bf16). The three host
-// launchers below (fp16, bf16) each set OutT and forward to this helper;
-// KERNEL_LAUNCH_CODE picks up OutT from this scope and instantiates
-// dense_kernel0<OutT, ...> accordingly.
-template <typename OutT>
+// Phase 28: template dispatch over OutT (fp16 / bf16).
+// Phase 42 G4: add has_bias template; bias is bf16/fp16 [N], passed as
+// Packed2* (= __half2*/__nv_bfloat162*) and indexed by col_wb/2, same
+// shape as wscales/w_szs.
+template <typename OutT, bool has_bias>
 static void w4a8_dispatch(torch::Tensor _in_feats,
                           torch::Tensor _kernel,
                           torch::Tensor _wscales,
                           torch::Tensor _ascales,
                           torch::Tensor _w_szs,
                           torch::Tensor _a_ssums,
+                          torch::Tensor _bias,        // undefined Tensor() if !has_bias
                           torch::Tensor _out_feats)
 {
   using Packed2 = typename DtypeTraits<OutT>::Packed2;
@@ -624,6 +632,7 @@ static void w4a8_dispatch(torch::Tensor _in_feats,
   auto a_ssums = reinterpret_cast<OutT *>(_a_ssums.data_ptr());
   auto wscales = reinterpret_cast<Packed2 *>(_wscales.data_ptr());
   auto ascales = reinterpret_cast<OutT *>(_ascales.data_ptr());
+  Packed2 *bias = has_bias ? reinterpret_cast<Packed2 *>(_bias.data_ptr()) : nullptr;
   int num_out_feats = _out_feats.size(-2);
   int num_out_channels = _out_feats.size(-1);
   auto out_feats = reinterpret_cast<OutT *>(_out_feats.data_ptr());
@@ -696,8 +705,9 @@ torch::Tensor w4a8_of16_nobias_weight_asym(torch::Tensor input,
               "w4a8: packed weight K dim must be input.K/2");
 
   at::Tensor output = torch::empty({M, N}, input.options().dtype(torch::kHalf));
-  w4a8_dispatch<__half>(input, weight, scale_weight, scale_input,
-                        szeros_weight, sum_input, output);
+  w4a8_dispatch<__half, false>(input, weight, scale_weight, scale_input,
+                               szeros_weight, sum_input,
+                               torch::Tensor(), output);
   return output;
 }
 
@@ -733,7 +743,89 @@ torch::Tensor w4a8_obf16_nobias_weight_asym(torch::Tensor input,
               "w4a8: packed weight K dim must be input.K/2");
 
   at::Tensor output = torch::empty({M, N}, input.options().dtype(torch::kBFloat16));
-  w4a8_dispatch<__nv_bfloat16>(input, weight, scale_weight, scale_input,
-                               szeros_weight, sum_input, output);
+  w4a8_dispatch<__nv_bfloat16, false>(input, weight, scale_weight, scale_input,
+                                      szeros_weight, sum_input,
+                                      torch::Tensor(), output);
+  return output;
+}
+
+
+// Phase 42 G4: bias-fused W4A8 launchers (fp16 + bf16). Bias must match
+// output dtype and have shape [N]; PTQ-time int_weights schema is unchanged
+// (bias stays on the FP nn.Linear and is passed per-call).
+torch::Tensor w4a8_of16_bias_weight_asym(torch::Tensor input,
+                                         torch::Tensor weight,
+                                         torch::Tensor bias,
+                                         torch::Tensor scale_input,
+                                         torch::Tensor scale_weight,
+                                         torch::Tensor sum_input,
+                                         torch::Tensor szeros_weight)
+{
+  TORCH_CHECK(input.is_cuda() && weight.is_cuda() && scale_input.is_cuda() &&
+              scale_weight.is_cuda() && sum_input.is_cuda() &&
+              szeros_weight.is_cuda() && bias.is_cuda(),
+              "w4a8 bias: all tensors must be on CUDA");
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() &&
+              scale_input.is_contiguous() && scale_weight.is_contiguous() &&
+              sum_input.is_contiguous() && szeros_weight.is_contiguous() &&
+              bias.is_contiguous(),
+              "w4a8 bias: all tensors must be contiguous");
+  TORCH_CHECK(input.dtype() == torch::kInt8, "w4a8: input must be int8");
+  TORCH_CHECK(weight.dtype() == torch::kInt8, "w4a8: weight must be int8 (packed int4)");
+  TORCH_CHECK(scale_input.dtype() == torch::kHalf, "w4a8: scale_input fp16");
+  TORCH_CHECK(scale_weight.dtype() == torch::kHalf, "w4a8: scale_weight fp16");
+  TORCH_CHECK(sum_input.dtype() == torch::kHalf, "w4a8: sum_input fp16");
+  TORCH_CHECK(szeros_weight.dtype() == torch::kHalf, "w4a8: szeros_weight fp16");
+  TORCH_CHECK(bias.dtype() == torch::kHalf, "w4a8 bias fp16");
+
+  const int M = input.size(0);
+  const int N = weight.size(0);
+  const int K = input.size(1);
+  TORCH_CHECK(weight.size(1) == K / 2,
+              "w4a8: packed weight K dim must be input.K/2");
+  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == N, "w4a8 bias must be [N]");
+
+  at::Tensor output = torch::empty({M, N}, input.options().dtype(torch::kHalf));
+  w4a8_dispatch<__half, true>(input, weight, scale_weight, scale_input,
+                              szeros_weight, sum_input, bias, output);
+  return output;
+}
+
+
+torch::Tensor w4a8_obf16_bias_weight_asym(torch::Tensor input,
+                                          torch::Tensor weight,
+                                          torch::Tensor bias,
+                                          torch::Tensor scale_input,
+                                          torch::Tensor scale_weight,
+                                          torch::Tensor sum_input,
+                                          torch::Tensor szeros_weight)
+{
+  TORCH_CHECK(input.is_cuda() && weight.is_cuda() && scale_input.is_cuda() &&
+              scale_weight.is_cuda() && sum_input.is_cuda() &&
+              szeros_weight.is_cuda() && bias.is_cuda(),
+              "w4a8 bias: all tensors must be on CUDA");
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() &&
+              scale_input.is_contiguous() && scale_weight.is_contiguous() &&
+              sum_input.is_contiguous() && szeros_weight.is_contiguous() &&
+              bias.is_contiguous(),
+              "w4a8 bias: all tensors must be contiguous");
+  TORCH_CHECK(input.dtype() == torch::kInt8, "w4a8: input must be int8");
+  TORCH_CHECK(weight.dtype() == torch::kInt8, "w4a8: weight must be int8 (packed int4)");
+  TORCH_CHECK(scale_input.dtype() == torch::kBFloat16, "w4a8: scale_input bf16");
+  TORCH_CHECK(scale_weight.dtype() == torch::kBFloat16, "w4a8: scale_weight bf16");
+  TORCH_CHECK(sum_input.dtype() == torch::kBFloat16, "w4a8: sum_input bf16");
+  TORCH_CHECK(szeros_weight.dtype() == torch::kBFloat16, "w4a8: szeros_weight bf16");
+  TORCH_CHECK(bias.dtype() == torch::kBFloat16, "w4a8 bias bf16");
+
+  const int M = input.size(0);
+  const int N = weight.size(0);
+  const int K = input.size(1);
+  TORCH_CHECK(weight.size(1) == K / 2,
+              "w4a8: packed weight K dim must be input.K/2");
+  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == N, "w4a8 bias must be [N]");
+
+  at::Tensor output = torch::empty({M, N}, input.options().dtype(torch::kBFloat16));
+  w4a8_dispatch<__nv_bfloat16, true>(input, weight, scale_weight, scale_input,
+                                     szeros_weight, sum_input, bias, output);
   return output;
 }

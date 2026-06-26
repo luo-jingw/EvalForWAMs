@@ -21,15 +21,22 @@ This differs from the W8A8 convention `w_real = scale_w * (w_int_signed +
 zp_signed)` -- the SIGN flips. PTQ output must use the unsigned formula;
 see ptq._per_channel_asym_quant_unsigned.
 
-Bias: kernel has no bias variant by design (mirrors upstream); wrapper
-adds it post-GEMM (small elementwise add, ~microseconds vs ~1-3 ms GEMM).
+Bias: Phase 42 commit 4 (G4) added a has_bias=true template instantiation
+to the QServe W4A8 kernel; when self.bias is not None we dispatch
+w4a8_obf16_bias_weight_asym which adds bias inside the dequant epilogue
+(register FFMA `psums += bias` after scale-mul) — same approach the W8A8
+kernel already uses. Eliminates the per-call Python post-GEMM elementwise
+add and its ~37us memcpy DtoD launch.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from qwan_extension import w4a8_obf16_nobias_weight_asym
+from qwan_extension import (
+    w4a8_obf16_bias_weight_asym,
+    w4a8_obf16_nobias_weight_asym,
+)
 from qwan_extension.nn.base import QuantWanLinearBase
 
 
@@ -59,7 +66,17 @@ class QuantWanLinearW4A8(QuantWanLinearBase):
         scale_x_bf16: torch.Tensor,
         sum_x_bf16: torch.Tensor,
     ) -> torch.Tensor:
-        y = w4a8_obf16_nobias_weight_asym(
+        if self.has_bias:
+            return w4a8_obf16_bias_weight_asym(
+                x_int8,
+                self.int_weight,
+                self.bias,
+                scale_x_bf16,
+                self.scale_weight,
+                sum_x_bf16,
+                self.szeros_weight,
+            )
+        return w4a8_obf16_nobias_weight_asym(
             x_int8,
             self.int_weight,
             scale_x_bf16,
@@ -67,9 +84,6 @@ class QuantWanLinearW4A8(QuantWanLinearBase):
             sum_x_bf16,
             self.szeros_weight,
         )
-        if self.has_bias:
-            y = y + self.bias
-        return y
 
     @classmethod
     def from_fp_linear(cls, fp: nn.Linear) -> "QuantWanLinearW4A8":

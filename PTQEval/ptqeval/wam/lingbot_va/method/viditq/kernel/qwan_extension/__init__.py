@@ -20,6 +20,12 @@ from qwan_extension._C import (
     w8a8_obf16_nobias_weight_sym,
     w4a8_of16_nobias_weight_asym,
     w4a8_obf16_nobias_weight_asym,
+    w4a8_of16_bias_weight_asym,
+    w4a8_obf16_bias_weight_asym,
+    w4a4_of16_nobias_weight_sym,
+    w4a4_obf16_nobias_weight_sym,
+    w4a4_of16_bias_weight_sym,
+    w4a4_obf16_bias_weight_sym,
 )
 
 __all__ = [
@@ -33,4 +39,10 @@ __all__ = [
     "w8a8_obf16_nobias_weight_sym",
     "w4a8_of16_nobias_weight_asym",
     "w4a8_obf16_nobias_weight_asym",
+    "w4a8_of16_bias_weight_asym",
+    "w4a8_obf16_bias_weight_asym",
+    "w4a4_of16_nobias_weight_sym",
+    "w4a4_obf16_nobias_weight_sym",
+    "w4a4_of16_bias_weight_sym",
+    "w4a4_obf16_bias_weight_sym",
 ]

@@ -80,6 +80,26 @@ torch::Tensor w4a8_obf16_nobias_weight_asym(
     torch::Tensor szeros_weight
 );
 
+// Phase 42 G4: W4A8 bias-fusion retrofit (has_bias=true epilogue).
+torch::Tensor w4a8_of16_bias_weight_asym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,           // fp16 [N]
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight,
+    torch::Tensor sum_input,
+    torch::Tensor szeros_weight
+);
+torch::Tensor w4a8_obf16_bias_weight_asym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,           // bf16 [N]
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight,
+    torch::Tensor sum_input,
+    torch::Tensor szeros_weight
+);
+
 // w4a4/w4a4_gemm.cu (Phase 42 W4A4 mixed-precision GEMM family).
 //   commit 1: port atom.cu, strip keeper (G2).
 //   commit 2: OutT template + bf16 specialization (Phase 25 pattern).
@@ -234,6 +254,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "W4A8 GEMM with bf16 output (Phase 28; mirrors w4a8_of16 in bf16).",
           py::arg("input"),
           py::arg("weight"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"),
+          py::arg("sum_input"),
+          py::arg("szeros_weight"));
+
+    m.def("w4a8_of16_bias_weight_asym",
+          &w4a8_of16_bias_weight_asym,
+          "Phase 42 G4: W4A8 GEMM with bias-fusion (fp16 out). Adds bias[n]\n"
+          "inside the dequant epilogue (psums += Traits::to_float2(bias[col_wb/2]))\n"
+          "after `psums = psums * wscale * ascale - w_sz * a_ssum`. bias\n"
+          "must be fp16 [N].",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("bias"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"),
+          py::arg("sum_input"),
+          py::arg("szeros_weight"));
+
+    m.def("w4a8_obf16_bias_weight_asym",
+          &w4a8_obf16_bias_weight_asym,
+          "Phase 42 G4: W4A8 GEMM with bias-fusion (bf16 out). bias must\n"
+          "be bf16 [N]. Other args identical to fp16 variant.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("bias"),
           py::arg("scale_input"),
           py::arg("scale_weight"),
           py::arg("sum_input"),
