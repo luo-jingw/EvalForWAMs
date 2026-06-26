@@ -521,7 +521,12 @@ def run_smoke(cfg: Config) -> None:
 
 
 def run_single(cfg: Config) -> None:
-    test_num = cfg.test_num if cfg.test_num is not None else 25
+    # Default test_num bumped 25 -> 100 on 2026-06-26 alongside the
+    # task_list_name default flip (SELECTED_15_TASKS -> CALIB_TASKS_ALL)
+    # so the production scope matches paper-style full-coverage eval
+    # (50 tasks x 100 ep = 5000 episodes/variant); see run_eval.py
+    # --test_num help text for rationale.
+    test_num = cfg.test_num if cfg.test_num is not None else 100
     if cfg.task_name:
         run_one_task(cfg, cfg.task_name, cfg.gpu_id, 29056, 29061,
                       test_num, "single")
@@ -531,7 +536,8 @@ def run_single(cfg: Config) -> None:
 
 
 def run_pool(cfg: Config) -> None:
-    test_num = cfg.test_num if cfg.test_num is not None else 25
+    # Default test_num: see run_single comment above (25 -> 100 on 2026-06-26).
+    test_num = cfg.test_num if cfg.test_num is not None else 100
     all_tasks = load_tasks(cfg)
     pending = [t for t in all_tasks
                 if cfg.rerun_all or task_needs_run(cfg, t, test_num)]

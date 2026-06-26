@@ -19,8 +19,12 @@ Examples:
       --save_root results/smoke_bf16
 
   python -m ptqeval.eval.run_eval \\
-      --mode pool --test_num 25 \\
+      --mode pool \\
       --save_root results/bf16
+  # Defaults: task_list_name=CALIB_TASKS_ALL (50 tasks), test_num=100 per
+  # task = 5000 episodes/variant; matches the Phase 42 5-way cross_summary
+  # convention. For the legacy 15-task x 25-ep scope add
+  # --task_list_name SELECTED_15_TASKS --test_num 25.
 
   python -m ptqeval.eval.run_eval \\
       --mode pool \\
@@ -56,7 +60,10 @@ def parse_args() -> Config:
     p.add_argument("--task_name",
                    help="smoke / single only. Default adjust_bottle for smoke.")
     p.add_argument("--test_num", type=int,
-                   help="Episodes per task. Default: 1 for smoke, 25 for single/pool.")
+                   help="Episodes per task. Default: 1 for smoke, 100 for "
+                        "single/pool (promoted from 25 on 2026-06-26 to "
+                        "match the paper-style full-coverage eval — see "
+                        "_pool_runner.run_pool / run_single).")
     p.add_argument("--gpu_id", type=int, default=0,
                    help="Used by smoke / single.")
     p.add_argument("--seed", type=int, default=0)
@@ -109,8 +116,14 @@ def parse_args() -> Config:
                    help="Runtime args yaml (layer_config + int_weights_ckpt).")
 
     # --- task list ---
-    p.add_argument("--task_list_name", default="SELECTED_15_TASKS",
-                   help="Attribute in ptqeval.wam.<wam>.tasks to iterate.")
+    p.add_argument("--task_list_name", default="CALIB_TASKS_ALL",
+                   help="Attribute in ptqeval.wam.<wam>.tasks to iterate. "
+                        "Default CALIB_TASKS_ALL (50 RoboTwin tasks) was "
+                        "promoted from SELECTED_15_TASKS on 2026-06-26 to "
+                        "match the paper-style full-coverage eval used by "
+                        "the 5-way cross_summary (Phase 42). Pass "
+                        "--task_list_name SELECTED_15_TASKS for the older "
+                        "15-task subset (Phase 39 / 40 historical scope).")
     p.add_argument("--task_config", default="demo_clean",
                    help="RoboTwin task_config yaml stem (demo_clean / "
                         "demo_randomized). Forwarded to eval_client. "
