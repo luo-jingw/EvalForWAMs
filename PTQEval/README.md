@@ -276,7 +276,7 @@ python -m ptqeval.eval.run_eval \
     --mode pool --variant viditq \
     --variant_args PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/runtime_args_w8a8.yaml \
     --task_config demo_randomized --test_num 25 \
-    --save_root results/viditq_w8a8_dynamic
+    --save_root results/viditq_w8a8
 
 # Calibration data collection (50 task x 5 ep on bf16, for viditq calib)
 python -m ptqeval.wam.lingbot_va.method.viditq.collect_calib_videos \
@@ -347,20 +347,20 @@ python -m ptqeval.wam.lingbot_va.method.viditq.derive_calib_ptq \
 # the runtime_args yamls point at those existing paths.
 python -m ptqeval.wam.lingbot_va.method.viditq.ptq \
     --layer_config ${CFG}/w8a8.yaml \
-    --output results/viditq_w8a8_dynamic/calib/int_weights.pth
+    --output results/viditq_w8a8/calib/int_weights.pth
 python -m ptqeval.wam.lingbot_va.method.viditq.ptq \
     --layer_config ${CFG}/w4a8.yaml \
-    --output results/viditq_w4a8_mixed/calib/int_weights.pth
+    --output results/viditq_w4a8/calib/int_weights.pth
 
 # Step 3: eval (runtime_args_<bits>.yaml points to int_weights.pth above)
 python -m ptqeval.eval.run_eval --mode pool --variant viditq \
     --variant_args ${CFG}/runtime_args_w8a8.yaml \
     --task_config demo_randomized --test_num 25 \
-    --save_root results/viditq_w8a8_dynamic
+    --save_root results/viditq_w8a8
 python -m ptqeval.eval.run_eval --mode pool --variant viditq \
     --variant_args ${CFG}/runtime_args_w4a8.yaml \
     --task_config demo_randomized --test_num 25 \
-    --save_root results/viditq_w4a8_mixed
+    --save_root results/viditq_w4a8
 ```
 
 The `<bits>.yaml` vs `runtime_args_<bits>.yaml` split:
@@ -395,13 +395,13 @@ python -m ptqeval.eval.run_eval --mode pool \
 python -m ptqeval.eval.run_eval --mode pool --variant viditq \
     --variant_args ${CFG}/runtime_args_w8a8.yaml \
     --task_list_name SELECTED_15_TASKS --task_config demo_randomized \
-    --test_num 25 --save_root results/viditq_w8a8_dynamic
+    --test_num 25 --save_root results/viditq_w8a8
 
 # viditq W4A8 mixed-precision
 python -m ptqeval.eval.run_eval --mode pool --variant viditq \
     --variant_args ${CFG}/runtime_args_w4a8.yaml \
     --task_list_name SELECTED_15_TASKS --task_config demo_randomized \
-    --test_num 25 --save_root results/viditq_w4a8_mixed
+    --test_num 25 --save_root results/viditq_w4a8
 ```
 
 ### Full 50-task sweep (~12-20 h on 8 GPU per variant)
@@ -422,14 +422,14 @@ statistically robust SR estimate but ~5× longer than the 15-task sweep.
 ```bash
 python -m ptqeval.eval.calc_cross_ckpt \
     --variant bf16=results/bf16/summary/summary.csv \
-    --variant viditq_w8a8_dynamic=results/viditq_w8a8_dynamic/summary/summary.csv \
-    --variant viditq_w4a8_mixed=results/viditq_w4a8_mixed/summary/summary.csv \
+    --variant viditq_w8a8=results/viditq_w8a8/summary/summary.csv \
+    --variant viditq_w4a8=results/viditq_w4a8/summary/summary.csv \
     --op_profile bf16=results/bf16/summary/op_profile.json \
-    --op_profile viditq_w8a8_dynamic=results/viditq_w8a8_dynamic/summary/op_profile.json \
-    --op_profile viditq_w4a8_mixed=results/viditq_w4a8_mixed/summary/op_profile.json \
+    --op_profile viditq_w8a8=results/viditq_w8a8/summary/op_profile.json \
+    --op_profile viditq_w4a8=results/viditq_w4a8/summary/op_profile.json \
     --measured_flops results/measured_flops.json \
     --measured_kv_cache results/measured_kv_cache.json \
-    --int_weights_ckpt results/viditq_w4a8_mixed/calib/int_weights.pth \
+    --int_weights_ckpt results/viditq_w4a8/calib/int_weights.pth \
     --out_dir results/cross_summary
 ```
 

@@ -26,7 +26,7 @@ Examples:
       --mode pool \\
       --variant viditq \\
       --variant_args .../runtime_args_w8a8.yaml \\
-      --save_root results/viditq_w8a8_dynamic
+      --save_root results/viditq_w8a8
 """
 from __future__ import annotations
 

@@ -933,7 +933,7 @@ def _make_plots(
     #
     # KV is bf16 regardless of quant variant, so values are
     # variant-independent. Pick whichever variant actually has the
-    # instrumentation (preferring viditq_w4a8_mixed since that's the
+    # instrumentation (preferring viditq_w4a8 since that's the
     # 50-task fresh run); fall back to any variant with non-NaN KV
     # data. Skipped silently when no variant has the columns
     # (pre-instrumentation cross_summary).
@@ -944,7 +944,7 @@ def _make_plots(
                 return True
         return False
 
-    kv_tag = next((t for t in ("viditq_w4a8_mixed",) if t in tags and _has_kv(t)),
+    kv_tag = next((t for t in ("viditq_w4a8",) if t in tags and _has_kv(t)),
                   None)
     if kv_tag is None:
         kv_tag = next((t for t in tags if _has_kv(t)), None)
@@ -1242,7 +1242,7 @@ def _render_op_breakdown(
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
     # Generous left margin so long variant tags (e.g.
-    # `viditq_w8a8_dynamic`) are not clipped at the y-tick gutter.
+    # `viditq_w4a8`) are not clipped at the y-tick gutter.
     # When the chart was decomposed into 'other' sub-cats, append a
     # one-line definition per displayed sub-cat to the caption so the
     # reader knows what each colored slice covers without grepping
