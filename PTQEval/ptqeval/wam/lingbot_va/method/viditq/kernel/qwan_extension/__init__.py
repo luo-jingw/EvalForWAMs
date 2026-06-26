@@ -26,6 +26,10 @@ from qwan_extension._C import (
     w4a4_obf16_nobias_weight_sym,
     w4a4_of16_bias_weight_sym,
     w4a4_obf16_bias_weight_sym,
+    pack_atom_scale_a_fp16,
+    pack_atom_scale_a_bf16,
+    pack_atom_scale_b_fp16,
+    pack_atom_scale_b_bf16,
 )
 
 __all__ = [
@@ -45,4 +49,8 @@ __all__ = [
     "w4a4_obf16_nobias_weight_sym",
     "w4a4_of16_bias_weight_sym",
     "w4a4_obf16_bias_weight_sym",
+    "pack_atom_scale_a_fp16",
+    "pack_atom_scale_a_bf16",
+    "pack_atom_scale_b_fp16",
+    "pack_atom_scale_b_bf16",
 ]

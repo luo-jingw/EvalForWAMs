@@ -133,6 +133,16 @@ torch::Tensor w4a4_obf16_bias_weight_sym(
     torch::Tensor scale_weight
 );
 
+// w4a4/scale_layout.cu (Phase 42 step 6a: pack natural per-group scale into
+// Atom-permuted layout consumed by w4a4_gemm.cu's loadScale / loadScaleReg).
+// A side (per-token activation): [M, K/128] natural -> [G, 4*M] packed.
+// B side (per-channel weight):    [N, K/128] natural -> [G, N] packed (=
+// transpose+contiguous; no element permutation).
+torch::Tensor pack_atom_scale_a_fp16(torch::Tensor natural);
+torch::Tensor pack_atom_scale_a_bf16(torch::Tensor natural);
+torch::Tensor pack_atom_scale_b_fp16(torch::Tensor natural);
+torch::Tensor pack_atom_scale_b_bf16(torch::Tensor natural);
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "qwan_extension: BF16-native int8 GEMM kernels for LingBot-VA.";
@@ -336,4 +346,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bias"),
           py::arg("scale_input"),
           py::arg("scale_weight"));
+
+    m.def("pack_atom_scale_a_fp16",
+          &pack_atom_scale_a_fp16,
+          "Phase 42 step 6a: pack [M, K/128] fp16 natural activation scale\n"
+          "into the Atom-permuted layout the W4A4 GEMM expects in its\n"
+          "A_scale buffer. Output shape [K/128, 4*M] fp16 — each natural\n"
+          "scalar appears 4 times with upper/lower interleave matching\n"
+          "ldmatrix.m8n8.x4. M must be a multiple of 128.",
+          py::arg("natural"));
+
+    m.def("pack_atom_scale_a_bf16",
+          &pack_atom_scale_a_bf16,
+          "Phase 42 step 6a: bf16 variant of pack_atom_scale_a_fp16.",
+          py::arg("natural"));
+
+    m.def("pack_atom_scale_b_fp16",
+          &pack_atom_scale_b_fp16,
+          "Phase 42 step 6a: pack [N, K/128] fp16 per-channel weight scale\n"
+          "into the Atom-permuted layout the W4A4 GEMM expects in its\n"
+          "B_scale buffer. Output [K/128, N] fp16 (= transpose+contiguous;\n"
+          "no element permutation per loadScale B-side address arithmetic).",
+          py::arg("natural"));
+
+    m.def("pack_atom_scale_b_bf16",
+          &pack_atom_scale_b_bf16,
+          "Phase 42 step 6a: bf16 variant of pack_atom_scale_b_fp16.",
+          py::arg("natural"));
 }
