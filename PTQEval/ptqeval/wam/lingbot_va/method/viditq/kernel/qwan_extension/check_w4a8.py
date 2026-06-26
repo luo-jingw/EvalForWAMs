@@ -82,34 +82,33 @@ def reference_qserve(input_int, weight_uns, scale_input, scale_w, zp_uns,
     return y_fp32.to(out_dtype)
 
 
-def numerical_check(launcher, dtype, label: str) -> bool:
-    """Reference must consume the SAME bf16/fp16 helper tensors the kernel
-    sees (scale_input, scale_weight, szeros, sum_input). Using fp64-exact
-    inputs would unfairly count the inherent precision loss of those
-    intermediate buffers as 'kernel error'. The buffers are themselves the
-    output of upstream fp16 ops (act_quant_bf16_with_sum at runtime; PTQ-
-    time scale_w/szeros cast), so the kernel can at best reproduce
-    `psums * sw * sa - szeros * sum_x` evaluated in fp32 with those exact
-    fp16/bf16 operands, then cast to the output dtype. We replicate that
-    formula here and tolerate ULP_BUDGET * 1 ULP per cell.
+def numerical_check(launcher, dtype, label: str) -> None:
+    """OBSERVATIONAL (principle.txt L12): emits metric table only, no
+    PASS/FAIL judgement.
+
+    Reference consumes the SAME bf16/fp16 helper tensors the kernel sees
+    (scale_input, scale_weight, szeros, sum_input).  Using fp64-exact
+    inputs would unfairly count the precision loss of those intermediate
+    buffers as 'kernel error'.  The kernel can at best reproduce
+    `psums * sw * sa - szeros * sum_x` evaluated in fp32 with those
+    exact fp16/bf16 operands, then cast to the output dtype.  Per-cell
+    expected ULP at max output magnitude reported as `1_ulp@max` for
+    context.  ULP_BUDGET (Phase 28 saw 8) shown alongside.
     """
     from ptqeval.wam.lingbot_va.method.viditq.ptq import _pack_int4_qserve
 
     ulp_unit = 2 ** -10 if dtype == torch.float16 else 2 ** -7
     print(f"\n{label}:")
-    print(f"{'shape (M, N, K)':<26}{'max_abs':>12}{'dyn_range':>12}{'budget':>12}{'pass':>8}")
-    print("-" * 70)
-    all_pass = True
+    print(
+        f"{'shape (M, N, K)':<26}{'max_abs':>12}{'dyn_range':>12}"
+        f"{'1_ulp@max':>14}{'n_over_budget':>16}{'budget_x_ulp':>14}"
+    )
+    print("-" * 96)
     for M, N, K in SHAPES:
         x, w_uns, sx, sw, szeros, sum_x, zp = make_inputs(M, N, K, seed=0, dtype=dtype)
         w_packed = _pack_int4_qserve(w_uns)
         y_kernel = launcher(x, w_packed, sx, sw, sum_x, szeros)
-        # int32-exact dot product computed in fp64 (int values < 2^24 are
-        # exact in fp64; this matches the kernel's int32 accumulator after
-        # cast to fp32).
-        psums = (x.to(torch.float64) @ w_uns.to(torch.float64).T)  # [M, N]
-        # Epilogue replicated in fp32 with the SAME bf16/fp16 helper tensors
-        # the kernel sees, then cast to output dtype.
+        psums = (x.to(torch.float64) @ w_uns.to(torch.float64).T)
         y_ref_fp32 = (
             psums.to(torch.float32)
             * sx.view(-1, 1).to(torch.float32)
@@ -123,31 +122,25 @@ def numerical_check(launcher, dtype, label: str) -> bool:
         max_abs = diff.max().item()
         dyn_per_cell = y_ref.to(torch.float64).abs() * ulp_unit
         budget = (dyn_per_cell.clamp_min(ulp_unit) * ULP_BUDGET)
-        over = diff > budget
-        n_over = int(over.sum().item())
-        ok = n_over == 0
-        all_pass = all_pass and ok
+        n_over = int((diff > budget).sum().item())
         y_max = y_ref.to(torch.float32).abs().max().item()
         per_cell_ulp_at_max = y_max * ulp_unit
-        print(f"({M:>4}, {N:>5}, {K:>5}){max_abs:>14.4e}{y_max:>12.2f}"
-              f"{ULP_BUDGET * per_cell_ulp_at_max:>14.4e}{('OK' if ok else f'FAIL({n_over})'):>10}")
-    return all_pass
+        print(
+            f"({M:>4}, {N:>5}, {K:>5}){max_abs:>14.4e}{y_max:>12.2f}"
+            f"{per_cell_ulp_at_max:>14.4e}{n_over:>16d}"
+            f"{ULP_BUDGET * per_cell_ulp_at_max:>14.4e}"
+        )
 
 
 def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA not available, skipping check.")
         return 1
-    bf16_ok = numerical_check(w4a8_obf16_nobias_weight_asym, torch.bfloat16,
-                              "bf16 launcher (w4a8_obf16_nobias_weight_asym)")
-    fp16_ok = numerical_check(w4a8_of16_nobias_weight_asym, torch.float16,
-                              "fp16 launcher (w4a8_of16_nobias_weight_asym)")
-    print()
-    if bf16_ok and fp16_ok:
-        print("ALL PASS")
-        return 0
-    print("FAIL")
-    return 1
+    numerical_check(w4a8_obf16_nobias_weight_asym, torch.bfloat16,
+                    "bf16 launcher (w4a8_obf16_nobias_weight_asym)")
+    numerical_check(w4a8_of16_nobias_weight_asym, torch.float16,
+                    "fp16 launcher (w4a8_of16_nobias_weight_asym)")
+    return 0
 
 
 if __name__ == "__main__":

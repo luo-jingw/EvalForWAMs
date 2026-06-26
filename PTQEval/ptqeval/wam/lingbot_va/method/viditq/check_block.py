@@ -1,11 +1,12 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-"""Block-level numerical check.
+"""Block-level OBSERVATIONAL check.
 
-Builds a small WanTransformerBlock (dim/ffn small enough to fit easily),
-clones it, wraps the clone with QuantWanTransformerBlockWithCudaKernel
-for W8A8, runs forward on fake activations against the FP reference, and
-checks output shape + max abs error < tol. Phase 28 reinstates the W4A8
-block case once QuantWanLinearW4A8 is rebuilt.
+Per principle.txt L12: emits raw metrics only — no assert, no PASS/FAIL
+judgement.  Builds a small WanTransformerBlock (dim/ffn small), clones,
+wraps the clone with QuantWanTransformerBlockWithCudaKernel for W8A8,
+runs forward on fake activations against the FP reference, and reports
+shape / dtype / finite flag / max_abs / rel max-abs.  The user inspects
+the table.
 """
 from __future__ import annotations
 
@@ -52,8 +53,8 @@ def _make_inputs(device: torch.device, dtype: torch.dtype, seed: int):
     return hidden, encoder, temb
 
 
-def _check_one(name: str, quant_cls, tol: float,
-               device: torch.device, dtype: torch.dtype, seed: int = 0) -> bool:
+def _shape_metrics(name: str, quant_cls,
+                   device: torch.device, dtype: torch.dtype, seed: int = 0) -> None:
     block_fp = _build_block(device, dtype, seed)
     block_for_kernel = copy.deepcopy(block_fp)
     block_k = QuantWanTransformerBlockWithCudaKernel(block_for_kernel, quant_cls)
@@ -63,16 +64,18 @@ def _check_one(name: str, quant_cls, tol: float,
         y_ref = block_fp(hidden, encoder, temb, rotary_emb=None)
         y_k = block_k(hidden, encoder, temb, rotary_emb=None)
 
-    shape_ok = tuple(y_k.shape) == tuple(y_ref.shape) == (BATCH, SEQ, DIM)
-    dtype_ok = y_k.dtype == dtype
+    shape_match = tuple(y_k.shape) == tuple(y_ref.shape) == (BATCH, SEQ, DIM)
+    dtype_match = y_k.dtype == dtype
     diff = (y_k.float() - y_ref.float()).abs()
     max_abs = diff.max().item()
-    finite_ok = torch.isfinite(y_k).all().item()
-    err_ok = max_abs < tol
-    flag = "OK" if (shape_ok and dtype_ok and finite_ok and err_ok) else "FAIL"
-    print(f"{name:<10}  shape={tuple(y_k.shape)}  dtype={y_k.dtype}  "
-          f"max_abs={max_abs:.3e}  tol={tol}  {flag}")
-    return shape_ok and dtype_ok and finite_ok and err_ok
+    out_mag = y_ref.float().abs().max().item()
+    rel = max_abs / max(out_mag, 1e-6)
+    finite = bool(torch.isfinite(y_k).all().item())
+    print(
+        f"{name:<10}  shape_match={shape_match}  dtype_match={dtype_match}  "
+        f"finite={finite}  max_abs={max_abs:.3e}  rel={rel:.3e}  "
+        f"out_mag={out_mag:.3e}"
+    )
 
 
 def main() -> int:
@@ -81,21 +84,8 @@ def main() -> int:
         return 2
     device = torch.device("cuda:0")
     dtype = torch.bfloat16
-    # Per-variant tol: this test measures end-to-end quant error vs the FP
-    # block (6 chained quantized Linears + residuals). On centered random
-    # Gaussian weights, sym quant is optimal; asym adds ~2x noise from the
-    # zp correction term. Real WAN weights (Phase 27) have skewed
-    # distributions where asym recovers better, but this synthetic test
-    # measures the worst case for asym. Single-Linear wrapper plumbing is
-    # already validated by check_qlinear at max_abs ~4e-3.
-    tols = {
-        "W8A8 block": 0.3,    # asym scratch+kernel, see note above
-    }
-
-    results = [
-        _check_one("W8A8 block", QuantWanLinearW8A8, tols["W8A8 block"], device, dtype),
-    ]
-    return 0 if all(results) else 1
+    _shape_metrics("W8A8 block", QuantWanLinearW8A8, device, dtype)
+    return 0
 
 
 if __name__ == "__main__":

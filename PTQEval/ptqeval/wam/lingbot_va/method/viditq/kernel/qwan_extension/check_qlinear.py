@@ -1,14 +1,12 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-"""W8A8 wrapper numerical check.
+"""W8A8 wrapper OBSERVATIONAL check.
 
-Build a torch.nn.Linear with bf16 weights on CUDA, construct
+Per principle.txt L12: emits raw metrics only — no assert, no PASS/FAIL
+judgement.  Build a torch.nn.Linear with bf16 weights on CUDA, construct
 QuantWanLinearW8A8 via from_fp_linear, run a forward pass on a 3D random
-input [B, seq, in_features], and compare to a dequantize-then-matmul
-reference. Pass condition: bf16 outputs of correct shape with max abs
-error below the tolerance.
-
-Phase 26b: W4A8 cases removed alongside the scratch W4A8 wrapper. Phase
-28 reinstates W4A8 cases against the QServe port.
+input, and report shape / dtype / device / finite flag / max_abs / rel
+against a dequantize-then-matmul reference.  The user inspects the
+metric table.
 """
 from __future__ import annotations
 
@@ -63,37 +61,45 @@ def _make_ref_asym_w8a8(x: torch.Tensor, fp: nn.Linear) -> torch.Tensor:
     return y.to(torch.bfloat16)
 
 
-def _check(name: str, in_features: int, out_features: int,
-           batch: int, seq: int, has_bias: bool, tol: float,
-           device: torch.device, seed: int = 0) -> bool:
+def _shape_metrics(name: str, in_features: int, out_features: int,
+                   batch: int, seq: int, has_bias: bool,
+                   device: torch.device, seed: int = 0) -> None:
     g = torch.Generator(device=device).manual_seed(seed)
     fp = nn.Linear(in_features, out_features, bias=has_bias).to(device).to(torch.bfloat16)
     with torch.no_grad():
-        w_init = (torch.randn((out_features, in_features), device=device, generator=g) * 0.05).to(torch.bfloat16)
+        w_init = (
+            torch.randn((out_features, in_features), device=device, generator=g) * 0.05
+        ).to(torch.bfloat16)
         fp.weight.copy_(w_init)
         if has_bias:
-            b_init = (torch.randn((out_features,), device=device, generator=g) * 0.1).to(torch.bfloat16)
+            b_init = (
+                torch.randn((out_features,), device=device, generator=g) * 0.1
+            ).to(torch.bfloat16)
             fp.bias.copy_(b_init)
 
     mod = QuantWanLinearW8A8.from_fp_linear(fp).to(device)
 
-    x = (torch.randn((batch, seq, in_features), device=device, generator=g) * 0.5).to(torch.bfloat16)
+    x = (
+        torch.randn((batch, seq, in_features), device=device, generator=g) * 0.5
+    ).to(torch.bfloat16)
     y = mod(x)
 
-    shape_ok = tuple(y.shape) == (batch, seq, out_features)
-    dtype_ok = y.dtype == torch.bfloat16
-    device_ok = y.device == device
-    finite_ok = torch.isfinite(y).all().item()
+    shape_match = tuple(y.shape) == (batch, seq, out_features)
+    dtype_match = y.dtype == torch.bfloat16
+    device_match = y.device == device
+    finite = bool(torch.isfinite(y).all().item())
 
     y_ref = _make_ref_asym_w8a8(x, fp)
     diff = (y.float() - y_ref.float()).abs()
     max_abs = diff.max().item()
-    err_ok = max_abs < tol
+    out_mag = y_ref.float().abs().max().item()
+    rel = max_abs / max(out_mag, 1e-6)
 
-    flag = "OK" if (shape_ok and dtype_ok and device_ok and finite_ok and err_ok) else "FAIL"
-    print(f"{name:<40}  shape={tuple(y.shape)} dtype={y.dtype}  "
-          f"max_abs={max_abs:.3e} (tol={tol})  {flag}")
-    return shape_ok and dtype_ok and device_ok and finite_ok and err_ok
+    print(
+        f"{name:<40}  shape_match={shape_match} dtype_match={dtype_match} "
+        f"device_match={device_match} finite={finite} "
+        f"max_abs={max_abs:.3e} rel={rel:.3e} out_mag={out_mag:.3e}"
+    )
 
 
 def main() -> int:
@@ -102,19 +108,16 @@ def main() -> int:
         return 2
     device = torch.device("cuda:0")
 
-    # tol = 5e-2: asym epilogue + bf16 final cast + fast-math fp32 noise +
-    # small output magnitudes (~1-10 for N(0,0.05) weights). Same physics
-    # as Phase 25 bench_w8a8_bf16's max_rel < 1e-2 (abs-error variant).
     # in=14336 case covers LingBot-VA down_proj shape.
     cases = [
-        ("W8A8 attn  3072->3072   bias=True",  3072,  3072, 2, 256, True,  5e-2),
-        ("W8A8 attn  3072->3072   bias=False", 3072,  3072, 2, 256, False, 5e-2),
-        ("W8A8 ffn   3072->14336  bias=True",  3072, 14336, 1, 128, True,  5e-2),
-        ("W8A8 ffn   14336->3072  bias=True",  14336, 3072, 1, 128, True,  5e-2),
+        ("W8A8 attn  3072->3072   bias=True",  3072,  3072, 2, 256, True),
+        ("W8A8 attn  3072->3072   bias=False", 3072,  3072, 2, 256, False),
+        ("W8A8 ffn   3072->14336  bias=True",  3072, 14336, 1, 128, True),
+        ("W8A8 ffn   14336->3072  bias=True",  14336, 3072, 1, 128, True),
     ]
-    results = [_check(name, ci, co, b, s, hb, tol, device)
-               for (name, ci, co, b, s, hb, tol) in cases]
-    return 0 if all(results) else 1
+    for case in cases:
+        _shape_metrics(*case, device=device)
+    return 0
 
 
 if __name__ == "__main__":

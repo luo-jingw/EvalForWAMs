@@ -3,17 +3,10 @@
 (OutT = __nv_bfloat16). Mirrors bench_w8a8_fp16.py in bf16 domain.
 
 Reference: same ViDiT-Q-style asym formula (bench_gemm.py:26-29), but
-all fp16 scales/bias/sum_input become bf16. Compares kernel output
-against fp32 ref cast to bf16, asserts max_rel < 1e-2. The looser
-bound (vs fp16 bench's 5e-3) reflects bf16's 7-bit mantissa: the
-final fp32 -> bf16 cast produces ~1 ULP noise per output element,
-which at the LingBot-VA-relevant output magnitudes (10-500) gives a
-worst-case rel error around 7e-3. 1e-2 keeps a ~30% margin.
-
-Also benchmarks wall-clock of the kernel vs torch.nn.functional.linear
-on bf16 for one representative shape (256, 3072, 3072), per Phase 25
-acceptance: "Single-shape wall-clock vs torch.nn.functional.linear
-bf16 ratio recorded in the bench output".
+all fp16 scales/bias/sum_input become bf16.  OBSERVATIONAL per
+principle.txt L12: emits {max_abs_err, max_rel_err} per shape +
+wall-clock kernel-vs-torch ms / TFLOPS / speedup for one
+representative shape; no PASS/FAIL judgement.
 """
 import torch
 import torch.nn.functional as F
@@ -26,7 +19,6 @@ SHAPES = [
     (256,  3072, 14336),
     (256, 14336,  3072),
 ]
-REL_TOL = 1e-2
 BENCH_SHAPE = (256, 3072, 3072)
 WARMUP_ITERS = 20
 TIMED_ITERS = 100
@@ -61,10 +53,9 @@ def reference_viditq(input_int, weight_int, bias,
     return y_fp32.to(torch.bfloat16)
 
 
-def numerical_check() -> bool:
-    print(f"{'shape (M, N, K)':<26}{'max_abs_err':>14}{'max_rel_err':>14}{'pass':>8}")
-    print("-" * 62)
-    all_pass = True
+def numerical_check() -> None:
+    print(f"{'shape (M, N, K)':<26}{'max_abs_err':>14}{'max_rel_err':>14}")
+    print("-" * 54)
     for M, N, K in SHAPES:
         x, w, b, sx, sw, su, zp = make_inputs(M, N, K, seed=0)
         y_kernel = w8a8_obf16_bias_weight_asym(x, w, b, sx, sw, su, zp)
@@ -76,10 +67,7 @@ def numerical_check() -> bool:
         max_abs  = abs_diff.max().item()
         denom    = y_r_fp32.abs().clamp_min(1.0)
         max_rel  = (abs_diff / denom).max().item()
-        ok = max_rel < REL_TOL
-        all_pass = all_pass and ok
-        print(f"({M:>4}, {N:>5}, {K:>5}){max_abs:>16.4e}{max_rel:>14.4e}{('OK' if ok else 'FAIL'):>8}")
-    return all_pass
+        print(f"({M:>4}, {N:>5}, {K:>5}){max_abs:>16.4e}{max_rel:>14.4e}")
 
 
 def wall_clock_compare() -> None:
@@ -128,14 +116,10 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device required")
 
-    print("Phase 25 bench: W8A8 bf16-output kernel")
+    print("Phase 25 observational bench: W8A8 bf16-output kernel")
     print()
-    all_pass = numerical_check()
-    if not all_pass:
-        raise AssertionError(f"at least one shape exceeded max_rel < {REL_TOL}")
-
+    numerical_check()
     wall_clock_compare()
-    print(f"\nbench_w8a8_bf16 OK (all shapes within max_rel < {REL_TOL})")
 
 
 if __name__ == "__main__":
