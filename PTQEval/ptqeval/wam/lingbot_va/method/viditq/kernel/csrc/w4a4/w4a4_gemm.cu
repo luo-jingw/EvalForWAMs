@@ -205,13 +205,20 @@ __device__ __forceinline__ void loadBFrag(
   }
 }
 
-// Templated on output dtype. Per-fragment float -> OutT cast uses
-// DtypeTraits::from_float_rn (half: __float2half_rn; bf16: __float2bfloat16_rn).
-template <typename OutT>
+// Templated on output dtype + has_bias.  Per-fragment float -> OutT cast
+// uses DtypeTraits::from_float_rn.  When has_bias=true a per-N bias
+// component is added before the cast (register-level FFMA); bias_warp_ptr
+// is the warp-local base of Bias in N-dim (= Bias + bi*BLOCK_N +
+// wi*WARP_ROW_TILES*N).  Per the m16n8k32 s32 fragment layout, each thread
+// owns a 2x2 sub-block within a tile: column = ti*2 + {0,1}, row =
+// {tj, tj+8}. c_frag[0]/[2] share column ti*2+0; c_frag[1]/[3] share
+// column ti*2+1 — so the 4 frags only require 2 bias loads per tile.
+template <typename OutT, bool has_bias>
 __device__ __forceinline__ void storeAccumulator(
   float *c_frag,
   OutT *smem,
-  const int smem_ldm
+  const int smem_ldm,
+  const OutT *bias_warp_ptr   // nullptr OK when has_bias == false
 ){
   using Traits = DtypeTraits<OutT>;
   const int ti = threadIdx.x % 4;
@@ -221,10 +228,15 @@ __device__ __forceinline__ void storeAccumulator(
 #pragma unroll
     for(int j = 0;j < WARP_ROW_TILES; ++j){
       OutT *ptr = &smem[i * smem_ldm * M + j * N];
-      ptr[tj * smem_ldm + ti * 2 + 0] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 0]);
-      ptr[tj * smem_ldm + ti * 2 + 1] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 1]);
-      ptr[(tj+8) * smem_ldm + ti * 2 + 0] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 2]);
-      ptr[(tj+8) * smem_ldm + ti * 2 + 1] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 3]);
+      float b0_f = 0.f, b1_f = 0.f;
+      if constexpr (has_bias) {
+        b0_f = Traits::to_float(bias_warp_ptr[j * N + ti * 2 + 0]);
+        b1_f = Traits::to_float(bias_warp_ptr[j * N + ti * 2 + 1]);
+      }
+      ptr[tj * smem_ldm + ti * 2 + 0] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 0] + b0_f);
+      ptr[tj * smem_ldm + ti * 2 + 1] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 1] + b1_f);
+      ptr[(tj+8) * smem_ldm + ti * 2 + 0] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 2] + b0_f);
+      ptr[(tj+8) * smem_ldm + ti * 2 + 1] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 3] + b1_f);
     }
   }
 }
@@ -376,7 +388,7 @@ __device__ __forceinline__ void dequant(
   }
 }
 
-template <typename OutT>
+template <typename OutT, bool has_bias>
 __global__ void __launch_bounds__(256) w4a4_compute_gemm_imma(
   const uint8_t *A,
   const uint8_t *B,
@@ -385,7 +397,8 @@ __global__ void __launch_bounds__(256) w4a4_compute_gemm_imma(
   const int N_GLOBAL,
   const int K_GLOBAL,
   const uint8_t *A_scale,
-  const uint8_t *B_scale
+  const uint8_t *B_scale,
+  const OutT *Bias            // unused when has_bias == false
 ){
   extern __shared__ uint8_t shmem[];
 
@@ -520,10 +533,14 @@ __global__ void __launch_bounds__(256) w4a4_compute_gemm_imma(
     );
   }
 
-  storeAccumulator<OutT>(
+  const OutT *bias_warp_ptr = has_bias
+    ? (Bias + bi * BLOCK_N + wi * WARP_ROW_TILES * N)
+    : nullptr;
+  storeAccumulator<OutT, has_bias>(
     c_fp,
     (OutT *)shmem + wj * WARP_COL_TILES * M * BLOCK_N + wi * WARP_ROW_TILES * N,
-    BLOCK_N
+    BLOCK_N,
+    bias_warp_ptr
   );
   __syncthreads();
 
@@ -548,13 +565,14 @@ __global__ void __launch_bounds__(256) w4a4_compute_gemm_imma(
  * \param B_scale per-group scale for B. [K/128, N] with Atom-permuted layout.
  * \param D Output matrix in global memory. OutT [M, N] row-major.
  */
-template <typename OutT>
+template <typename OutT, bool has_bias>
 static void w4a4_launch_dense_layer_gemm(
   const uint8_t *A,
   const uint8_t *B,
   const uint8_t *A_scale,
   const uint8_t *B_scale,
   OutT *D,
+  const OutT *Bias,             // nullptr when has_bias == false
   const size_t M_GLOBAL,
   const size_t N_GLOBAL,
   const size_t K_GLOBAL
@@ -577,15 +595,16 @@ static void w4a4_launch_dense_layer_gemm(
   constexpr size_t SHMEM_SZ = shmem_size1 > shmem_size2 ? shmem_size1 : shmem_size2;
 
   cudaFuncSetAttribute(
-    w4a4_compute_gemm_imma<OutT>,
+    w4a4_compute_gemm_imma<OutT, has_bias>,
     cudaFuncAttributeMaxDynamicSharedMemorySize,
     SHMEM_SZ
   );
 
-  w4a4_compute_gemm_imma<OutT><<<gridDim, blockDim, SHMEM_SZ>>>(
+  w4a4_compute_gemm_imma<OutT, has_bias><<<gridDim, blockDim, SHMEM_SZ>>>(
     A, B, D,
     M_GLOBAL, N_GLOBAL, K_GLOBAL,
-    A_scale, B_scale
+    A_scale, B_scale,
+    Bias
   );
 }
 
@@ -594,14 +613,17 @@ static void w4a4_launch_dense_layer_gemm(
 // Torch entry point: w4a4_of16_nobias_weight_sym
 // ============================================================================
 
-// Shape + alignment checks shared between fp16 + bf16 entry points.
-// out_torch_dtype is torch::kFloat16 or torch::kBFloat16.
-template <typename OutT>
-static torch::Tensor _w4a4_nobias_weight_sym_impl(
+// Shape + alignment checks shared between fp16 + bf16 / bias + nobias entry
+// points.  has_bias is a template bool: when true `bias` must be a tensor of
+// out_torch_dtype with shape [N]; when false `bias` is an undefined Tensor()
+// and the kernel receives nullptr.
+template <typename OutT, bool has_bias>
+static torch::Tensor _w4a4_weight_sym_impl(
     torch::Tensor input,
     torch::Tensor weight,
     torch::Tensor scale_input,
     torch::Tensor scale_weight,
+    torch::Tensor bias,
     torch::ScalarType out_torch_dtype
 ){
     TORCH_CHECK(input.is_cuda(),  "input must be cuda");
@@ -627,17 +649,27 @@ static torch::Tensor _w4a4_nobias_weight_sym_impl(
     TORCH_CHECK(N_global % BLOCK_N == 0, "N must be multiple of BLOCK_N (128)");
     TORCH_CHECK(K_global % BLOCK_K == 0, "K must be multiple of BLOCK_K (128)");
 
+    const OutT *bias_ptr = nullptr;
+    if constexpr (has_bias) {
+        TORCH_CHECK(bias.defined() && bias.is_cuda(), "bias must be a cuda tensor");
+        TORCH_CHECK(bias.dtype() == out_torch_dtype, "bias dtype must match output dtype");
+        TORCH_CHECK(bias.dim() == 1 && bias.size(0) == N_global,
+                    "bias must be 1-D [N]");
+        bias_ptr = reinterpret_cast<const OutT*>(bias.data_ptr());
+    }
+
     auto opts = torch::TensorOptions()
                     .dtype(out_torch_dtype)
                     .device(input.device());
     torch::Tensor output = torch::empty({M_global, N_global}, opts);
 
-    w4a4_launch_dense_layer_gemm<OutT>(
+    w4a4_launch_dense_layer_gemm<OutT, has_bias>(
         reinterpret_cast<const uint8_t*>(input.data_ptr()),
         reinterpret_cast<const uint8_t*>(weight.data_ptr()),
         reinterpret_cast<const uint8_t*>(scale_input.data_ptr()),
         reinterpret_cast<const uint8_t*>(scale_weight.data_ptr()),
         reinterpret_cast<OutT*>(output.data_ptr()),
+        bias_ptr,
         static_cast<size_t>(M_global),
         static_cast<size_t>(N_global),
         static_cast<size_t>(K_global)
@@ -647,22 +679,43 @@ static torch::Tensor _w4a4_nobias_weight_sym_impl(
 
 
 torch::Tensor w4a4_of16_nobias_weight_sym(
-    torch::Tensor input,        // uint8 [M, K/2]  packed int4 row-major
-    torch::Tensor weight,       // uint8 [N, K/2]  packed int4 row-major
-    torch::Tensor scale_input,  // fp16  [M, K/128] Atom-layout
-    torch::Tensor scale_weight  // fp16  [K/128, N] Atom-layout
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight
 ) {
-    return _w4a4_nobias_weight_sym_impl<half>(
-        input, weight, scale_input, scale_weight, torch::kFloat16);
+    return _w4a4_weight_sym_impl<half, false>(
+        input, weight, scale_input, scale_weight, torch::Tensor(), torch::kFloat16);
 }
 
-
 torch::Tensor w4a4_obf16_nobias_weight_sym(
-    torch::Tensor input,        // uint8 [M, K/2]  packed int4 row-major
-    torch::Tensor weight,       // uint8 [N, K/2]  packed int4 row-major
-    torch::Tensor scale_input,  // bf16  [M, K/128] Atom-layout
-    torch::Tensor scale_weight  // bf16  [K/128, N] Atom-layout
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight
 ) {
-    return _w4a4_nobias_weight_sym_impl<__nv_bfloat16>(
-        input, weight, scale_input, scale_weight, torch::kBFloat16);
+    return _w4a4_weight_sym_impl<__nv_bfloat16, false>(
+        input, weight, scale_input, scale_weight, torch::Tensor(), torch::kBFloat16);
+}
+
+torch::Tensor w4a4_of16_bias_weight_sym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight
+) {
+    return _w4a4_weight_sym_impl<half, true>(
+        input, weight, scale_input, scale_weight, bias, torch::kFloat16);
+}
+
+torch::Tensor w4a4_obf16_bias_weight_sym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight
+) {
+    return _w4a4_weight_sym_impl<__nv_bfloat16, true>(
+        input, weight, scale_input, scale_weight, bias, torch::kBFloat16);
 }

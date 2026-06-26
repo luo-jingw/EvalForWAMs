@@ -80,10 +80,12 @@ torch::Tensor w4a8_obf16_nobias_weight_asym(
     torch::Tensor szeros_weight
 );
 
-// w4a4/w4a4_gemm.cu (Phase 42 commit 1: ported from ViDiT-Q atom.cu,
-// keeper stripped per plan G2; per-group symmetric per G5; commit 2 adds
-// OutT template + bf16 specialization mirroring Phase 25 W8A8 pattern;
-// bias-fusion via has_bias template still pending in commit 3).
+// w4a4/w4a4_gemm.cu (Phase 42 W4A4 mixed-precision GEMM family).
+//   commit 1: port atom.cu, strip keeper (G2).
+//   commit 2: OutT template + bf16 specialization (Phase 25 pattern).
+//   commit 3: has_bias template + register-level FFMA in storeAccumulator
+//             epilogue (G3 — bias-fusion). 4 launchers: {fp16,bf16} x
+//             {with_bias, nobias}.
 torch::Tensor w4a4_of16_nobias_weight_sym(
     torch::Tensor input,         // uint8 [M, K/2] packed int4 row-major
     torch::Tensor weight,        // uint8 [N, K/2] packed int4 row-major
@@ -95,6 +97,20 @@ torch::Tensor w4a4_obf16_nobias_weight_sym(
     torch::Tensor weight,
     torch::Tensor scale_input,   // bf16 [M, K/128]
     torch::Tensor scale_weight   // bf16 [K/128, N]
+);
+torch::Tensor w4a4_of16_bias_weight_sym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,          // fp16 [N]
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight
+);
+torch::Tensor w4a4_obf16_bias_weight_sym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,          // bf16 [N]
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight
 );
 
 
@@ -247,6 +263,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "must be bf16 (interpreted as __nv_bfloat162 in dequant).",
           py::arg("input"),
           py::arg("weight"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"));
+
+    m.def("w4a4_of16_bias_weight_sym",
+          &w4a4_of16_bias_weight_sym,
+          "Phase 42 commit 3 (G3): bias-fused W4A4 GEMM (fp16 out).\n"
+          "Adds bias[n] inside the dequant epilogue via register-level\n"
+          "FFMA (one add per output element); bias loaded warp-local\n"
+          "at offset bi*BLOCK_N + wi*WARP_ROW_TILES*N. bias must be\n"
+          "fp16 [N]. Other args identical to nobias variant.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("bias"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"));
+
+    m.def("w4a4_obf16_bias_weight_sym",
+          &w4a4_obf16_bias_weight_sym,
+          "Phase 42 commit 3 (G3): bias-fused W4A4 GEMM (bf16 out).\n"
+          "bf16 specialization of w4a4_of16_bias_weight_sym; bias must\n"
+          "be bf16 [N].",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("bias"),
           py::arg("scale_input"),
           py::arg("scale_weight"));
 }
