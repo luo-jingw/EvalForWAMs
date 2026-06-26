@@ -81,13 +81,20 @@ torch::Tensor w4a8_obf16_nobias_weight_asym(
 );
 
 // w4a4/w4a4_gemm.cu (Phase 42 commit 1: ported from ViDiT-Q atom.cu,
-// keeper stripped per plan G2; per-group symmetric per G5; fp16 output,
-// no bias — bf16 + bias come in subsequent commits 2 + 3).
+// keeper stripped per plan G2; per-group symmetric per G5; commit 2 adds
+// OutT template + bf16 specialization mirroring Phase 25 W8A8 pattern;
+// bias-fusion via has_bias template still pending in commit 3).
 torch::Tensor w4a4_of16_nobias_weight_sym(
     torch::Tensor input,         // uint8 [M, K/2] packed int4 row-major
     torch::Tensor weight,        // uint8 [N, K/2] packed int4 row-major
     torch::Tensor scale_input,   // fp16 [M, K/128] Atom-permuted layout
     torch::Tensor scale_weight   // fp16 [K/128, N] Atom-permuted layout
+);
+torch::Tensor w4a4_obf16_nobias_weight_sym(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor scale_input,   // bf16 [M, K/128]
+    torch::Tensor scale_weight   // bf16 [K/128, N]
 );
 
 
@@ -228,6 +235,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "  scale_input fp16 [M, K/128] Atom-permuted layout,\n"
           "  scale_weight fp16 [K/128, N] Atom-permuted layout.\n"
           "Output [M, N] fp16. M/N/K must each be multiples of 128.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"));
+
+    m.def("w4a4_obf16_nobias_weight_sym",
+          &w4a4_obf16_nobias_weight_sym,
+          "Phase 42 commit 2: bf16-output W4A4 GEMM. Mirrors\n"
+          "w4a4_of16_nobias_weight_sym via the OutT template; scales\n"
+          "must be bf16 (interpreted as __nv_bfloat162 in dequant).",
           py::arg("input"),
           py::arg("weight"),
           py::arg("scale_input"),

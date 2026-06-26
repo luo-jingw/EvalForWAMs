@@ -13,10 +13,13 @@
 
 #include <assert.h>
 #include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <mma.h>
 #include <stdio.h>
 #include <random>
 #include <torch/extension.h>
+#include "dtype_traits.cuh"
 
 // Accumulator: 128 * 128 * sizeof(int32_t) = 64KB
 // Block A + B: 128 * 128 * sizeof(int8_t) * 0.5 * 2 = 16KB
@@ -132,9 +135,13 @@ __device__ __forceinline__ void loadBSMem(
   }
 }
 
+// Templated on output dtype (half or __nv_bfloat16). copy_t = int4 = 16 bytes
+// = 8 elements for either dtype (both are 2-byte), so the byte-level chunk
+// copy is dtype-agnostic; only the gmem/smem typed pointer changes.
+template <typename OutT>
 __device__ __forceinline__ void storeSMem(
-  const half *smem,
-  half *gmem,
+  const OutT *smem,
+  OutT *gmem,
   const int smem_ldm,
   const int max_m_dimension,
   const int gmem_ldm
@@ -198,22 +205,26 @@ __device__ __forceinline__ void loadBFrag(
   }
 }
 
+// Templated on output dtype. Per-fragment float -> OutT cast uses
+// DtypeTraits::from_float_rn (half: __float2half_rn; bf16: __float2bfloat16_rn).
+template <typename OutT>
 __device__ __forceinline__ void storeAccumulator(
   float *c_frag,
-  half *smem,
+  OutT *smem,
   const int smem_ldm
 ){
+  using Traits = DtypeTraits<OutT>;
   const int ti = threadIdx.x % 4;
   const int tj = threadIdx.x / 4;
 #pragma unroll
   for(int i = 0;i < WARP_COL_TILES; ++i){
 #pragma unroll
     for(int j = 0;j < WARP_ROW_TILES; ++j){
-      half *ptr = &smem[i * smem_ldm * M + j * N];
-      ptr[tj * smem_ldm + ti * 2 + 0] = __float2half(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 0]);
-      ptr[tj * smem_ldm + ti * 2 + 1] = __float2half(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 1]);
-      ptr[(tj+8) * smem_ldm + ti * 2 + 0] = __float2half(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 2]);
-      ptr[(tj+8) * smem_ldm + ti * 2 + 1] = __float2half(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 3]);
+      OutT *ptr = &smem[i * smem_ldm * M + j * N];
+      ptr[tj * smem_ldm + ti * 2 + 0] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 0]);
+      ptr[tj * smem_ldm + ti * 2 + 1] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 1]);
+      ptr[(tj+8) * smem_ldm + ti * 2 + 0] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 2]);
+      ptr[(tj+8) * smem_ldm + ti * 2 + 1] = Traits::from_float_rn(c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 3]);
     }
   }
 }
@@ -331,21 +342,28 @@ __device__ __forceinline__ void loadScaleReg(
   );
 }
 
+// Templated on scale dtype (= output dtype). Scales are stored as raw bytes
+// in gmem/smem and reinterpreted here as Packed2 (half2 / __nv_bfloat162).
+// CUDA's __hmul2 has overloads for both __half2 and __nv_bfloat162 since
+// CUDA 11; DtypeTraits::to_float handles per-component cast.
+template <typename OutT>
 __device__ __forceinline__ void dequant(
   int32_t *c_frag,
   int32_t *reg_a,
   int32_t *reg_b,
   float *accu
 ){
+  using Traits  = DtypeTraits<OutT>;
+  using Packed2 = typename Traits::Packed2;
 #pragma unroll
   for(int i = 0;i < WARP_COL_TILES; ++i){
-    half2 row_scale = *(half2*)(&reg_a[i]);
+    Packed2 row_scale = *(Packed2*)(&reg_a[i]);
 #pragma unroll
     for(int j = 0;j < WARP_ROW_TILES; ++j){
-      half2 col_scale = *(half2*)(&reg_b[j]);
-      half2 rs_scale = __hmul2(row_scale, col_scale);
-      float rs_scale_u = __half2float(rs_scale.x);
-      float rs_scale_d = __half2float(rs_scale.y);
+      Packed2 col_scale = *(Packed2*)(&reg_b[j]);
+      Packed2 rs_scale  = __hmul2(row_scale, col_scale);
+      float rs_scale_u = Traits::to_float(rs_scale.x);
+      float rs_scale_d = Traits::to_float(rs_scale.y);
       accu[i * WARP_ROW_TILES * 4 + j * 4 + 0] +=
         (c_frag[i * WARP_ROW_TILES * 4 + j * 4 + 0]) * rs_scale_u;
       accu[i * WARP_ROW_TILES * 4 + j * 4 + 1] +=
@@ -358,10 +376,11 @@ __device__ __forceinline__ void dequant(
   }
 }
 
+template <typename OutT>
 __global__ void __launch_bounds__(256) w4a4_compute_gemm_imma(
   const uint8_t *A,
   const uint8_t *B,
-  half *D,
+  OutT *D,
   const int M_GLOBAL,
   const int N_GLOBAL,
   const int K_GLOBAL,
@@ -493,7 +512,7 @@ __global__ void __launch_bounds__(256) w4a4_compute_gemm_imma(
       BLOCK_K,
       0
     );
-    dequant(
+    dequant<OutT>(
       c,
       a_s,
       b_s,
@@ -501,16 +520,16 @@ __global__ void __launch_bounds__(256) w4a4_compute_gemm_imma(
     );
   }
 
-  storeAccumulator(
+  storeAccumulator<OutT>(
     c_fp,
-    (half *)shmem + wj * WARP_COL_TILES * M * BLOCK_N + wi * WARP_ROW_TILES * N,
+    (OutT *)shmem + wj * WARP_COL_TILES * M * BLOCK_N + wi * WARP_ROW_TILES * N,
     BLOCK_N
   );
   __syncthreads();
 
-  storeSMem(
-    (half *)shmem,
-    (half *)D + bj * BLOCK_M * N_GLOBAL + bi * BLOCK_N,
+  storeSMem<OutT>(
+    (OutT *)shmem,
+    D + bj * BLOCK_M * N_GLOBAL + bi * BLOCK_N,
     BLOCK_N,
     M_GLOBAL,
     N_GLOBAL
@@ -518,22 +537,24 @@ __global__ void __launch_bounds__(256) w4a4_compute_gemm_imma(
 }
 
 /*!
- * \brief Dense W4A4 per-group symmetric GEMM (keeper stripped, sym, fp16 out).
+ * \brief Dense W4A4 per-group symmetric GEMM (keeper stripped, sym).
+ *   Templated on output dtype OutT in {half, __nv_bfloat16}.
+ *   Scales are stored as raw bytes (2 bytes per element) in the same dtype
+ *   as OutT — caller passes the .data_ptr() reinterpreted as uint8.
  * \param A INT4 matrix in global memory. Packed in uint8_t. [M, K/2] row-major.
  * \param B INT4 matrix in global memory. Packed in uint8_t. [K, N] column-major
  *          (equiv [N, K/2] row-major in PyTorch storage).
- * \param A_scale per-group scale for A. half stored as uint8_t pointer.
- *          [M, K/128] with Atom-specific permuted layout.
- * \param B_scale per-group scale for B. half stored as uint8_t pointer.
- *          [K/128, N] with Atom-specific permuted layout.
- * \param D Output matrix in global memory. half [M, N] row-major.
+ * \param A_scale per-group scale for A. [M, K/128] with Atom-permuted layout.
+ * \param B_scale per-group scale for B. [K/128, N] with Atom-permuted layout.
+ * \param D Output matrix in global memory. OutT [M, N] row-major.
  */
+template <typename OutT>
 static void w4a4_launch_dense_layer_gemm(
   const uint8_t *A,
   const uint8_t *B,
   const uint8_t *A_scale,
   const uint8_t *B_scale,
-  half *D,
+  OutT *D,
   const size_t M_GLOBAL,
   const size_t N_GLOBAL,
   const size_t K_GLOBAL
@@ -548,18 +569,20 @@ static void w4a4_launch_dense_layer_gemm(
     BLOCK_COL_WARPS
   );
 
+  // The scale-block half2 sizing was derived for fp16; the same byte budget
+  // covers bf16 since __nv_bfloat162 and __half2 are both 4 bytes.
   constexpr size_t shmem_size1 = sizeof(uint8_t) * BLOCK_K * (BLOCK_M + BLOCK_N) / 2 * STAGE +
       sizeof(half2) * (SCALE_PACKING_A(BLOCK_M) + SCALE_PACKING_B(BLOCK_N)) * STAGE;
-  constexpr size_t shmem_size2 = BLOCK_M * BLOCK_N * sizeof(half);
+  constexpr size_t shmem_size2 = BLOCK_M * BLOCK_N * sizeof(OutT);
   constexpr size_t SHMEM_SZ = shmem_size1 > shmem_size2 ? shmem_size1 : shmem_size2;
 
   cudaFuncSetAttribute(
-    w4a4_compute_gemm_imma,
+    w4a4_compute_gemm_imma<OutT>,
     cudaFuncAttributeMaxDynamicSharedMemorySize,
     SHMEM_SZ
   );
 
-  w4a4_compute_gemm_imma<<<gridDim, blockDim, SHMEM_SZ>>>(
+  w4a4_compute_gemm_imma<OutT><<<gridDim, blockDim, SHMEM_SZ>>>(
     A, B, D,
     M_GLOBAL, N_GLOBAL, K_GLOBAL,
     A_scale, B_scale
@@ -571,20 +594,24 @@ static void w4a4_launch_dense_layer_gemm(
 // Torch entry point: w4a4_of16_nobias_weight_sym
 // ============================================================================
 
-torch::Tensor w4a4_of16_nobias_weight_sym(
-    torch::Tensor input,        // uint8 [M, K/2]  packed int4 row-major
-    torch::Tensor weight,       // uint8 [N, K/2]  packed int4 row-major
-    torch::Tensor scale_input,  // half  [M, K/128] Atom-layout (raw bytes)
-    torch::Tensor scale_weight  // half  [K/128, N] Atom-layout (raw bytes)
-) {
+// Shape + alignment checks shared between fp16 + bf16 entry points.
+// out_torch_dtype is torch::kFloat16 or torch::kBFloat16.
+template <typename OutT>
+static torch::Tensor _w4a4_nobias_weight_sym_impl(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor scale_input,
+    torch::Tensor scale_weight,
+    torch::ScalarType out_torch_dtype
+){
     TORCH_CHECK(input.is_cuda(),  "input must be cuda");
     TORCH_CHECK(weight.is_cuda(), "weight must be cuda");
     TORCH_CHECK(scale_input.is_cuda(),  "scale_input must be cuda");
     TORCH_CHECK(scale_weight.is_cuda(), "scale_weight must be cuda");
     TORCH_CHECK(input.dtype()  == torch::kUInt8, "input must be uint8 (packed int4)");
     TORCH_CHECK(weight.dtype() == torch::kUInt8, "weight must be uint8 (packed int4)");
-    TORCH_CHECK(scale_input.dtype()  == torch::kFloat16, "scale_input must be fp16");
-    TORCH_CHECK(scale_weight.dtype() == torch::kFloat16, "scale_weight must be fp16");
+    TORCH_CHECK(scale_input.dtype()  == out_torch_dtype,  "scale_input dtype must match output dtype");
+    TORCH_CHECK(scale_weight.dtype() == out_torch_dtype,  "scale_weight dtype must match output dtype");
     TORCH_CHECK(input.dim()  == 2, "input must be 2-D [M, K/2]");
     TORCH_CHECK(weight.dim() == 2, "weight must be 2-D [N, K/2]");
 
@@ -601,19 +628,41 @@ torch::Tensor w4a4_of16_nobias_weight_sym(
     TORCH_CHECK(K_global % BLOCK_K == 0, "K must be multiple of BLOCK_K (128)");
 
     auto opts = torch::TensorOptions()
-                    .dtype(torch::kFloat16)
+                    .dtype(out_torch_dtype)
                     .device(input.device());
     torch::Tensor output = torch::empty({M_global, N_global}, opts);
 
-    w4a4_launch_dense_layer_gemm(
+    w4a4_launch_dense_layer_gemm<OutT>(
         reinterpret_cast<const uint8_t*>(input.data_ptr()),
         reinterpret_cast<const uint8_t*>(weight.data_ptr()),
         reinterpret_cast<const uint8_t*>(scale_input.data_ptr()),
         reinterpret_cast<const uint8_t*>(scale_weight.data_ptr()),
-        reinterpret_cast<half*>(output.data_ptr()),
+        reinterpret_cast<OutT*>(output.data_ptr()),
         static_cast<size_t>(M_global),
         static_cast<size_t>(N_global),
         static_cast<size_t>(K_global)
     );
     return output;
+}
+
+
+torch::Tensor w4a4_of16_nobias_weight_sym(
+    torch::Tensor input,        // uint8 [M, K/2]  packed int4 row-major
+    torch::Tensor weight,       // uint8 [N, K/2]  packed int4 row-major
+    torch::Tensor scale_input,  // fp16  [M, K/128] Atom-layout
+    torch::Tensor scale_weight  // fp16  [K/128, N] Atom-layout
+) {
+    return _w4a4_nobias_weight_sym_impl<half>(
+        input, weight, scale_input, scale_weight, torch::kFloat16);
+}
+
+
+torch::Tensor w4a4_obf16_nobias_weight_sym(
+    torch::Tensor input,        // uint8 [M, K/2]  packed int4 row-major
+    torch::Tensor weight,       // uint8 [N, K/2]  packed int4 row-major
+    torch::Tensor scale_input,  // bf16  [M, K/128] Atom-layout
+    torch::Tensor scale_weight  // bf16  [K/128, N] Atom-layout
+) {
+    return _w4a4_nobias_weight_sym_impl<__nv_bfloat16>(
+        input, weight, scale_input, scale_weight, torch::kBFloat16);
 }
