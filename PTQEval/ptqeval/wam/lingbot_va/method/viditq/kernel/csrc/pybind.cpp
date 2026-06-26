@@ -80,6 +80,16 @@ torch::Tensor w4a8_obf16_nobias_weight_asym(
     torch::Tensor szeros_weight
 );
 
+// w4a4/w4a4_gemm.cu (Phase 42 commit 1: ported from ViDiT-Q atom.cu,
+// keeper stripped per plan G2; per-group symmetric per G5; fp16 output,
+// no bias — bf16 + bias come in subsequent commits 2 + 3).
+torch::Tensor w4a4_of16_nobias_weight_sym(
+    torch::Tensor input,         // uint8 [M, K/2] packed int4 row-major
+    torch::Tensor weight,        // uint8 [N, K/2] packed int4 row-major
+    torch::Tensor scale_input,   // fp16 [M, K/128] Atom-permuted layout
+    torch::Tensor scale_weight   // fp16 [K/128, N] Atom-permuted layout
+);
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "qwan_extension: BF16-native int8 GEMM kernels for LingBot-VA.";
@@ -205,4 +215,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("scale_weight"),
           py::arg("sum_input"),
           py::arg("szeros_weight"));
+
+    m.def("w4a4_of16_nobias_weight_sym",
+          &w4a4_of16_nobias_weight_sym,
+          "Phase 42 W4A4 per-group symmetric INT4xINT4 GEMM (fp16 out).\n"
+          "Ported from ViDiT-Q atom.cu with keeper code stripped (plan\n"
+          "G2). Kernel is sym-only per plan G5; no zp, no sum_x, no bias.\n"
+          "Computes y[m,n] = sum_g(scale_a[m,g] * scale_b[g,n] *\n"
+          "  sum_{k in group g}(int4_a[m,k] * int4_b[n,k])).\n"
+          "Shapes: input uint8 [M, K/2] packed nibbles row-major,\n"
+          "  weight uint8 [N, K/2] packed nibbles (= [K,N] col-major),\n"
+          "  scale_input fp16 [M, K/128] Atom-permuted layout,\n"
+          "  scale_weight fp16 [K/128, N] Atom-permuted layout.\n"
+          "Output [M, N] fp16. M/N/K must each be multiples of 128.",
+          py::arg("input"),
+          py::arg("weight"),
+          py::arg("scale_input"),
+          py::arg("scale_weight"));
 }
