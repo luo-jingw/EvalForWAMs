@@ -27,10 +27,6 @@ Optional Part VI preprocessing buffers (default None -> no-op):
                                               channel_mask; triggers per-
                                               channel division of x
                                               before rotation/quant)
-    act_scale_static bf16  [1]               (Phase 33 static activation
-                                              scale; routes act quant to
-                                              the static kernel variant
-                                              which skips runtime amax)
 """
 from __future__ import annotations
 
@@ -93,7 +89,6 @@ class QuantWanLinearBase(nn.Module, ABC):
         # raises on shape mismatch, only ignores missing keys).
         self.act_channel_div: Optional[torch.Tensor] = None
         self.quarot_sign: Optional[torch.Tensor] = None
-        self.act_scale_static: Optional[torch.Tensor] = None
 
     @staticmethod
     @abstractmethod
@@ -148,17 +143,11 @@ class QuantWanLinearBase(nn.Module, ABC):
         if M_pad != M:
             x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, M_pad - M))
 
-        # Phase 33: static act quant when calibrated scale buffer is present;
-        # else dynamic per-token amax. Both return the same (x_int8, scale_x,
-        # sum_x) triple so the downstream W8A8 GEMM is unchanged.
-        if self.act_scale_static is not None:
-            from qwan_extension import act_quant_bf16_with_sum_static
-            x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum_static(
-                x_2d, self.act_scale_static
-            )
-        else:
-            from qwan_extension import act_quant_bf16_with_sum  # local: avoids cycles
-            x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum(x_2d)
+        # Dynamic per-token sym INT8 act quant (paper Sec 4.1; the static
+        # variant was Phase 33's paper-criticized baseline and has been
+        # removed from the shipped pipeline).
+        from qwan_extension import act_quant_bf16_with_sum  # local: avoids cycles
+        x_int8, scale_x_bf16, sum_x_bf16 = act_quant_bf16_with_sum(x_2d)
         y_2d = self._gemm(x_int8, scale_x_bf16, sum_x_bf16)
 
         if M_pad != M:

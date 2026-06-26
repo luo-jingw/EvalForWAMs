@@ -8,8 +8,7 @@ Two task lists:
   CALIB_TASKS_ALL      -- all 50 RoboTwin tasks. Used by Phase 31
                           calibration data collection (5 ep / task) so
                           per-channel activation absmax covers the full
-                          task-space diversity for SmoothQuant
-                          channel_mask and static activation scales.
+                          task-space diversity for SmoothQuant channel_mask.
 
 EVAL_STEP_LIMIT mirrors RoboTwin/task_config/_eval_step_limit.yml for
 all 50 tasks; cross-WAM aggregators can reason about wall-clock without

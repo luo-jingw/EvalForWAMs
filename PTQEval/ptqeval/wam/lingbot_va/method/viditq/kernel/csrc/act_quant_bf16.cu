@@ -178,61 +178,6 @@ __global__ void act_quant_bf16_with_sum_kernel(
     }
 }
 
-// Phase 33: static activation quant variant. Skips Phase 1 amax reduction;
-// reads a pre-computed scalar scale from scale_in[0]. Phase 2 quant + Phase
-// 3 sum_x reduction identical to act_quant_bf16_with_sum_kernel.
-//
-// scale_x[n] is still filled with the scalar (so downstream W8A8 GEMM can
-// consume the same scale_input[M] interface as the dynamic variant; cost
-// is N bf16 writes, negligible).
-__global__ void act_quant_bf16_with_sum_static_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    int8_t* __restrict__ x_q,
-    __nv_bfloat16* __restrict__ scale_x,
-    __nv_bfloat16* __restrict__ sum_x,
-    const __nv_bfloat16* __restrict__ scale_in,    // [1] scalar
-    int N, int K
-) {
-    int n = blockIdx.x;
-    if (n >= N) return;
-
-    const __nv_bfloat16* x_row = x + n * K;
-    int8_t* xq_row = x_q + n * K;
-
-    __shared__ float warp_smem[32];
-    __shared__ float row_inv_scale;
-
-    // ---- Phase 1 (static): broadcast pre-computed scalar; no reduction ----
-    if (threadIdx.x == 0) {
-        float scale = __bfloat162float(scale_in[0]);
-        if (scale < 1e-8f) scale = 1e-8f;
-        row_inv_scale = 1.0f / scale;
-        scale_x[n] = __float2bfloat16(scale);
-    }
-    __syncthreads();
-
-    // ---- Phase 2: quantize + accumulate per-thread int sum ----
-    float inv_scale = row_inv_scale;
-    int32_t local_sum = 0;
-    for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        float v = __bfloat162float(x_row[k]) * inv_scale;
-        int q = __float2int_rn(v);
-        q = q > 127 ? 127 : q;
-        q = q < -127 ? -127 : q;
-        xq_row[k] = (int8_t)q;
-        local_sum += q;
-    }
-
-    // ---- Phase 3: block-reduce int sum and write sum_x ----
-    int32_t row_sum_int = block_reduce_sum_int32(
-        local_sum, reinterpret_cast<int32_t*>(warp_smem));
-
-    if (threadIdx.x == 0) {
-        float sum_f = __int2float_rn(row_sum_int) / inv_scale;
-        sum_x[n] = __float2bfloat16(sum_f);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Phase 42 step 2: per-token per-group symmetric INT4 quant (group=128 along K).
 //
@@ -367,49 +312,6 @@ act_quant_bf16_with_sum(torch::Tensor x_bf16) {
         x_q.data_ptr<int8_t>(),
         reinterpret_cast<__nv_bfloat16*>(scale_x.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(sum_x.data_ptr()),
-        N, K
-    );
-    QWAN_CUDA_CHECK(cudaGetLastError());
-    return {x_q, scale_x, sum_x};
-}
-
-
-// Phase 33: static activation quant. Takes a pre-computed scalar scale
-// (bf16, 1-element tensor or 0-dim) and skips the amax reduction. Same
-// output shape as act_quant_bf16_with_sum (scale_x filled with the
-// scalar so downstream GEMM is unchanged).
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-act_quant_bf16_with_sum_static(torch::Tensor x_bf16, torch::Tensor scale_in) {
-    TORCH_CHECK(x_bf16.is_cuda(), "x_bf16 must be on CUDA");
-    TORCH_CHECK(x_bf16.dtype() == torch::kBFloat16, "x_bf16 must be bfloat16");
-    TORCH_CHECK(x_bf16.is_contiguous(), "x_bf16 must be contiguous");
-    TORCH_CHECK(x_bf16.dim() == 2, "x_bf16 must be 2D [N, K]");
-    TORCH_CHECK(scale_in.is_cuda(), "scale_in must be on CUDA");
-    TORCH_CHECK(scale_in.dtype() == torch::kBFloat16, "scale_in must be bfloat16");
-    TORCH_CHECK(scale_in.numel() == 1, "scale_in must contain exactly 1 scalar");
-
-    int N = static_cast<int>(x_bf16.size(0));
-    int K = static_cast<int>(x_bf16.size(1));
-
-    auto opts_int8 = torch::TensorOptions().dtype(torch::kInt8).device(x_bf16.device());
-    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(x_bf16.device());
-
-    auto x_q = torch::empty({N, K}, opts_int8);
-    auto scale_x = torch::empty({N}, opts_bf16);
-    auto sum_x = torch::empty({N}, opts_bf16);
-
-    int threads = 256;
-    if (K < threads) {
-        threads = 32 * ((K + 31) / 32);
-        if (threads < 32) threads = 32;
-    }
-
-    act_quant_bf16_with_sum_static_kernel<<<N, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x_bf16.data_ptr()),
-        x_q.data_ptr<int8_t>(),
-        reinterpret_cast<__nv_bfloat16*>(scale_x.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(sum_x.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(scale_in.data_ptr()),
         N, K
     );
     QWAN_CUDA_CHECK(cudaGetLastError());

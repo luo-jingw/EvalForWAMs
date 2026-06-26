@@ -6,8 +6,6 @@
 std::tuple<torch::Tensor, torch::Tensor> act_quant_bf16(torch::Tensor x_bf16);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
     act_quant_bf16_with_sum(torch::Tensor x_bf16);
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-    act_quant_bf16_with_sum_static(torch::Tensor x_bf16, torch::Tensor scale_in);
 // Phase 42 step 2: per-token per-group sym INT4 (group=128 along K).
 std::tuple<torch::Tensor, torch::Tensor> act_quant_bf16_group128(torch::Tensor x_bf16);
 
@@ -166,17 +164,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "permuted layout the W4A4 GEMM expects is applied by a separate\n"
           "downstream helper (concern separation per plan G5).",
           py::arg("x_bf16"));
-
-    m.def("act_quant_bf16_with_sum_static",
-          &act_quant_bf16_with_sum_static,
-          "Phase 33 static variant. Same as act_quant_bf16_with_sum but\n"
-          "skips amax reduction; reads a pre-computed scalar scale from\n"
-          "scale_in[0] (bf16). scale_x[N] is still filled with the scalar\n"
-          "so downstream W8A8 GEMM consumes the same per-row scale[M]\n"
-          "interface as the dynamic variant.\n"
-          "Input:  x_bf16 [N, K], scale_in [1] bf16.\n"
-          "Output: (x_int8 [N, K], scale_x_bf16 [N], sum_x_bf16 [N]).",
-          py::arg("x_bf16"), py::arg("scale_in"));
 
     m.def("toy_mma_int8_gemm",
           &toy_mma_int8_gemm,

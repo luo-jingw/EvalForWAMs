@@ -159,7 +159,7 @@ def load_quant_model(
     # them (would trigger size mismatch on load); instead loader installs
     # them as proper buffers post-load, only on layers that have them.
     model_keys = set(model.state_dict().keys())
-    PREPROCESSING_SUFFIXES = (".quarot_sign", ".act_channel_div", ".act_scale_static")
+    PREPROCESSING_SUFFIXES = (".quarot_sign", ".act_channel_div")
 
     main_sd = {}
     preprocessing_sd = {}

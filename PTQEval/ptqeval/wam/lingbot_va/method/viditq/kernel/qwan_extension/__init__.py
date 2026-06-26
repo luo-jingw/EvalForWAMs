@@ -12,7 +12,6 @@ import torch  # noqa: F401
 from qwan_extension._C import (
     act_quant_bf16,
     act_quant_bf16_with_sum,
-    act_quant_bf16_with_sum_static,
     act_quant_bf16_group128,
     w8a8_of16_bias_weight_asym,
     w8a8_obf16_bias_weight_asym,
@@ -32,7 +31,6 @@ from qwan_extension._C import (
 __all__ = [
     "act_quant_bf16",
     "act_quant_bf16_with_sum",
-    "act_quant_bf16_with_sum_static",
     "act_quant_bf16_group128",
     "w8a8_of16_bias_weight_asym",
     "w8a8_obf16_bias_weight_asym",

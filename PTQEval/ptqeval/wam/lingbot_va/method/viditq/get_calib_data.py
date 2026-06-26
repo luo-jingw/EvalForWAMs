@@ -19,8 +19,7 @@ Output schema (matches Part V Phase 32 / Part VI Phase 36 consumers):
 
 Single-tensor-per-layer (NOT per-call) keeps storage trivial (~1 MB
 total) while still being sufficient for SmoothQuant's channel_mask
-formula and for the simple max-based static activation scale used in
-the Part V plan.
+formula.
 """
 from __future__ import annotations
 

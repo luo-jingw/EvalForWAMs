@@ -32,7 +32,7 @@ forward driven by previously-captured observations.
 After workers drain the queue, the orchestrator runs ptq.py as a
 subprocess with the supplied --layer_config so PTQ produces the
 int_weights.pth for any variant (W8A8 dynamic / smooth / quarot /
-viditq / viditq-static). Layer configs read calib_data path from the
+viditq combined). Layer configs read calib_data path from the
 yaml itself; this script writes calib_data.pth at the path declared
 by the config (or --calib_out override).
 
