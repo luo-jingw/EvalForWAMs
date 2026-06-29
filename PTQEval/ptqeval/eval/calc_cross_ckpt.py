@@ -326,6 +326,30 @@ _GPU_SPECS: dict[str, dict] = {
 }
 
 
+def _parse_measured_kv_paths(spec: str | None) -> dict[str, str]:
+    """Parse a tagged --measured_kv_cache string 'tag=path,tag2=path2'
+    into {tag: path}. Bare path or empty -> {}."""
+    out: dict[str, str] = {}
+    if spec and "=" in spec:
+        for entry in spec.split(","):
+            t, _, p = entry.partition("=")
+            out[t.strip()] = p.strip()
+    return out
+
+
+def _read_measured_gb(path: str, field: str) -> float | None:
+    """samples[field] (MB) from a measure_kv_cache JSON -> GB. None when
+    the file or field is missing."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            v = json.load(f).get("samples", {}).get(field)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return float(v) / 1024.0 if v is not None else None
+
+
 def _make_plots(
     out_dir: str,
     variant_paths: list[tuple[str, str]],
@@ -661,9 +685,18 @@ def _make_plots(
         (0,   -22, "center", "top"),      # idx 5: below
     ]
     from matplotlib.colors import to_rgba
+    # V1 (Phase 45.8): weight bytes per variant from the MEASURED
+    # transformer weight (measure_kv_cache transformer_weight_mb), not the
+    # theoretical N_PARAMS * bytes_per_param. Falls back to the theoretical
+    # value only for a variant with no measured transformer.
+    _rl_kv_paths = _parse_measured_kv_paths(measured_kv_cache_path)
+    _rl_xfmr_bytes = {
+        tag: ((_read_measured_gb(_rl_kv_paths.get(tag, ""),
+                                 "transformer_weight_mb") or 0.0) * 1e9)
+        for tag in tags}
     for idx, tag in enumerate(tags):
-        wbytes = _weight_bytes(tag)
-        weight_bytes = N_PARAMS * wbytes
+        wbytes = _weight_bytes(tag)   # dtype class for the peak ceiling below
+        weight_bytes = _rl_xfmr_bytes.get(tag) or (N_PARAMS * wbytes)
         extra_bytes = _extra_bytes_from_profile(tag) + measured_extra_b
         ai = flops_per_call / (weight_bytes + extra_bytes)
         t_ms = statistics.mean(
@@ -753,11 +786,7 @@ def _make_plots(
     _REQUIRED_MEAS = ("transformer_weight_mb", "vae_weight_mb",
                       "kv_cache_mb", "text_encoder_weight_mb",
                       "activation_peak_mb")
-    _kv_paths: dict[str, str] = {}
-    if measured_kv_cache_path is not None and "=" in measured_kv_cache_path:
-        for entry in measured_kv_cache_path.split(","):
-            t, _, p = entry.partition("=")
-            _kv_paths[t.strip()] = p.strip()
+    _kv_paths = _parse_measured_kv_paths(measured_kv_cache_path)
     _meas: dict[str, dict[str, float]] = {}   # tag -> {field_mb: value in GB}
     for tag in tags:
         p = _kv_paths.get(tag)

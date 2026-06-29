@@ -137,7 +137,8 @@ results/
   roofline.png
     throughput (y)          [C]      flops_per_call / mean(transformer+action_head)_ms
     arithmetic intensity(x) [C]      flops / (weight_bytes + extra_bytes)
-      weight_bytes          [T]      N_PARAMS(5.09e9) * bytes_per_param(2/1)
+      weight_bytes          [M-Δ]    measure_kv_cache transformer_weight_mb/variant
+                                     (无实测时回退 [T] N_PARAMS*bytes_per_param)
       extra_bytes           [C-shape] measure_flops 的 kv+act bytes
     ceilings (TFLOPS/BW)    [T]      A6000/L40S datasheet
     %peak 注释              [C]      throughput / ceiling
