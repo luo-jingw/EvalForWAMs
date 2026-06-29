@@ -99,6 +99,11 @@ class Config:
     perf_log_dir: Path
     profile_ops: bool = False
     profile_n_calls: int = 5
+    # Save per-episode obs_data/latents/actions .pt under
+    # <save_root>/visualization/. Default False for eval (the dumps are
+    # raw camera frames, ~20 MB/ep, not needed for SR/latency/memory).
+    # collect_calib_videos sets True (the .pt files ARE the calib corpus).
+    save_visualization: bool = False
     # Optional pool GPU selection (default = scan all 8 + filter by free
     # memory). When gpu_ids is set, only those GPUs are considered (still
     # subject to min_free_mb filter). When max_gpus is set, after the
@@ -349,6 +354,7 @@ def run_client_blocking(cfg: Config, gpu: int, task_name: str, port: int,
         f"    --video_guidance_scale 5"
         f"    --action_guidance_scale 1"
         f"    --test_num {test_num}"
+        f"    --save_visualization {cfg.save_visualization}"
         f"    --port {port}\n"
     )
     proc = launch_in_session(cmd, client_log)
@@ -522,7 +528,7 @@ def run_smoke(cfg: Config) -> None:
 
 def run_single(cfg: Config) -> None:
     # Default test_num bumped 25 -> 100 on 2026-06-26 alongside the
-    # task_list_name default flip (SELECTED_15_TASKS -> CALIB_TASKS_ALL)
+    # task_list_name default flip (SELECTED_15_TASKS -> ALL_TASKS)
     # so the production scope matches paper-style full-coverage eval
     # (50 tasks x 100 ep = 5000 episodes/variant); see run_eval.py
     # --test_num help text for rationale.

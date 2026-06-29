@@ -15,7 +15,7 @@ other. Both import the shared orchestration primitives from
 ptqeval.eval._pool_runner. The calibration pipeline (collect_calib_videos
 + derive_calib_ptq + ptq.py) is fully independent of the eval pipeline.
 
-Default: 50 task * 5 ep (CALIB_TASKS_ALL), demo_randomized config,
+Default: 50 task * 5 ep (ALL_TASKS), demo_randomized config,
 output under results/calib_capture/. Re-runs overwrite the same path
 per the no-_v2 / no-backward-compat convention (ProjectDescription.txt
 section "关键约定" item 7).
@@ -41,9 +41,9 @@ def parse_args() -> Config:
     )
 
     # --- task scope ---
-    p.add_argument("--task_list_name", default="CALIB_TASKS_ALL",
+    p.add_argument("--task_list_name", default="ALL_TASKS",
                    help="Attribute in ptqeval.wam.<wam>.tasks to iterate. "
-                        "Default CALIB_TASKS_ALL (50 RoboTwin tasks).")
+                        "Default ALL_TASKS (50 RoboTwin tasks).")
     p.add_argument("--test_num", type=int, default=5,
                    help="Episodes per task. Default 5.")
     p.add_argument("--task_config", default="demo_randomized",
@@ -114,6 +114,7 @@ def parse_args() -> Config:
         client_env=args.client_env,
         save_root=save_root,
         perf_log_dir=perf_log_dir,
+        save_visualization=True,    # the per-episode .pt dumps ARE the calib corpus
     )
 
 

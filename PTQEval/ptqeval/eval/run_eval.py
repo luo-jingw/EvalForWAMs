@@ -21,7 +21,7 @@ Examples:
   python -m ptqeval.eval.run_eval \\
       --mode pool \\
       --save_root results/bf16
-  # Defaults: task_list_name=CALIB_TASKS_ALL (50 tasks), test_num=100 per
+  # Defaults: task_list_name=ALL_TASKS (50 tasks), test_num=100 per
   # task = 5000 episodes/variant; matches the Phase 42 5-way cross_summary
   # convention. For the legacy 15-task x 25-ep scope add
   # --task_list_name SELECTED_15_TASKS --test_num 25.
@@ -116,9 +116,9 @@ def parse_args() -> Config:
                    help="Runtime args yaml (layer_config + int_weights_ckpt).")
 
     # --- task list ---
-    p.add_argument("--task_list_name", default="CALIB_TASKS_ALL",
+    p.add_argument("--task_list_name", default="ALL_TASKS",
                    help="Attribute in ptqeval.wam.<wam>.tasks to iterate. "
-                        "Default CALIB_TASKS_ALL (50 RoboTwin tasks) was "
+                        "Default ALL_TASKS (50 RoboTwin tasks) was "
                         "promoted from SELECTED_15_TASKS on 2026-06-26 to "
                         "match the paper-style full-coverage eval used by "
                         "the 5-way cross_summary (Phase 42). Pass "
@@ -153,6 +153,13 @@ def parse_args() -> Config:
     p.add_argument("--profile_n_calls", type=int, default=5,
                    help="Number of post-warmup infer() calls to profile "
                         "per server when --profile_ops is on.")
+    p.add_argument("--save_visualization", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Save per-episode obs_data/latents/actions .pt under "
+                        "<save_root>/visualization/. Default OFF (raw camera "
+                        "frames ~20 MB/ep, not needed for SR/latency/memory). "
+                        "Pass --save_visualization to opt in for inspection; "
+                        "calibration (collect_calib_videos) always saves.")
 
     args = p.parse_args()
 
@@ -196,6 +203,7 @@ def parse_args() -> Config:
         perf_log_dir=perf_log_dir,
         profile_ops=args.profile_ops,
         profile_n_calls=args.profile_n_calls,
+        save_visualization=args.save_visualization,
         gpu_ids=gpu_ids,
         max_gpus=args.max_gpus,
     )

@@ -5,7 +5,7 @@ Two task lists:
   SELECTED_15_TASKS    -- production eval subset (1 long + 4 medium-long
                           + 10 short). Used by run_eval.sh's pool/single
                           modes by default.
-  CALIB_TASKS_ALL      -- all 50 RoboTwin tasks. Used by Phase 31
+  ALL_TASKS      -- all 50 RoboTwin tasks. Used by Phase 31
                           calibration data collection (5 ep / task) so
                           per-channel activation absmax covers the full
                           task-space diversity for SmoothQuant channel_mask.
@@ -17,7 +17,7 @@ parsing the RoboTwin yaml.
 CLI access:
     python -c "from ptqeval.wam.lingbot_va.tasks import SELECTED_15_TASKS \\
                as t; print(' '.join(t))"
-    python -c "from ptqeval.wam.lingbot_va.tasks import CALIB_TASKS_ALL \\
+    python -c "from ptqeval.wam.lingbot_va.tasks import ALL_TASKS \\
                as t; print(' '.join(t))"
 """
 from __future__ import annotations
@@ -39,7 +39,7 @@ SELECTED_15_TASKS: list[str] = [
 # absmax aggregation (running-max merged via _CalibState; sequential
 # single-mode invocation in the calib runner avoids cross-process race
 # on calib_data.pth).
-CALIB_TASKS_ALL: list[str] = [
+ALL_TASKS: list[str] = [
     "adjust_bottle", "beat_block_hammer", "blocks_ranking_rgb",
     "blocks_ranking_size", "click_alarmclock", "click_bell",
     "dump_bin_bigbin", "grab_roller", "handover_block", "handover_mic",
@@ -57,9 +57,9 @@ CALIB_TASKS_ALL: list[str] = [
     "stack_blocks_three", "stack_blocks_two", "stack_bowls_three",
     "stack_bowls_two", "stamp_seal", "turn_switch",
 ]
-assert len(CALIB_TASKS_ALL) == 50, f"expected 50, got {len(CALIB_TASKS_ALL)}"
-assert set(SELECTED_15_TASKS).issubset(CALIB_TASKS_ALL), (
-    "SELECTED_15_TASKS must be a subset of CALIB_TASKS_ALL"
+assert len(ALL_TASKS) == 50, f"expected 50, got {len(ALL_TASKS)}"
+assert set(SELECTED_15_TASKS).issubset(ALL_TASKS), (
+    "SELECTED_15_TASKS must be a subset of ALL_TASKS"
 )
 
 EVAL_STEP_LIMIT: dict[str, int] = {
@@ -85,6 +85,6 @@ EVAL_STEP_LIMIT: dict[str, int] = {
     "stack_blocks_two": 800, "stack_bowls_three": 1200,
     "stack_bowls_two": 900, "stamp_seal": 400, "turn_switch": 400,
 }
-assert set(EVAL_STEP_LIMIT.keys()) == set(CALIB_TASKS_ALL), (
+assert set(EVAL_STEP_LIMIT.keys()) == set(ALL_TASKS), (
     "EVAL_STEP_LIMIT must cover exactly the 50 calib tasks"
 )

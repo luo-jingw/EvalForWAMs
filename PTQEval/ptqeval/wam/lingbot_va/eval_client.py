@@ -407,7 +407,7 @@ def main(usr_args):
                                    test_num=test_num,
                                    video_size=video_size,
                                    instruction_type=instruction_type,
-                                   save_visualization=True,
+                                   save_visualization=usr_args.get("save_visualization", False),
                                    video_guidance_scale=video_guidance_scale,
                                    action_guidance_scale=action_guidance_scale)
     suc_nums.append(suc_num)

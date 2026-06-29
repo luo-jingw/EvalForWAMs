@@ -301,7 +301,7 @@ Two eval scales coexist in `ptqeval/wam/lingbot_va/tasks.py`. Pick by
 | Tier | Attribute | Tasks | Typical `--test_num` | Use for |
 |---|---|---|---|---|
 | **Production SR** | `SELECTED_15_TASKS` | 15 | 25 | Cross-variant SR comparison (cross_summary). 1 long + 4 medium-long + 10 short, ~3-4 h on 8 GPU |
-| **Full bench / calibration** | `CALIB_TASKS_ALL` | 50 | 5 (calib) or 100 (full sweep) | bf16 rollout collection for static-act calib; or a comprehensive variant sweep |
+| **Full bench / calibration** | `ALL_TASKS` | 50 | 5 (calib) or 100 (full sweep) | bf16 rollout collection for static-act calib; or a comprehensive variant sweep |
 
 Task config (RoboTwin scene randomization) — `--task_config`:
 
@@ -408,12 +408,12 @@ python -m ptqeval.eval.run_eval --mode pool --variant viditq \
 
 ```bash
 python -m ptqeval.eval.run_eval --mode pool \
-    --task_list_name CALIB_TASKS_ALL --task_config demo_randomized \
+    --task_list_name ALL_TASKS --task_config demo_randomized \
     --test_num 100 --save_root results/bf16_full
 ```
 
 Use the same command with `--variant viditq --variant_args ...` for each
-quant variant. CALIB_TASKS_ALL covers all 50 RoboTwin 2.0 tasks; with
+quant variant. ALL_TASKS covers all 50 RoboTwin 2.0 tasks; with
 `--test_num 100` it produces 5000 episodes per variant — the most
 statistically robust SR estimate but ~5× longer than the 15-task sweep.
 
