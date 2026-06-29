@@ -299,6 +299,33 @@ def _fmt_gb(v: float) -> str:
     return f"{v / 1024:.2f} GB"
 
 
+# GPU hardware ceilings for the roofline chart, from each board's NVIDIA
+# datasheet (dense / no structured sparsity; sparse peaks are 2x of these).
+# INT8 Tensor Core peak is 2x the BF16 Tensor Core peak (8b vs 16b mma).
+# dtod_bw_gbs is the practical device-to-device cudaMemcpyAsync bandwidth
+# (~78% of the spec DRAM bandwidth) used to convert profile memcpy ms back
+# into bytes. Selected at the CLI via --gpu.
+_GPU_SPECS: dict[str, dict] = {
+    # RTX A6000 (Ampere, sm_86), GDDR6.
+    "a6000": {
+        "label": "RTX A6000",
+        "bf16_tflops": 154.8,
+        "int8_tops": 309.7,
+        "bw_gbs": 768.0,
+        "dtod_bw_gbs": 600.0,
+    },
+    # L40S (Ada Lovelace, sm_89), 48 GB GDDR6 w/ ECC. Datasheet dense:
+    # BF16/FP16 TC 362.05 TFLOPS, INT8 TC 733 TOPS, 864 GB/s.
+    "l40s": {
+        "label": "L40S",
+        "bf16_tflops": 362.05,
+        "int8_tops": 733.0,
+        "bw_gbs": 864.0,
+        "dtod_bw_gbs": 675.0,
+    },
+}
+
+
 def _make_plots(
     out_dir: str,
     variant_paths: list[tuple[str, str]],
@@ -311,13 +338,14 @@ def _make_plots(
     measured_kv_bytes: float | None = None,
     measured_act_bytes: float | None = None,
     measured_kv_cache_path: str | None = None,
+    gpu: str = "a6000",
 ) -> list[tuple[str, str]]:
     """Renders charts under <out_dir>/plots/:
       1. sr_by_task.png           per-task SR per variant
       2. total_ms_speedup.png     latency + speedup curve per task
       3. speedup_by_task.png      speedup ratio per task (omitted when single variant)
       4. latency_distribution.png mean / p50 / p95 per task
-      5. roofline.png             achieved (AI, throughput) vs A6000 ceilings
+      5. roofline.png             achieved (AI, throughput) vs --gpu ceilings
                                   (requires --measured_flops; skipped otherwise)
       6. memory_breakdown.png     VRAM peak = model weights + transient
     Main also writes op_breakdown_measured.png when --op_profile entries
@@ -494,9 +522,9 @@ def _make_plots(
                    "plots/latency_distribution.png"))
 
     # ------ Chart 5: Roofline (achieved throughput vs arithmetic intensity) ------
-    # Hardware: RTX A6000 (sm_86). Two compute ceilings (bf16 tensor core,
-    # int8 tensor core) and one memory-bandwidth ceiling. Workload
-    # parameters estimated for LingBot-VA per-call:
+    # Hardware: selected via --gpu (see _GPU_SPECS). Two compute ceilings
+    # (bf16 tensor core, int8 tensor core) and one memory-bandwidth ceiling.
+    # Workload parameters estimated for LingBot-VA per-call:
     #   - 5.09B params (ProjectDescription) -> weight memory dominates
     #   - per-call forward count and token count are aggregate proxies;
     #     we keep absolute FLOPs CONSTANT across variants and only vary
@@ -506,15 +534,15 @@ def _make_plots(
     # Variants land at different (AI, throughput) points; the diagonal
     # bandwidth line separates memory-bound (below diagonal) from
     # compute-bound (right of knee).
-    # A6000 spec (NVIDIA datasheet, dense / no structured sparsity):
-    #   FP32 CUDA cores       38.7 TFLOPS  <- NOT used here, common confusion
-    #   BF16/FP16 Tensor Core 154.8 TFLOPS (4x FP32 since TC fuse mma)
-    #   INT8 Tensor Core      309.7 TOPS   (2x BF16 since 8b vs 16b mma)
-    #   GDDR6 bandwidth       768 GB/s
-    # Sparse peaks would be 2x of these but our path is dense.
-    PEAK_BF16_TFLOPS = 154.8    # A6000 BF16 Tensor Core dense peak
-    PEAK_INT8_TOPS   = 309.7    # A6000 INT8 Tensor Core dense peak (= 2x BF16 TC)
-    PEAK_BW_GBS      = 768.0    # A6000 GDDR6 bandwidth
+    # Ceilings are NVIDIA-datasheet dense peaks (no structured sparsity;
+    # sparse would be 2x). INT8 TC = 2x BF16 TC (8b vs 16b mma). Boards:
+    #   A6000 (Ampere): BF16 154.8 TFLOPS / INT8 309.7 TOPS / 768 GB/s
+    #   L40S  (Ada)   : BF16 362.05 TFLOPS / INT8 733 TOPS  / 864 GB/s
+    _gpu_spec = _GPU_SPECS.get(gpu, _GPU_SPECS["a6000"])
+    _gpu_label = _gpu_spec["label"]
+    PEAK_BF16_TFLOPS = _gpu_spec["bf16_tflops"]   # BF16 Tensor Core dense peak
+    PEAK_INT8_TOPS   = _gpu_spec["int8_tops"]     # INT8 Tensor Core dense peak (= 2x BF16 TC)
+    PEAK_BW_GBS      = _gpu_spec["bw_gbs"]         # DRAM bandwidth
     N_PARAMS         = 5.09e9   # LingBot-VA WAN transformer
     # FLOPs per call from FlopCounterMode dispatcher-level measurement
     # (ptqeval.eval.measure_flops). Required: roofline depends on real
@@ -533,10 +561,11 @@ def _make_plots(
         return bytes_per_param.get(tag.lower(), 1.0)
 
     # Effective device-to-device bandwidth used to convert profile-measured
-    # memcpy ms back into bytes. A6000 spec is 768 GB/s; the practical
-    # DtoD copy bandwidth (cudaMemcpyAsync within the same device) tops
-    # out around 600-700 GB/s due to allocator + scheduler overhead.
-    _DTOD_BW_GBS = 600.0
+    # memcpy ms back into bytes. The practical DtoD copy bandwidth
+    # (cudaMemcpyAsync within the same device) is ~78% of the spec DRAM
+    # bandwidth due to allocator + scheduler overhead (per-board value in
+    # _GPU_SPECS): A6000 ~600 GB/s of 768, L40S ~675 GB/s of 864.
+    _DTOD_BW_GBS = _gpu_spec["dtod_bw_gbs"]
 
     def _extra_bytes_from_profile(tag: str) -> float:
         """Bytes/call beyond raw weight load, estimated from profile
@@ -668,7 +697,7 @@ def _make_plots(
     ax.set_xlabel("Arithmetic intensity (FLOPs / byte)", fontsize=10)
     ax.set_ylabel("Throughput (TFLOPs/s)", fontsize=10)
     ax.set_title(
-        "Roofline placement of LingBot-VA per-variant inference (RTX A6000)",
+        f"Roofline placement of LingBot-VA per-variant inference ({_gpu_label})",
         fontsize=11, pad=8)
     # Legend in upper-left like the VLA paper, lists ceilings then
     # markers; compact.
@@ -709,7 +738,7 @@ def _make_plots(
     p_rl = os.path.join(plots_dir, "roofline.png")
     fig.savefig(p_rl, dpi=130)
     plt.close(fig)
-    charts.append(("Roofline (achieved throughput vs arithmetic intensity, A6000)",
+    charts.append((f"Roofline (achieved throughput vs arithmetic intensity, {_gpu_label})",
                    "plots/roofline.png"))
 
     # ------ Chart 6: Memory breakdown (spatial, analytical) ------
@@ -1643,6 +1672,12 @@ def main() -> int:
                         "transformer-bf16 sizes) instead of theoretical "
                         "13.59 GB hardcoded value. Produced by "
                         "ptqeval.eval.measure_kv_cache.")
+    p.add_argument("--gpu", default="a6000", choices=sorted(_GPU_SPECS.keys()),
+                   help="Hardware whose tensor-core / bandwidth ceilings the "
+                        "roofline chart draws against (see _GPU_SPECS). "
+                        "'a6000' (default, Ampere) or 'l40s' (Ada). Only "
+                        "affects roofline.png; SR / latency / memory charts "
+                        "are hardware-independent.")
     args = p.parse_args()
 
     variant_specs = [_parse_variant_arg(v) for v in args.variant]
@@ -1728,18 +1763,39 @@ def main() -> int:
         except (OSError, json.JSONDecodeError, ValueError) as e:
             print(f"warning: --measured_flops unreadable: {e}")
 
+    # --measured_kv_cache accepts either a bare JSON path, or a tagged
+    # multi-path string "tag=path,tag2=path2" (per-variant transformer /
+    # activation). os.path.exists() can only validate the bare form, so
+    # the tagged form is recognized by the presence of "=" and each of
+    # its component paths is checked individually (a missing one warns
+    # but does not drop the whole arg).
+    measured_kv_cache_arg: str | None = None
+    if args.measured_kv_cache:
+        if "=" in args.measured_kv_cache:
+            bad = [entry.partition("=")[2].strip()
+                   for entry in args.measured_kv_cache.split(",")
+                   if not os.path.exists(entry.partition("=")[2].strip())]
+            if bad:
+                print(f"warning: --measured_kv_cache tagged path(s) not "
+                      f"readable, those variants fall back to derived "
+                      f"values: {bad}")
+            measured_kv_cache_arg = args.measured_kv_cache
+        elif os.path.exists(args.measured_kv_cache):
+            measured_kv_cache_arg = args.measured_kv_cache
+        else:
+            print(f"warning: --measured_kv_cache {args.measured_kv_cache!r} "
+                  f"not readable; memory_breakdown uses theoretical values.")
+
     charts: list[tuple[str, str]] = []
     if not args.no_plots:
         charts = _make_plots(args.out_dir, variant_specs, baseline_tag,
                              tasks, summaries, step_limits,
                              op_data=op_data,
                              measured_flops_tf=measured_flops_tf,
-                             measured_kv_cache_path=(args.measured_kv_cache
-                                                     if args.measured_kv_cache
-                                                     and os.path.exists(args.measured_kv_cache)
-                                                     else None),
+                             measured_kv_cache_path=measured_kv_cache_arg,
                              measured_kv_bytes=measured_kv_bytes,
-                             measured_act_bytes=measured_act_bytes)
+                             measured_act_bytes=measured_act_bytes,
+                             gpu=args.gpu)
 
         # Overlay a profiler-measured op_breakdown chart alongside the
         # architecture-estimated default when op_profile is available.
