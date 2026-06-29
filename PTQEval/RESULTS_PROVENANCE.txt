@@ -1,0 +1,154 @@
+===============================================================================
+RESULTS DATA PROVENANCE
+results/ 下每个量的来源分类 — 直接实测 / 聚合 / 计算 / 理论
+本文件唯一作用：描述 results/ 数据的组成结构。不含计划。
+===============================================================================
+
+图例 (Legend)
+  [M]       直接实测 — 一次运行时读数 (cuda event / memory_allocated / mask.sum)
+  [M-Δ]     实测增量 — 两个 memory_allocated 快照相减 (组件显存的标准测法)
+  [M-agg]   实测样本归约 — 对一批实测值取 mean/max/p50/p95，仅归约不引入新量
+  [C]       计算 — 由其它量经公式得到；公式给出
+  [C-shape] 计算 — 解析公式作用在「实测得到的真实张量 shape」上
+  [T]       理论/硬编码 — 非实测，常量或解析模型
+  [GAP]     当前缺失 — 既非实测也未计算
+
+===============================================================================
+0. 文件结构总览 (top-down)
+===============================================================================
+results/
+  <variant>/                              每 variant 的 eval 输出
+    |                                       (bf16, viditq_w8a8, viditq_w4a8,
+    |                                        viditq_w4a4, *_speed, bf16_clean)
+    stseed-10000/metrics/<task>/res.json    RoboTwin 成功率原始 (succ/total)   [-> 节 2]
+    perf/<task>_*.jsonl                     每 infer call 的 perf 记录 (PerfProbe) [-> 节 1]
+    perf/<task>_op_profile.json             每 op-type kernel ms (--profile_ops 时)
+    summary/summary.csv                     每 task 聚合指标 (aggregator)       [-> 节 3]
+    summary/summary.json                    同上 JSON
+    summary/op_profile.json                 merge 后每 op-type ms
+    calib/int_weights.pth                   PTQ 量化权重 (仅 quant variant)
+    visualization/real/<prompt>_<ts>/       obs_data/latents/actions .pt
+    |                                       (eval 现默认不存; calib 才存)
+    logs/                                   run 日志
+    measured_kv_cache.json                  本 variant 实测显存 (若测)          [-> 节 4]
+  measured_kv_cache.json                    bf16 实测显存 (共享 baseline)        [-> 节 4]
+  measured_flops.json                       FlopCounterMode FLOPs/call          [-> 节 5]
+  calib_capture/                            校准语料 (obs .pt, 保留原始帧)
+  cross_summary/                            calc_cross_ckpt 输出
+    cross_summary.csv / .json               N-variant 联表 + 派生列             [-> 节 6]
+    report.md                               markdown 汇报
+    plots/*.png                             8 张图                              [-> 节 7]
+
+数据流: eval -> (res.json + perf JSONL) -> aggregator -> summary.csv
+        -> calc_cross_ckpt -> cross_summary.csv + report.md + plots/
+旁路实测: measure_kv_cache.json (显存), measured_flops.json (FLOPs)
+
+===============================================================================
+逐路径数据组成
+===============================================================================
+
+-------------------------------------------------------------------------------
+1. <variant>/perf/<task>_*.jsonl   (PerfProbe, 每 infer call 一条)  — 全 [M]
+-------------------------------------------------------------------------------
+  stage             [M]  stage 名 (init/text_encoder/vae_encode/transformer/action_head)
+  elapsed_ms        [M]  torch.cuda.Event start/stop, 每 stage
+  peak_alloc_mb     [M]  torch.cuda.max_memory_allocated, 每 stage 进入时 reset
+  peak_reserved_mb  [M]  torch.cuda.max_memory_reserved
+  kv_filled_slots   [M]  attention mask.sum() 当前 stage
+  kv_total_slots    [M]  cache 容器 slot 总数
+  total_ms          [M]  time.perf_counter 包住整个 call
+
+-------------------------------------------------------------------------------
+2. <variant>/stseed-10000/metrics/<task>/res.json   (RoboTwin client, 每 task)
+-------------------------------------------------------------------------------
+  succ_num    [M]  RoboTwin task 成功判定为 success 的 episode 计数
+  total_num   [M]  episode 计数
+  succ_rate   [C]  = succ_num / total_num
+
+-------------------------------------------------------------------------------
+3. <variant>/summary/summary.csv   (aggregator, 每 task)
+-------------------------------------------------------------------------------
+  task_name            [M]
+  num_episodes         [M]    计数
+  success_rate         [C]    succ_num/total_num (取自 res.json)
+  init_peak_mb         [M]    init stage 的 peak_alloc
+  mean_total_ms        [M-agg] mean(total_ms)
+  p50_total_ms         [M-agg] percentile(total_ms, .50)
+  p95_total_ms         [M-agg] percentile(total_ms, .95)
+  mean_transformer_ms  [M-agg] mean(transformer stage elapsed_ms)
+  mean_action_head_ms  [M-agg] mean(action_head stage elapsed_ms)
+  peak_alloc_mb        [M-agg] max over (stage x call) of peak_alloc  (真实峰值)
+  peak_reserved_mb     [M-agg] max over (stage x call) of peak_reserved
+  mean_kv_filled_slots [M-agg] mean(kv_filled_slots)
+  max_kv_filled_slots  [M-agg] max(kv_filled_slots)
+  kv_total_slots       [M]    容器 slot 数
+  组成: 全是实测 primitive 的聚合 / 计数; raw per-call 在 perf JSONL。
+
+-------------------------------------------------------------------------------
+4. measured_kv_cache.json   (measure_kv_cache.py, 一次隔离测量)
+   (results/measured_kv_cache.json = bf16; <variant>/measured_kv_cache.json = 该 variant)
+-------------------------------------------------------------------------------
+  baseline_mb / after_*_mb  [M]   torch.cuda.memory_allocated 快照
+  transformer_weight_mb     [M-Δ] after_transformer - baseline
+  vae_weight_mb             [M-Δ] after_vae - after_transformer
+  text_encoder_weight_mb    [M-Δ] after_text_encoder - after_vae (载入后即释放)
+  kv_cache_mb               [M-Δ] after_kv_cache - after_vae
+  activation_peak_mb        [M-Δ] forward_peak - forward_resident
+                                  (--activation_videos_root 时实测; 跑真实 _infer,
+                                   reset_peak -> forward -> 读 peak; 否则 None)
+  forward_resident_mb       [M]   forward 前常驻 (有 activation 测量时)
+  forward_peak_mb           [M]   forward 期间峰值
+  segsum_vs_forwardpeak_mb  [C]   (transformer+vae+kv+activation) - forward_peak
+                                  (sum-check 诊断量, observational, 不参与 derive)
+  theoretical_kv_mb         [T]   解析 = layers*2*batch*tolen*heads*head_dim*2bytes
+                                  (sanity 旁注, 不进任何图)
+
+-------------------------------------------------------------------------------
+5. measured_flops.json   (measure_flops.py, FlopCounterMode)
+-------------------------------------------------------------------------------
+  flops_per_call_tf            [M]      FlopCounterMode dispatcher 级 FLOP 求和
+  by_op_tf_per_call            [M]      每 aten op FLOP
+  bytes_per_call_b
+    kv_attention_bytes_b       [C-shape] 2*B*H*S*D*dtype, 公式作用在 hook 实测的真实 q/k shape
+    block_activation_bytes_b   [C-shape] 2*B*S*d*dtype, 公式作用在 hook 实测的真实 hidden_states shape
+
+-------------------------------------------------------------------------------
+6. cross_summary/cross_summary.csv   (calc_cross_ckpt)
+-------------------------------------------------------------------------------
+  per-variant 列 (success_rate__<tag>, mean_total_ms__<tag>, peak_alloc_mb__<tag> ...)
+                                       = 直接拷贝 summary.csv (见 节 3)
+  success_rate_delta__X_vs_base        [C]  SR_X - SR_base
+  mean_total_ms_ratio__X_vs_base       [C]  ms_X / ms_base
+  mean_transformer_ms_ratio__X_vs_base [C]  同上
+  peak_alloc_mb_savings__base_minus_X  [C]  peak_base - peak_X
+  组成: 派生列均为对实测 primitive 的 diff/ratio。
+
+-------------------------------------------------------------------------------
+7. cross_summary/plots/   (calc_cross_ckpt charts)
+-------------------------------------------------------------------------------
+  sr_by_task.png            [M]      success_rate per task
+  latency_distribution.png  [M-agg]  mean/p50/p95 total_ms
+  total_ms_speedup.png      [C]      ms_base / ms_variant
+  speedup_by_task.png       [C]      同上 per task
+  kv_occupancy_by_task.png  [C]      = (filled/total) * container_gb
+                                     primitives 实测; container_gb 见 节 4
+  peak_mem_by_task.png      [M-agg]  peak_alloc per (task, variant); 虚线=cross-task max
+  op_breakdown_measured.png [M]      op_profile 每 op-type kernel ms (PerfProbe profiler)
+  roofline.png
+    throughput (y)          [C]      flops_per_call / mean(transformer+action_head)_ms
+    arithmetic intensity(x) [C]      flops / (weight_bytes + extra_bytes)
+      weight_bytes          [T]      N_PARAMS(5.09e9) * bytes_per_param(2/1)
+      extra_bytes           [C-shape] measure_flops 的 kv+act bytes
+    ceilings (TFLOPS/BW)    [T]      A6000/L40S datasheet
+    %peak 注释              [C]      throughput / ceiling
+  memory_breakdown.png   (force-measured; 缺实测字段则整图跳过, 不画理论值)
+    transformer 段          [M-Δ]    measure_kv_cache transformer_weight_mb
+    KV cache 段             [M-Δ]    measure_kv_cache kv_cache_mb
+    VAE 段                  [M-Δ]    measure_kv_cache vae_weight_mb
+    text encoder 段         [M-Δ]    measure_kv_cache text_encoder_weight_mb
+    Activations+scratch 段  [M-Δ]    measure_kv_cache activation_peak_mb
+                                     (= forward_peak - forward_resident, 实测)
+    bar total               [M]      = sum(以上 5 个实测段)
+    eval-peak 参考虚线       [M-agg]  max over tasks of peak_alloc (另一次测量)
+    gap 标注                [C]      sum(段) - eval-peak (诊断量, observational)
+===============================================================================

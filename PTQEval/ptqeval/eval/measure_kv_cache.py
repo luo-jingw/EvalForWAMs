@@ -126,6 +126,29 @@ def measure(model_path: str, device: torch.device,
         f"(now {samples['after_vae_mb']:.1f} MB total)"
     )
 
+    # ---- 3b. text encoder weight (own segment) ----
+    # Measured as a load delta then freed. Eval offloads it to CPU at
+    # steady state, but the transient swap-to-GPU during text encoding
+    # makes it a real peak contributor; the memory_breakdown shows it as
+    # its own segment. Freed before KV so the KV delta stays clean.
+    from wan_va.modules.utils import load_text_encoder
+    text_encoder = load_text_encoder(
+        os.path.join(model_path, "text_encoder"),
+        torch_dtype=dtype,
+        torch_device=device,
+    )
+    samples["after_text_encoder_mb"] = _alloc_mb()
+    samples["text_encoder_weight_mb"] = (
+        samples["after_text_encoder_mb"] - samples["after_vae_mb"]
+    )
+    logger.info(
+        f"text encoder weight: {samples['text_encoder_weight_mb']:.1f} MB "
+        f"(freed before KV measurement)"
+    )
+    del text_encoder
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # ---- 4. init_kv_cache ----
     # Mirror server.py's create_empty_cache call with the same RoboTwin
     # config values that determine total_tolen.
@@ -219,6 +242,61 @@ def measure(model_path: str, device: torch.device,
     return {"samples": samples, "meta": samples_meta}
 
 
+def measure_activation(model_path: str, videos_root: str,
+                       task: str | None, warmup: int, n_calls: int,
+                       variant: str = "", variant_args_path: str = "") -> dict:
+    """Measure the activation+scratch transient of a REAL forward by
+    reusing measure_flops' server harness (build server -> warmup the KV
+    cache -> measured calls). Resets the peak counter right before the
+    measured calls and reads max_memory_allocated relative to the
+    resident-before allocation. This is a direct measurement of the
+    forward transient in one process (reset_peak -> forward -> read
+    peak), the same allocation-delta method used for the weight/KV
+    segments -- NOT a chart-side cross-source subtraction.
+
+    Returns: forward_resident_mb, forward_peak_mb, activation_peak_mb
+    (= forward_peak - forward_resident). Needs obs chunks under
+    videos_root/visualization/real/ (bf16 run keeps a sample)."""
+    from pathlib import Path
+    from ptqeval.eval.measure_flops import (
+        _build_server, _pick_episode, _CHUNK_RE)
+
+    server = _build_server(model_path,
+                           Path("/tmp/measure_kv_cache_activation_scratch"))
+    ep_dir = _pick_episode(Path(videos_root), task)
+    chunks = sorted(
+        (int(_CHUNK_RE.search(p.name).group(1)), p)
+        for p in ep_dir.glob("obs_data_*.pt"))
+    if not chunks:
+        raise RuntimeError(f"no obs_data_*.pt under {ep_dir}")
+    first = torch.load(chunks[0][1], weights_only=False, map_location="cpu")
+    prompt = first[0]["task"]
+    frame_chunk_size = server.job_config.frame_chunk_size
+    init_obs = {"obs": [first[0]], "prompt": prompt,
+                "save_visualization": False}
+    logger.info(f"activation: episode {ep_dir.name}, warmup {warmup} chunks")
+    server.infer({"reset": True, "prompt": prompt,
+                  "save_visualization": False})
+    for chunk_id in range(warmup):
+        server._infer(init_obs, frame_st_id=chunk_id * frame_chunk_size)
+    torch.cuda.synchronize()
+    resident_before = _alloc_mb()
+    torch.cuda.reset_peak_memory_stats()
+    for j in range(n_calls):
+        server._infer(init_obs,
+                      frame_st_id=(warmup + j) * frame_chunk_size)
+    peak = _peak_mb()
+    logger.info(
+        f"activation: resident_before={resident_before:.1f} MB, "
+        f"forward_peak={peak:.1f} MB, "
+        f"activation={peak - resident_before:.1f} MB")
+    return {
+        "forward_resident_mb": resident_before,
+        "forward_peak_mb": peak,
+        "activation_peak_mb": peak - resident_before,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_path", type=str,
@@ -235,6 +313,20 @@ def main() -> int:
     parser.add_argument("--variant_args", type=str, default="",
                         help="Variant runtime_args yaml (layer_config + "
                              "int_weights_ckpt paths).")
+    parser.add_argument("--activation_videos_root", type=str, default="",
+                        help="When set, ALSO measure the forward "
+                             "activation+scratch transient via a real "
+                             "server._infer (reuses measure_flops harness). "
+                             "Points at a root with visualization/real/ obs "
+                             "chunks (e.g. results/bf16). Empty -> "
+                             "activation_peak_mb stays None.")
+    parser.add_argument("--activation_task", default=None,
+                        help="Episode prompt substring filter for activation.")
+    parser.add_argument("--activation_warmup", type=int, default=36,
+                        help="Warmup chunks to fill KV before measuring "
+                             "activation (default 36 = attn_window/2).")
+    parser.add_argument("--activation_n_calls", type=int, default=3,
+                        help="Measured _infer calls for activation peak.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -249,6 +341,29 @@ def main() -> int:
     result = measure(args.model_path, device, dtype,
                      variant=args.variant,
                      variant_args_path=args.variant_args)
+
+    if args.activation_videos_root:
+        gc.collect()
+        torch.cuda.empty_cache()
+        act = measure_activation(
+            args.model_path, args.activation_videos_root,
+            args.activation_task, args.activation_warmup,
+            args.activation_n_calls,
+            variant=args.variant, variant_args_path=args.variant_args)
+        result["samples"].update(act)
+        # Observational sum-check (principle.txt L12): do the measured
+        # resident segments + measured activation reconstruct the
+        # measured forward peak? Reported, never used to derive a value.
+        s = result["samples"]
+        seg_sum = (s.get("transformer_weight_mb", 0.0)
+                   + s.get("vae_weight_mb", 0.0)
+                   + s.get("kv_cache_mb", 0.0)
+                   + s.get("activation_peak_mb", 0.0))
+        s["segsum_vs_forwardpeak_mb"] = seg_sum - s.get("forward_peak_mb", 0.0)
+        logger.info(
+            f"sum-check: transformer+vae+kv+activation = {seg_sum:.1f} MB "
+            f"vs forward_peak {s.get('forward_peak_mb', 0.0):.1f} MB "
+            f"(gap {s['segsum_vs_forwardpeak_mb']:+.1f} MB)")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w") as f:

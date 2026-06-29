@@ -741,222 +741,109 @@ def _make_plots(
     charts.append((f"Roofline (achieved throughput vs arithmetic intensity, {_gpu_label})",
                    "plots/roofline.png"))
 
-    # ------ Chart 6: Memory breakdown (spatial, analytical) ------
-    # First-principles spatial decomposition: each segment derived from
-    # model architecture + KV-cache config, NOT reverse-fit to any
-    # particular measured peak. The residual segment ("Activations +
-    # scratch") is clamped to >= 0; if theoretical sum exceeds measured
-    # peak, the residual is 0 and the bar total exceeds the measured
-    # peak (over-estimate from theoretical-max KV vs allocator caching).
-    #
-    #   Text encoder (UMT5-XXL)    : 0 GB (Phase 41 CPU offload; was 11 GB)
-    #   Transformer weights        : per-variant from tag (bf16 2 byte/param,
-    #                                W8A8 1 byte/param quantized + 2 byte/param
-    #                                kept FP, W4A8 0.5 byte/param quantized +
-    #                                2 byte/param kept FP, mixed = weighted)
-    #   KV cache                   : 13.59 GB theoretical max @ attn_window=72
-    #                                sliding-window saturation, batch_size=2
-    #                                from CFG (guidance_scale=5 > 1 ->
-    #                                use_cfg=True -> init_kv_cache(batch=2)),
-    #                                bf16. Quantization does NOT touch KV;
-    #                                same value across all variants. Earlier
-    #                                hardcoded 8.92 GB was reverse-fit from a
-    #                                casually-stated 32 GB peak (collaborator,
-    #                                not a measurement); first-principles
-    #                                value preferred per 2026-06-21 audit.
-    #   VAE (AutoencoderKLWan)     : 2.7 GB const
-    #   Activations / scratch / frag: measured_peak - sum(above), clamp >= 0
-    # Phase 41: text encoder is CPU-offloaded so it contributes 0 to GPU peak
-    # at steady state. The variable name is kept for plot-segment continuity
-    # but the value reflects the offload.
-    _TEXT_ENCODER_GB = 0.0
-    _DEFAULT_VAE_GB = 2.7        # disk: vae/ ~ 2.7 GB
-    # Default KV: 30 layers * 2 (K+V) * batch=2 (CFG) * 18432 tokens
-    # * 24 heads * 128 head_dim * 2 bytes = 13.59 GB (theoretical max).
-    # If --measured_kv_cache is supplied, overrides with the
-    # ptqeval.eval.measure_kv_cache.py output (recommended: that
-    # script captures real torch.cuda.memory_allocated() delta from
-    # init_kv_cache call, not theoretical sum-of-tensors).
-    _DEFAULT_KV_CACHE_GB = 13.59
-    _DEFAULT_XFMR_WEIGHT_BF16_GB = N_PARAMS * 2 / 1e9   # ~10.18 GB
-
-    _kv_cache_gb = _DEFAULT_KV_CACHE_GB
-    _vae_gb = _DEFAULT_VAE_GB
-    _xfmr_bf16_gb = _DEFAULT_XFMR_WEIGHT_BF16_GB
-    _xfmr_per_variant_gb: dict[str, float] = {}
-    _activation_per_variant_gb: dict[str, float] = {}
-    _kv_source_note = "theoretical max @ attn_window=72 batch=2 (CFG)"
-    # measured_kv_cache_path may be a single JSON path, or a dict-string
-    # tag=path,tag2=path2 if multiple per-variant measurements are provided.
+    # ------ Chart 6: Memory breakdown (force-measured, Phase 45.8) ------
+    # Every segment is a measured allocation delta from measure_kv_cache.py:
+    #   text-encoder / transformer / VAE weight deltas, KV container delta,
+    #   and the activation+scratch forward transient (forward_peak -
+    #   forward_resident). NO theoretical fallback, NO residual. Requires
+    #   --measured_kv_cache as a tagged per-variant string (tag=path,...)
+    #   with every field present; otherwise the chart is SKIPPED (never
+    #   drawn with theoretical numbers). The eval per-task max peak (45a)
+    #   is overlaid as a reference line with the sum-vs-peak gap.
+    _REQUIRED_MEAS = ("transformer_weight_mb", "vae_weight_mb",
+                      "kv_cache_mb", "text_encoder_weight_mb",
+                      "activation_peak_mb")
     _kv_paths: dict[str, str] = {}
-    if measured_kv_cache_path is not None:
-        if "=" in measured_kv_cache_path:
-            for entry in measured_kv_cache_path.split(","):
-                t, _, p = entry.partition("=")
-                _kv_paths[t.strip()] = p.strip()
-        else:
-            # Bare path: applies to all variants (kv + vae same, but
-            # transformer + activation will be the BF16 baseline values).
-            _kv_paths["_default"] = measured_kv_cache_path
-    if _kv_paths:
-        # Prefer "_default" (bf16) for KV/VAE/xfmr_bf16 baseline. KV
-        # is bf16-invariant across variants; VAE same.
-        baseline_path = _kv_paths.get("_default") or next(iter(_kv_paths.values()))
-        with open(baseline_path) as f:
-            _kv_data = json.load(f)
-        _kv_cache_gb = _kv_data["samples"]["kv_cache_mb"] / 1024.0
-        _vae_gb = _kv_data["samples"]["vae_weight_mb"] / 1024.0
-        _xfmr_bf16_gb = _kv_data["samples"]["transformer_weight_mb"] / 1024.0
-        _kv_source_note = (
-            f"measured via measure_kv_cache.py "
-            f"(attn_window={_kv_data['meta']['attn_window']}, "
-            f"batch={_kv_data['meta']['batch_size']}, "
-            f"total_tolen={_kv_data['meta']['total_tolen']})"
-        )
-        # Per-variant transformer + activation, when JSON was tagged.
-        for t, p in _kv_paths.items():
-            if t == "_default":
-                continue
-            with open(p) as f:
-                d = json.load(f)
-            _xfmr_per_variant_gb[t] = d["samples"]["transformer_weight_mb"] / 1024.0
-            act = d["samples"].get("activation_peak_mb")
-            if act is not None:
-                _activation_per_variant_gb[t] = float(act) / 1024.0
-    _N_PARAMS_XFMR   = N_PARAMS  # 5.09e9 (defined in roofline block above)
-    # Fraction of transformer params that get quantized (everything
-    # inside the 30 WanTransformerBlocks; embedders / condition_embedder
-    # / proj_out / scale_shift_table stay FP per remain_fp_regex).
-    _XFMR_QUANT_FRAC = 0.95
-    _QUANT_META_GB = 0.03  # per-channel scales + smooth + Hadamard sign
-
-    def _xfmr_weight_gb(tag: str) -> float:
-        # If per-variant measurement available, use that (most accurate).
-        # Otherwise derive from bf16 footprint via quant ratio formula.
-        if tag in _xfmr_per_variant_gb:
-            return _xfmr_per_variant_gb[tag]
-        # Anchor on the measured bf16 transformer weight footprint
-        # (_xfmr_bf16_gb) when measure_kv_cache.py JSON was supplied;
-        # otherwise fall back to N_PARAMS * 2 bytes.
-        # bf16:  all params at 2 bytes/param
-        # W8A8:  quant_frac * 1 byte/param   + (1-quant_frac) * 2 byte/param
-        # W4A8:  quant_frac * 0.5 byte/param + (1-quant_frac) * 2 byte/param
-        t = tag.lower()
-        if "bf16" in t or "fp16" in t:
-            return _xfmr_bf16_gb
-        if "w4a8" in t or "w4" in t:
-            quant_bytes = 0.5    # int4, two nibbles per byte
-        else:
-            quant_bytes = 1.0    # int8
-        # Scale bf16 footprint by per-byte ratio.
-        bf16_ratio = (_XFMR_QUANT_FRAC * quant_bytes
-                      + (1 - _XFMR_QUANT_FRAC) * 2) / 2.0
-        return _xfmr_bf16_gb * bf16_ratio + _QUANT_META_GB
-
-    # Phase 45a: cross-task aggregate is the MAX over tasks (true
-    # worst-case VRAM), not the mean. A mean over a bimodal per-task
-    # peak distribution (e.g. w4a8 16.92/25.94) represents no real run.
-    # The residual (Activations+scratch) below recomputes against this
-    # max automatically.
-    measured_peak_gb = [
-        max(summaries[tag][t].peak_alloc_mb for t in sorted_tasks) / 1024.0
-        for tag in tags
-    ]
-
-    # 5 segments per bar in fixed left-to-right order. Last is the
-    # residual so the visualization always matches the measured total.
-    seg_names = ["Text encoder (UMT5)", "Transformer weights",
-                 "KV cache (self-attn)", "VAE", "Activations + scratch"]
-    seg_colors = ["#6b4596", "#1f78b4", "#ff7f00", "#33a02c", "#999999"]
-    seg_data = []  # list per variant: [text, xfmr, kv, vae, residual]  in GB
-    for idx, tag in enumerate(tags):
-        text = _TEXT_ENCODER_GB
-        xfmr = _xfmr_weight_gb(tag)
-        kv   = _kv_cache_gb
-        vae  = _vae_gb
-        residual = max(0.0, measured_peak_gb[idx] - (text + xfmr + kv + vae))
-        seg_data.append([text, xfmr, kv, vae, residual])
-
-    fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 2.2)))
-    y_pos = list(range(len(tags)))
-    bar_total_gb = [sum(row) for row in seg_data]
-    bar_max_gb = max(bar_total_gb)
-    for s_idx, (s_name, s_color) in enumerate(zip(seg_names, seg_colors)):
-        widths = [row[s_idx] for row in seg_data]
-        lefts  = [sum(row[:s_idx]) for row in seg_data]
-        ax.barh(y_pos, widths, left=lefts, color=s_color,
-                label=s_name, edgecolor="white",
-                linewidth=1.0, height=0.78)
-        # Inline label only when segment is big enough to fit text legibly.
-        for i, w in enumerate(widths):
-            if w >= 0.045 * bar_max_gb:
-                tot = bar_total_gb[i]
-                pct = w / tot * 100 if tot > 0 else 0
-                center = lefts[i] + w / 2
-                txt_color = "white" if s_idx in (0, 1, 3) else "#1a1a1a"
-                ax.text(center, i,
-                        f"{s_name.split(' (')[0]}\n{w:.1f} GB\n({pct:.0f}%)",
-                        ha="center", va="center", fontsize=8.5,
-                        color=txt_color, fontweight="bold")
-    # Total at bar right edge.
-    for i, tot in enumerate(bar_total_gb):
-        ax.text(tot + 0.012 * bar_max_gb, i, f"{tot:.1f} GB total",
-                va="center", fontsize=10, color="#333", fontweight="bold")
-    # Bf16 -> W8A8 savings arrow (skip if only one variant).
-    if len(tags) >= 2:
-        bf16_idx = next((i for i, t in enumerate(tags) if t.lower() in ("bf16", "fp16")), 0)
-        for j, tag in enumerate(tags):
-            if j == bf16_idx:
-                continue
-            saving = bar_total_gb[bf16_idx] - bar_total_gb[j]
-            if saving > 0.1:
-                ax.annotate(
-                    f"-{saving:.1f} GB ({saving / bar_total_gb[bf16_idx] * 100:.1f}%)",
-                    xy=(bar_total_gb[j], j),
-                    xytext=(bar_total_gb[bf16_idx] + 0.18 * bar_max_gb, j - 0.30),
-                    arrowprops=dict(arrowstyle="->", color="#b22222", lw=1.6,
-                                    connectionstyle="arc3,rad=-0.25"),
-                    fontsize=9.5, color="#b22222", fontweight="bold",
-                    ha="center", va="center")
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(tags, fontsize=11, fontweight="bold")
-    ax.set_ylim(-0.6, len(tags) - 0.4)
-    ax.invert_yaxis()
-    ax.set_xlabel("VRAM peak alloc (GB)", fontsize=10)
-    ax.set_title("Per-variant VRAM peak breakdown "
-                 "(spatial decomposition of the 32 GB)",
-                 fontsize=12, pad=8)
-    ax.legend(loc="lower right", framealpha=0.92, fontsize=8.5, ncol=2)
-    ax.set_xlim(0, bar_max_gb * 1.32)
-    ax.grid(True, axis="x", alpha=0.20)
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
-    fig.subplots_adjust(left=0.18, bottom=0.18)
-    floor_gb = _TEXT_ENCODER_GB + _kv_cache_gb + _vae_gb
-    xfmr_cap_gb = _xfmr_bf16_gb - _xfmr_weight_gb('viditq_w8a8')
-    fig.text(
-        0.5, 0.04,
-        f"Text encoder (Phase 41 CPU-offload = 0 GB), VAE, KV cache: unquantized.  "
-        f"KV cache = {_kv_cache_gb:.2f} GB ({_kv_source_note}).  "
-        f"Transformer: N_PARAMS={_N_PARAMS_XFMR/1e9:.2f}B, W8A8 quantizes "
-        f"~{_XFMR_QUANT_FRAC*100:.0f}% (remain_fp_regex).  "
-        f"Activations+scratch = max(0, measured_peak - sum); bar may exceed "
-        f"measured peak when KV alloc < allocator-tracked peak (overflow case).",
-        ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
-    fig.text(
-        0.5, 0.008,
-        f"Floor (text + KV + VAE) = {floor_gb:.1f} GB  •  "
-        f"W8A8-on-transformer cap = -{xfmr_cap_gb:.1f} GB  •  "
-        f"next levers: KV int8 quant / text-encoder CPU offload.",
-        ha="center", va="bottom", fontsize=8.5, color="#b22222",
-        fontstyle="italic")
-    p_mem = os.path.join(plots_dir, "memory_breakdown.png")
-    fig.savefig(p_mem, dpi=130)
-    plt.close(fig)
-    charts.append(("VRAM peak spatial breakdown per variant "
-                   "(text encoder / transformer / KV / VAE / scratch)",
-                   "plots/memory_breakdown.png"))
+    if measured_kv_cache_path is not None and "=" in measured_kv_cache_path:
+        for entry in measured_kv_cache_path.split(","):
+            t, _, p = entry.partition("=")
+            _kv_paths[t.strip()] = p.strip()
+    _meas: dict[str, dict[str, float]] = {}   # tag -> {field_mb: value in GB}
+    for tag in tags:
+        p = _kv_paths.get(tag)
+        if not p or not os.path.exists(p):
+            continue
+        with open(p) as f:
+            s = json.load(f).get("samples", {})
+        if any(s.get(k) is None for k in _REQUIRED_MEAS):
+            continue
+        _meas[tag] = {k: float(s[k]) / 1024.0 for k in _REQUIRED_MEAS}
+    # KV container size (bf16-invariant) for the kv_occupancy chart below;
+    # measured, from any complete variant. None disables kv_occupancy GB.
+    _kv_cache_gb = (next(iter(_meas.values()))["kv_cache_mb"]
+                    if _meas else None)
+    _mem_ok = len(tags) > 0 and len(_meas) == len(tags)
+    if not _mem_ok:
+        print("warning: memory_breakdown skipped — force-measured requires a "
+              "complete --measured_kv_cache (tagged per variant) with all of "
+              f"{list(_REQUIRED_MEAS)}; have {sorted(_meas)} of {tags}.")
+    else:
+        seg_names = ["Text encoder (UMT5)", "Transformer weights",
+                     "KV cache (self-attn)", "VAE", "Activations + scratch"]
+        seg_colors = ["#6b4596", "#1f78b4", "#ff7f00", "#33a02c", "#999999"]
+        seg_data = [[_meas[tag]["text_encoder_weight_mb"],
+                     _meas[tag]["transformer_weight_mb"],
+                     _meas[tag]["kv_cache_mb"],
+                     _meas[tag]["vae_weight_mb"],
+                     _meas[tag]["activation_peak_mb"]] for tag in tags]
+        # eval per-task max peak (45a) overlaid as reference (a separate
+        # measurement; the gap vs sum(segments) is the diagnostic).
+        eval_peak_gb = [
+            max(summaries[tag][t].peak_alloc_mb for t in sorted_tasks) / 1024.0
+            for tag in tags]
+        fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 2.2)))
+        y_pos = list(range(len(tags)))
+        bar_total_gb = [sum(row) for row in seg_data]
+        bar_max_gb = max(bar_total_gb + eval_peak_gb)
+        for s_idx, (s_name, s_color) in enumerate(zip(seg_names, seg_colors)):
+            widths = [row[s_idx] for row in seg_data]
+            lefts = [sum(row[:s_idx]) for row in seg_data]
+            ax.barh(y_pos, widths, left=lefts, color=s_color, label=s_name,
+                    edgecolor="white", linewidth=1.0, height=0.78)
+            for i, w in enumerate(widths):
+                if w >= 0.045 * bar_max_gb:
+                    tot = bar_total_gb[i]
+                    pct = w / tot * 100 if tot > 0 else 0
+                    center = lefts[i] + w / 2
+                    txt_color = "white" if s_idx in (0, 1, 3) else "#1a1a1a"
+                    ax.text(center, i,
+                            f"{s_name.split(' (')[0]}\n{w:.1f} GB\n({pct:.0f}%)",
+                            ha="center", va="center", fontsize=8.5,
+                            color=txt_color, fontweight="bold")
+        # eval-peak reference line + sum-vs-peak gap per bar.
+        for i, (segsum, pk) in enumerate(zip(bar_total_gb, eval_peak_gb)):
+            ax.plot([pk, pk], [i - 0.39, i + 0.39], color="#b22222", lw=1.8,
+                    ls="--", zorder=6)
+            ax.text(max(segsum, pk) + 0.012 * bar_max_gb, i,
+                    f"Sigma seg {segsum:.1f} | eval-peak {pk:.1f} GB "
+                    f"(gap {segsum - pk:+.1f})",
+                    va="center", fontsize=9, color="#333", fontweight="bold")
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(tags, fontsize=11, fontweight="bold")
+        ax.set_ylim(-0.6, len(tags) - 0.4)
+        ax.invert_yaxis()
+        ax.set_xlabel("VRAM (GB) — measured segments; dashed = eval peak", fontsize=10)
+        ax.set_title("Per-variant VRAM breakdown (all segments measured)",
+                     fontsize=12, pad=8)
+        ax.legend(loc="lower right", framealpha=0.92, fontsize=8.5, ncol=2)
+        ax.set_xlim(0, bar_max_gb * 1.40)
+        ax.grid(True, axis="x", alpha=0.20)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        fig.subplots_adjust(left=0.18, bottom=0.16)
+        fig.text(
+            0.5, 0.03,
+            "All segments are measured allocation deltas (measure_kv_cache.py): "
+            "text-encoder / transformer / VAE weight deltas, KV container delta, "
+            "activation = forward_peak - forward_resident. No residual, no "
+            "theoretical value. Dashed red = eval per-task max peak (separate "
+            "measurement); 'gap' = sum(segments) - eval-peak, observational.",
+            ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
+        p_mem = os.path.join(plots_dir, "memory_breakdown.png")
+        fig.savefig(p_mem, dpi=130)
+        plt.close(fig)
+        charts.append(("VRAM breakdown per variant (all segments measured; "
+                       "dashed = eval peak)", "plots/memory_breakdown.png"))
 
     # ------ Chart 7: per-task KV cache occupancy ------
     # Bar chart: x=task, y=KV cache GB actually used (mean during eval).
@@ -990,7 +877,10 @@ def _make_plots(
     # cover fewer tasks. Sort ascending by mean fill for readability.
     kv_rows_raw = [(t, r) for t, r in summaries[base_tag].items()
                    if r.mean_kv_filled_slots == r.mean_kv_filled_slots]  # not NaN
-    has_kv = kv_tag is not None and bool(kv_rows_raw)
+    # _kv_cache_gb (measured KV container) is required for the GB scaling;
+    # None when no complete --measured_kv_cache was supplied (Phase 45.8
+    # force-measured) -> skip rather than fall back to a theoretical size.
+    has_kv = kv_tag is not None and bool(kv_rows_raw) and _kv_cache_gb is not None
     if has_kv:
         # Total slots from any non-NaN row; assume constant across tasks
         # (same attn_window config).
