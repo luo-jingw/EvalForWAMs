@@ -853,8 +853,13 @@ def _make_plots(
                       + (1 - _XFMR_QUANT_FRAC) * 2) / 2.0
         return _xfmr_bf16_gb * bf16_ratio + _QUANT_META_GB
 
+    # Phase 45a: cross-task aggregate is the MAX over tasks (true
+    # worst-case VRAM), not the mean. A mean over a bimodal per-task
+    # peak distribution (e.g. w4a8 16.92/25.94) represents no real run.
+    # The residual (Activations+scratch) below recomputes against this
+    # max automatically.
     measured_peak_gb = [
-        statistics.mean(summaries[tag][t].peak_alloc_mb for t in sorted_tasks) / 1024.0
+        max(summaries[tag][t].peak_alloc_mb for t in sorted_tasks) / 1024.0
         for tag in tags
     ]
 
@@ -1038,6 +1043,46 @@ def _make_plots(
         charts.append(("Per-task KV cache occupancy (measured via PerfProbe "
                        "kv_introspect, GB used of container)",
                        "plots/kv_occupancy_by_task.png"))
+
+    # ------ Chart 8: per-task peak VRAM by variant (Phase 45b) ------
+    # Models on kv_occupancy_by_task, but peak_alloc is variant-dependent
+    # so bars are grouped by variant. Dashed line per variant = the
+    # cross-task MAX (the value the memory_breakdown bar total uses,
+    # Phase 45a). Shows which tasks drive each variant's worst-case.
+    _peak_palette = ["#1f78b4", "#33a02c", "#e31a1c", "#ff7f00", "#6a3d9a"]
+    peak_order = sorted(
+        sorted_tasks,
+        key=lambda t: summaries[baseline_tag][t].peak_alloc_mb)
+    n_var = len(tags)
+    fig, ax = plt.subplots(
+        figsize=(13.0, max(5.0, 0.32 * len(peak_order) + 1.0)))
+    y = list(range(len(peak_order)))
+    bar_h = 0.80 / n_var
+    for vi, tag in enumerate(tags):
+        vals = [summaries[tag][t].peak_alloc_mb / 1024.0 for t in peak_order]
+        offs = [yy + (vi - (n_var - 1) / 2.0) * bar_h for yy in y]
+        color = _peak_palette[vi % len(_peak_palette)]
+        ax.barh(offs, vals, height=bar_h, color=color, label=tag, zorder=2)
+        vmax = max(vals)
+        ax.axvline(vmax, ls="--", color=color, lw=1.2,
+                   label=f"{tag} cross-task max = {vmax:.2f} GB")
+    ax.set_yticks(y)
+    ax.set_yticklabels(peak_order, fontsize=7)
+    ax.set_ylim(-0.6, len(peak_order) - 0.4)
+    ax.set_xlabel("Peak VRAM alloc (GB)")
+    ax.set_title(
+        f"Per-task peak VRAM by variant ({len(peak_order)} tasks)\n"
+        f"dashed line = cross-task max (used by memory_breakdown bar total)",
+        fontsize=10)
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(axis="x", alpha=0.30, zorder=1)
+    fig.tight_layout()
+    p_peak = os.path.join(plots_dir, "peak_mem_by_task.png")
+    fig.savefig(p_peak, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    charts.append(("Per-task peak VRAM alloc by variant "
+                   "(dashed = cross-task max used by memory_breakdown)",
+                   "plots/peak_mem_by_task.png"))
 
     return charts
 
