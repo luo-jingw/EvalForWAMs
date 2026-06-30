@@ -32,7 +32,10 @@ _MAX_SEQ = 512
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cache", required=True, help="text_cond_cache .pt path.")
+    ap.add_argument("--cache", default=None,
+                    help="text_cond_cache .pt path. Required for the default "
+                         "inspection / --reencode / --residency modes; omit "
+                         "for --serial (Phase 44d builds without a cache).")
     ap.add_argument("--reencode", type=int, default=0,
                     help="Re-encode the first N prompts live and print "
                          "max_abs vs cached (needs GPU + model). 0 = skip.")
@@ -43,17 +46,28 @@ def main() -> int:
                          "reset peak_alloc for a cache-hit vs a cache-miss "
                          "prompt (shows whether the text encoder enters the "
                          "VRAM peak). Needs GPU + model.")
+    ap.add_argument("--serial", action="store_true",
+                    help="Phase 44d: build the server WITHOUT a disk cache "
+                         "and reset on an uncached prompt under "
+                         "serve_residency on vs off. Prints reset peak_alloc "
+                         "+ reset wall-time for each path: serial keeps T5 "
+                         "and the transformer disjoint (peak ~= max), the "
+                         "transient swap co-resides them (peak ~= sum). "
+                         "Needs GPU + model.")
     args = ap.parse_args()
 
-    cache = load_cache(args.cache)
-    empty_key = cache_key("", _MAX_SEQ)
-    print(f"entries={len(cache)}  empty_negative_present={empty_key in cache}")
-    print(f"{'key_consistent':>14} {'seq':>4} {'dim':>5} {'embed_l2':>10}  prompt")
-    for k, e in cache.items():
-        consistent = (k == cache_key(e.prompt, e.max_sequence_length))
-        l2 = e.prompt_embeds.float().norm().item()
-        print(f"{str(consistent):>14} {e.seq_len:>4} {e.dim:>5} {l2:>10.2f}  "
-              f"'{e.prompt[:44]}'")
+    if args.cache is not None:
+        cache = load_cache(args.cache)
+        empty_key = cache_key("", _MAX_SEQ)
+        print(f"entries={len(cache)}  empty_negative_present={empty_key in cache}")
+        print(f"{'key_consistent':>14} {'seq':>4} {'dim':>5} {'embed_l2':>10}  prompt")
+        for k, e in cache.items():
+            consistent = (k == cache_key(e.prompt, e.max_sequence_length))
+            l2 = e.prompt_embeds.float().norm().item()
+            print(f"{str(consistent):>14} {e.seq_len:>4} {e.dim:>5} {l2:>10.2f}  "
+                  f"'{e.prompt[:44]}'")
+    else:
+        cache = {}
 
     if args.reencode > 0:
         from pathlib import Path
@@ -94,6 +108,33 @@ def main() -> int:
             hit = cache_key(prompt, _MAX_SEQ) in cache
             print(f"  {label:10} hit={hit} reset_peak_alloc={peak:.1f} MB "
                   f"embeds_set={server.prompt_embeds is not None}")
+        server.text_encoder.to("cpu")
+
+    if args.serial:
+        import time
+        from pathlib import Path
+        from ptqeval.eval.measure_flops import _build_server
+        server = _build_server(args.model_path,
+                               Path("/tmp/check_text_cond_serial"))
+        # No disk cache: both paths take a real T5 encode on a miss. The
+        # only difference is residency ordering.
+        server.text_cond_cache = None
+        server._mem_text_cond = {}
+        print("\n--serial reset peak_alloc + wall (serve_residency on vs off):")
+        cases = (("serial  (44d)", True, "serial uncached prompt aaa 111"),
+                 ("transient(41v3)", False, "transient uncached prompt bbb 222"))
+        for label, residency, prompt in cases:
+            server.serve_residency = residency
+            server._mem_text_cond = {}        # force a miss each path
+            torch.cuda.reset_peak_memory_stats()
+            t0 = time.time()
+            server.infer({"reset": True, "prompt": prompt,
+                          "save_visualization": False})
+            torch.cuda.synchronize()
+            dt = time.time() - t0
+            peak = torch.cuda.max_memory_allocated() / 1024 / 1024
+            print(f"  {label:16} serve_residency={residency!s:5} "
+                  f"reset_peak_alloc={peak:8.1f} MB  reset_wall={dt:6.2f} s")
         server.text_encoder.to("cpu")
     return 0
 

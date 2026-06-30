@@ -954,8 +954,15 @@ Source authority
     to GPU inline and skips the T5 swap; miss / no cache -> the Phase-41
     v3 transient swap (retained as the robustness path). Residency is
     gated by cache presence, not a serve_residency enum.
-- M-TC4 (deployment serial, 44d pending): load T5 -> encode -> offload
-    T5 -> load lingbot-va; lifecycles disjoint.
+- M-TC4 (deployment serial, 44d as implemented): serve_residency flag
+    (job_config, default off). On a miss, _reset offloads the transformer
+    to CPU, loads T5, encodes, offloads T5, reloads the transformer; the
+    embeds land in an in-memory cache (_mem_text_cond) so only the first
+    reset per unique prompt pays the swap. The encode runs at the top of
+    _reset, BEFORE create_empty_cache allocates the KV buffer, so the
+    encode window holds T5 alone: peak = max(T5, lingbot-va), not sum.
+    _resolve_cached_embeds(prompt) is the single resolver for both the
+    in-memory (44d) and disk (44c) caches.
 
 44.5 FLOW
 - precompute: enumerate prompts -> T5 on GPU -> encode each + neg ""
@@ -980,8 +987,10 @@ Source authority
          _reset:   M-TC3 resolve+inject; M-TC4 serial ordering.
 - new  .../method/viditq/check_text_cond_cache.py (observational)
 - edit PTQEval/ptqeval/eval/calc_cross_ckpt.py memory_breakdown:
-         text-encoder segment reconcile (precompute => 0 real; serial
-         => own bar, not summed). No reverse-fit.
+         --text_encoder_in_peak knob. --no-text_encoder_in_peak (eval
+         used the cache) zeroes the T5 segment in the stack; the measured
+         T5 weight is reported in the footnote as the off-GPU saving.
+         No reverse-fit (segment zeroed, not recomputed).
 
 44.7 IMPLEMENTATION PHASES (minimal verifiable)
 - 44a text_cond_cache.py: TextCondEntry + load/store + cache_key.   [DONE]
@@ -992,10 +1001,20 @@ Source authority
 - 44c server _reset cache-hit injection.                              [DONE]
       check_text_cond_cache --residency (A6000): cache-hit reset peak
       19360 MB vs miss 30426 MB -> ~11 GB T5 removed from the peak.
-- 44d server serial residency (deployment mode). observe: peak_alloc   [pending]
-      timeline = max(T5, lingbot-va) not sum; reset wall-time delta.
-- 44e calc_cross_ckpt memory_breakdown text-encoder reconcile          [pending]
-      (eval used cache -> text segment 0). observe bar totals.
+- 44d server serial residency (deployment mode). serve_residency flag    [DONE]
+      + _mem_text_cond + _resolve_cached_embeds; encode hoisted above
+      create_empty_cache. check_text_cond_cache --serial (A6000, bf16):
+      serve_residency=True reset_peak 19376 MB / wall 17.86 s vs
+      transient swap 30425 MB / wall 10.58 s -> peak = max(T5,xfmr) not
+      sum (~11 GB T5 off the peak); +7.3 s reset = transformer CPU
+      round-trip (the documented serial cost).
+- 44e calc_cross_ckpt memory_breakdown text-encoder reconcile          [DONE]
+      --text_encoder_in_peak (BooleanOptionalAction, default on).
+      --no-text_encoder_in_peak drops the T5 segment from the stack so
+      sum(segments) reconciles with the cache-mode eval peak; measured
+      T5 weight reported in the footnote as the saving (not reverse-fit).
+      Smoke (synthetic complete measured_kv_cache): both render; the T5
+      10.6 GB segment present (on) vs absent (off), sum drops by 10.6 GB.
 
 44.8 SCOPE (minimal)
 - 2 new modules + 1 server edit + 1 chart edit + 1 check script.

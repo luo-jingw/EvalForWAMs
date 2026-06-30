@@ -71,3 +71,6 @@ PTQEval/**/*.o
 
 omniserve/
 /private/
+
+# session scratch (plan.txt: 临时结果)
+tmp/

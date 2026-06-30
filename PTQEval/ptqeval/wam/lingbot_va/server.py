@@ -239,6 +239,17 @@ class VA_Server:
             _tc_path = getattr(job_config, 'text_cond_cache', None)
             self.text_cond_cache = load_cache(_tc_path) if _tc_path else None
 
+            # Phase 44d: deployment serial residency. When on (and no disk
+            # cache hit), _reset encodes the prompt with the transformer
+            # offloaded to CPU, so T5 and lingbot-va are never co-resident:
+            # peak during encode = T5 alone (KV buffer not yet allocated),
+            # then the transformer reloads. The result is cached in
+            # _mem_text_cond so only the first reset per unique prompt pays
+            # the swap. Off by default; eval uses the precomputed disk cache.
+            self.serve_residency = bool(
+                getattr(job_config, 'serve_residency', False))
+            self._mem_text_cond: dict = {}
+
             variant: Optional[str] = getattr(job_config, 'variant', None)
             variant_args_path: Optional[str] = getattr(job_config, 'variant_args', None)
             transformer_dir = os.path.join(
@@ -293,6 +304,23 @@ class VA_Server:
         if self.probe is None:
             return contextlib.nullcontext()
         return self.probe.stage(name)
+
+    def _resolve_cached_embeds(self, prompt):
+        """Return (pos_cpu, neg_cpu) cached T5 embeds for `prompt`, or None
+        on miss. Single resolver for both cache sources: the in-memory
+        deployment cache (44d serial residency) first, then the precomputed
+        disk cache (44c). neg_cpu may be None. Both tensors are CPU; the
+        caller moves them to GPU. No T5 forward here."""
+        _mem = self._mem_text_cond
+        if prompt in _mem:
+            return _mem[prompt]
+        _tc = self.text_cond_cache
+        if _tc is not None:
+            k_pos = cache_key(prompt, 512)
+            k_neg = cache_key("", 512)
+            if k_pos in _tc and k_neg in _tc:
+                return (_tc[k_pos].prompt_embeds, _tc[k_neg].prompt_embeds)
+        return None
 
     def _get_t5_prompt_embeds(
         self,
@@ -578,6 +606,46 @@ class VA_Server:
 
         logger.info('Reset.')
         _step('begin')
+
+        # Phase 44d: deployment serial residency. Encode the prompt here,
+        # BEFORE create_empty_cache allocates the KV buffer, with the
+        # transformer offloaded to CPU. T5 and lingbot-va are never
+        # co-resident: peak during the encode window = T5 alone. The
+        # embeds land in _mem_text_cond, so the prompt block below resolves
+        # them as a hit (no second encode) and every later reset on the
+        # same prompt skips the swap entirely. Only runs on a miss; eval
+        # uses the precomputed disk cache and never enters this path.
+        if (self.serve_residency and prompt is not None
+                and self._resolve_cached_embeds(prompt) is None):
+            _step('serial residency: transformer -> CPU')
+            with self._stage('serial_xfmr_offload'):
+                self.transformer.to('cpu')
+                torch.cuda.empty_cache()
+            _step('serial residency: text_encoder -> GPU + encode')
+            with self._stage('serial_text_encode'):
+                self.text_encoder.to(self.device)
+                torch.cuda.synchronize(self.device)
+                _pos, _neg = self.encode_prompt(
+                    prompt=prompt,
+                    negative_prompt=None,
+                    do_classifier_free_guidance=self.job_config.guidance_scale > 1,
+                    num_videos_per_prompt=1,
+                    prompt_embeds=None,
+                    negative_prompt_embeds=None,
+                    max_sequence_length=512,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                self.text_encoder.to('cpu')
+                torch.cuda.empty_cache()
+            self._mem_text_cond[prompt] = (
+                _pos.detach().to('cpu'),
+                _neg.detach().to('cpu') if _neg is not None else None)
+            _step('serial residency: transformer -> GPU')
+            with self._stage('serial_xfmr_reload'):
+                self.transformer.to(self.device)
+                torch.cuda.synchronize(self.device)
+
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
@@ -647,22 +715,22 @@ class VA_Server:
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
-            _tc = getattr(self, 'text_cond_cache', None)
-            _k_pos = cache_key(prompt, 512) if _tc is not None else None
-            _k_neg = cache_key("", 512) if _tc is not None else None
-            if _tc is not None and _k_pos in _tc and _k_neg in _tc:
-                # Phase 44c: inject precomputed T5 embeds. The text encoder
-                # is never moved to GPU -> it contributes 0 to the eval
+            _cached = self._resolve_cached_embeds(prompt)
+            if _cached is not None:
+                # Phase 44c/44d: inject cached T5 embeds (disk precompute or
+                # the in-memory serial-residency cache). The text encoder is
+                # never moved to GPU here -> it contributes 0 to the eval
                 # VRAM peak. Same (prompt_embeds, negative_prompt_embeds)
                 # shapes the swap path produces.
+                _pos_cpu, _neg_cpu = _cached
                 _step('text_cond cache hit (text encoder skipped)')
                 with self._stage('text_encoder'):
-                    self.prompt_embeds = _tc[_k_pos].prompt_embeds.to(
+                    self.prompt_embeds = _pos_cpu.to(
                         device=self.device, dtype=self.dtype)
                     self.negative_prompt_embeds = (
-                        _tc[_k_neg].prompt_embeds.to(
-                            device=self.device, dtype=self.dtype)
-                        if self.job_config.guidance_scale > 1 else None)
+                        _neg_cpu.to(device=self.device, dtype=self.dtype)
+                        if (_neg_cpu is not None
+                            and self.job_config.guidance_scale > 1) else None)
                 _step('text_cond inject done')
             else:
                 # Phase 41 v3: transient GPU swap (cache miss / no cache).

@@ -363,6 +363,7 @@ def _make_plots(
     measured_act_bytes: float | None = None,
     measured_kv_cache_path: str | None = None,
     gpu: str = "a6000",
+    text_encoder_in_peak: bool = True,
 ) -> list[tuple[str, str]]:
     """Renders charts under <out_dir>/plots/:
       1. sr_by_task.png           per-task SR per variant
@@ -810,11 +811,20 @@ def _make_plots(
         seg_names = ["Text encoder (UMT5)", "Transformer weights",
                      "KV cache (self-attn)", "VAE", "Activations + scratch"]
         seg_colors = ["#6b4596", "#1f78b4", "#ff7f00", "#33a02c", "#999999"]
-        seg_data = [[_meas[tag]["text_encoder_weight_mb"],
+        # Phase 44e: when eval used the precomputed text-cond cache (44c),
+        # T5 is never on GPU -> it is 0 in the eval VRAM peak. Drop the
+        # text-encoder segment from the stack so sum(segments) reconciles
+        # with the eval peak; the measured T5 weight is still reported
+        # separately (the amount the cache keeps off the GPU). No
+        # reverse-fit: the segment is zeroed, not recomputed.
+        _te_seg = [(_meas[tag]["text_encoder_weight_mb"] if text_encoder_in_peak
+                    else 0.0) for tag in tags]
+        seg_data = [[_te_seg[i],
                      _meas[tag]["transformer_weight_mb"],
                      _meas[tag]["kv_cache_mb"],
                      _meas[tag]["vae_weight_mb"],
-                     _meas[tag]["activation_peak_mb"]] for tag in tags]
+                     _meas[tag]["activation_peak_mb"]]
+                    for i, tag in enumerate(tags)]
         # eval per-task max peak (45a) overlaid as reference (a separate
         # measurement; the gap vs sum(segments) is the diagnostic).
         eval_peak_gb = [
@@ -852,21 +862,30 @@ def _make_plots(
         ax.set_ylim(-0.6, len(tags) - 0.4)
         ax.invert_yaxis()
         ax.set_xlabel("VRAM (GB) — measured segments; dashed = eval peak", fontsize=10)
-        ax.set_title("Per-variant VRAM breakdown (all segments measured)",
-                     fontsize=12, pad=8)
+        _title = ("Per-variant VRAM breakdown (all segments measured)"
+                  if text_encoder_in_peak else
+                  "Per-variant VRAM breakdown (text encoder cached off-GPU; "
+                  "all segments measured)")
+        ax.set_title(_title, fontsize=12, pad=8)
         ax.legend(loc="lower right", framealpha=0.92, fontsize=8.5, ncol=2)
         ax.set_xlim(0, bar_max_gb * 1.40)
         ax.grid(True, axis="x", alpha=0.20)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
         fig.subplots_adjust(left=0.18, bottom=0.16)
+        _te_note = ("" if text_encoder_in_peak else
+                    " Text encoder excluded from the stack (eval used the "
+                    "precomputed cache, Phase 44c -> T5 off-GPU); measured T5 "
+                    f"weight {next(iter(_meas.values()))['text_encoder_weight_mb']:.1f} "
+                    "GB is the saving, not in the peak.")
         fig.text(
             0.5, 0.03,
             "All segments are measured allocation deltas (measure_kv_cache.py): "
             "text-encoder / transformer / VAE weight deltas, KV container delta, "
             "activation = forward_peak - forward_resident. No residual, no "
             "theoretical value. Dashed red = eval per-task max peak (separate "
-            "measurement); 'gap' = sum(segments) - eval-peak, observational.",
+            "measurement); 'gap' = sum(segments) - eval-peak, observational."
+            + _te_note,
             ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
         p_mem = os.path.join(plots_dir, "memory_breakdown.png")
         fig.savefig(p_mem, dpi=130)
@@ -1642,6 +1661,15 @@ def main() -> int:
                         "'a6000' (default, Ampere) or 'l40s' (Ada). Only "
                         "affects roofline.png; SR / latency / memory charts "
                         "are hardware-independent.")
+    p.add_argument("--text_encoder_in_peak",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Phase 44e: whether the text encoder (UMT5) counts "
+                        "toward the memory_breakdown stack. Default on "
+                        "(transient-swap eval, T5 enters the peak). Pass "
+                        "--no-text_encoder_in_peak when eval used the "
+                        "precomputed text-cond cache (Phase 44c): T5 is "
+                        "off-GPU, so the segment is dropped from the stack "
+                        "and sum(segments) reconciles with the eval peak.")
     args = p.parse_args()
 
     variant_specs = [_parse_variant_arg(v) for v in args.variant]
@@ -1759,7 +1787,8 @@ def main() -> int:
                              measured_kv_cache_path=measured_kv_cache_arg,
                              measured_kv_bytes=measured_kv_bytes,
                              measured_act_bytes=measured_act_bytes,
-                             gpu=args.gpu)
+                             gpu=args.gpu,
+                             text_encoder_in_peak=args.text_encoder_in_peak)
 
         # Overlay a profiler-measured op_breakdown chart alongside the
         # architecture-estimated default when op_profile is available.
