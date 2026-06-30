@@ -47,6 +47,15 @@ _KNOWN_STAGES: tuple[str, ...] = (
     "action_head",
 )
 
+# Phase 44g: the diffusion working set = these stages; the text_encoder
+# stage (transient T5 co-residency) and init are excluded so the peak is
+# the T5-free, apples-to-apples VRAM working set.
+_DIFFUSION_STAGES: tuple[str, ...] = (
+    "transformer",
+    "action_head",
+    "vae_encode",
+)
+
 
 @dataclass
 class TaskSR:
@@ -69,6 +78,13 @@ class TaskPerf:
     per_stage_peak_reserved_mb: dict[str, float] = field(default_factory=dict)
     overall_peak_alloc_mb: Optional[float] = None
     overall_peak_reserved_mb: Optional[float] = None
+    # Phase 44g: diffusion working-set peak = max peak_alloc over the
+    # diffusion stages (transformer / action_head / vae_encode), EXCLUDING
+    # the text_encoder stage. When the text encoder is swapped in only for
+    # the text_encoder stage (Phase 41 v3), this is the T5-free,
+    # apples-to-apples VRAM peak; overall_peak_alloc_mb still includes the
+    # text_encoder stage's transient T5 co-residency.
+    diffusion_peak_alloc_mb: Optional[float] = None
     # KV cache occupancy across all stage records in this task's run.
     # `kv_total_slots` is fixed (= attn_window-derived container size);
     # `mean_kv_filled_slots` / `max_kv_filled_slots` show how the actual
@@ -91,6 +107,7 @@ class SummaryRow:
     mean_action_head_ms: Optional[float]
     peak_alloc_mb: Optional[float]
     peak_reserved_mb: Optional[float]
+    diffusion_peak_mb: Optional[float] = None
     mean_kv_filled_slots: Optional[float] = None
     max_kv_filled_slots: Optional[int] = None
     kv_total_slots: Optional[int] = None
@@ -195,6 +212,10 @@ def compute_task_perf(task_name: str, records: list[dict]) -> TaskPerf:
     }
     overall_peak_alloc = max(per_stage_alloc.values()) if per_stage_alloc else None
     overall_peak_reserved = max(per_stage_reserved.values()) if per_stage_reserved else None
+    # Phase 44g: diffusion working-set peak excludes the text_encoder stage.
+    _diff_stage_peaks = [per_stage_alloc[s] for s in _DIFFUSION_STAGES
+                         if s in per_stage_alloc]
+    diffusion_peak_alloc = max(_diff_stage_peaks) if _diff_stage_peaks else None
 
     return TaskPerf(
         task_name=task_name,
@@ -208,6 +229,7 @@ def compute_task_perf(task_name: str, records: list[dict]) -> TaskPerf:
         per_stage_peak_reserved_mb=per_stage_reserved,
         overall_peak_alloc_mb=overall_peak_alloc,
         overall_peak_reserved_mb=overall_peak_reserved,
+        diffusion_peak_alloc_mb=diffusion_peak_alloc,
         mean_kv_filled_slots=(statistics.fmean(kv_filled_list)
                               if kv_filled_list else None),
         max_kv_filled_slots=(max(kv_filled_list)
@@ -255,6 +277,7 @@ def build_summary(perf: dict[str, TaskPerf], sr: dict[str, TaskSR]) -> list[Summ
             mean_action_head_ms=p.per_stage_mean_ms.get("action_head") if p else None,
             peak_alloc_mb=p.overall_peak_alloc_mb if p else None,
             peak_reserved_mb=p.overall_peak_reserved_mb if p else None,
+            diffusion_peak_mb=p.diffusion_peak_alloc_mb if p else None,
             mean_kv_filled_slots=p.mean_kv_filled_slots if p else None,
             max_kv_filled_slots=p.max_kv_filled_slots if p else None,
             kv_total_slots=p.kv_total_slots if p else None,
@@ -270,7 +293,7 @@ def write_csv(rows: list[SummaryRow], path: str) -> None:
             "task_name", "num_episodes", "success_rate",
             "init_peak_mb", "mean_total_ms", "p50_total_ms", "p95_total_ms",
             "mean_transformer_ms", "mean_action_head_ms",
-            "peak_alloc_mb", "peak_reserved_mb",
+            "peak_alloc_mb", "peak_reserved_mb", "diffusion_peak_mb",
             "mean_kv_filled_slots", "max_kv_filled_slots", "kv_total_slots",
         ])
         for r in rows:
@@ -278,7 +301,7 @@ def write_csv(rows: list[SummaryRow], path: str) -> None:
                 r.task_name, r.num_episodes, r.success_rate,
                 r.init_peak_mb, r.mean_total_ms, r.p50_total_ms, r.p95_total_ms,
                 r.mean_transformer_ms, r.mean_action_head_ms,
-                r.peak_alloc_mb, r.peak_reserved_mb,
+                r.peak_alloc_mb, r.peak_reserved_mb, r.diffusion_peak_mb,
                 r.mean_kv_filled_slots, r.max_kv_filled_slots, r.kv_total_slots,
             ])
 

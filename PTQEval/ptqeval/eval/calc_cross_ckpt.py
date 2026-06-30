@@ -43,6 +43,11 @@ _FLOAT_FIELDS = (
 # Optional float fields added later (KV cache occupancy from
 # PerfProbe.kv_introspect; older summary.csv files don't have these).
 _OPTIONAL_FLOAT_FIELDS = (
+    # Phase 44g: diffusion working-set peak (max over transformer /
+    # action_head / vae_encode stages, T5 text_encoder stage excluded).
+    # Absent in pre-44g summary.csv -> nan -> callers fall back to
+    # peak_alloc_mb.
+    "diffusion_peak_mb",
     "mean_kv_filled_slots",
     "max_kv_filled_slots",
     "kv_total_slots",
@@ -62,6 +67,7 @@ class SummaryRow:
     mean_action_head_ms: float
     peak_alloc_mb: float
     peak_reserved_mb: float
+    diffusion_peak_mb: float = float("nan")
     mean_kv_filled_slots: float = float("nan")
     max_kv_filled_slots: float = float("nan")
     kv_total_slots: float = float("nan")
@@ -80,6 +86,18 @@ def load_summary(csv_path: str) -> dict[str, SummaryRow]:
                 data[k] = float(v) if v not in (None, "") else float("nan")
             rows[raw["task_name"]] = SummaryRow(**data)
     return rows
+
+
+def _apples_peak_mb(row: "SummaryRow") -> float:
+    """Phase 44g: the T5-excluded diffusion working-set peak
+    (diffusion_peak_mb) when the summary carries it, else the overall
+    peak_alloc_mb. This is the apples-to-apples VRAM peak across variants:
+    on a run where the text encoder is swapped in only for the
+    text_encoder stage (Phase 41 v3), diffusion_peak_mb drops the transient
+    T5 co-residency that peak_alloc_mb still includes."""
+    import math
+    d = row.diffusion_peak_mb
+    return d if (d is not None and not math.isnan(d)) else row.peak_alloc_mb
 
 
 def _inspect_quant_scope(int_weights_pth_path: str | None) -> dict | None:
@@ -257,6 +275,7 @@ def compute_aggregates(
         trans  = [summaries[t][task].mean_transformer_ms for task in tasks]
         peaks  = [summaries[t][task].peak_alloc_mb      for task in tasks]
         inits  = [summaries[t][task].init_peak_mb       for task in tasks]
+        diffpk = [_apples_peak_mb(summaries[t][task])   for task in tasks]
         out[t] = {
             "mean_success_rate":         statistics.mean(srs),
             "median_success_rate":       statistics.median(srs),
@@ -266,6 +285,9 @@ def compute_aggregates(
             "median_total_ms":           statistics.median(totals),
             "mean_transformer_ms":       statistics.mean(trans),
             "mean_peak_alloc_mb":        statistics.mean(peaks),
+            "max_peak_alloc_mb":         max(peaks),
+            "mean_diffusion_peak_mb":    statistics.mean(diffpk),
+            "max_diffusion_peak_mb":     max(diffpk),
             "mean_init_peak_mb":         statistics.mean(inits),
         }
     return out
@@ -826,9 +848,14 @@ def _make_plots(
                      _meas[tag]["activation_peak_mb"]]
                     for i, tag in enumerate(tags)]
         # eval per-task max peak (45a) overlaid as reference (a separate
-        # measurement; the gap vs sum(segments) is the diagnostic).
+        # measurement; the gap vs sum(segments) is the diagnostic). Phase
+        # 44g: use the T5-excluded diffusion working-set peak when the
+        # text encoder is excluded from the stack, so the reference line
+        # and the segments are on the same (T5-free) footing.
+        _peak_fn = _apples_peak_mb if not text_encoder_in_peak else (
+            lambda r: r.peak_alloc_mb)
         eval_peak_gb = [
-            max(summaries[tag][t].peak_alloc_mb for t in sorted_tasks) / 1024.0
+            max(_peak_fn(summaries[tag][t]) for t in sorted_tasks) / 1024.0
             for tag in tags]
         fig, ax = plt.subplots(figsize=(13.0, max(4.0, 1.0 * len(tags) + 2.2)))
         y_pos = list(range(len(tags)))
@@ -1408,6 +1435,7 @@ def write_report_md(
         ("mean_total_ms",       "Mean total ms/call", _fmt_ms),
         ("mean_transformer_ms", "Mean transformer ms/call", _fmt_ms),
         ("mean_peak_alloc_mb",  "Mean peak alloc",    _fmt_mb),
+        ("mean_diffusion_peak_mb", "Mean diffusion peak (T5-excluded, 44g)", _fmt_mb),
         ("mean_init_peak_mb",   "Init peak alloc",    _fmt_mb),
     ]
     head_header = ["Metric"] + [f"`{t}`" for t in tags]

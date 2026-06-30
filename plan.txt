@@ -935,7 +935,21 @@ Source authority
 - F6 wiring gap: text_cond_cache (and serve_residency) are read by
   server.__init__ via getattr but are NOT exposed through run_eval /
   _pool_runner Config / runtime_args yaml. Production eval cannot reach
-  the cache or the serial path today. (44f, pending — see 44.7.)
+  the cache or the serial path today. (44f, DONE — see 44.7.)
+- F7 (15x5 smoke, 2026-06-30): serve_residency DISTORTS wall-clock
+  latency/roofline. Per-call total 2.5x inflated even single-worker
+  (11422 vs historical 4657) while the transformer GEMM stage stays
+  normal (2059~2091); a 5-worker pool inflates even the GEMM stage
+  (->2899) via host-RAM/PCIe swap contention. Roofline then shows w8a8
+  SLOWER than bf16 (wrong); op_breakdown (kernel time, immune) correctly
+  shows w8a8 1.44x faster. Cause: per-episode transformer offload/reload
+  + empty_cache() -> slow re-cudaMalloc stalls between kernels.
+  => serve_residency is DEPLOYMENT-only; the eval runs WITHOUT it and
+  44g (per-stage diffusion peak) supplies the apples-to-apples memory.
+  Open: the user's precompute-cache idea (44c disk cache) would drop T5
+  entirely with NO latency hit (injection is cheap) IF coverage is
+  solved -- demo_randomized prompts are per-episode (F1), so it needs a
+  seed-deterministic prompt-collection pass; deferred, 44g unblocks now.
 
 44.1 PROBLEM
 - Phase 41 v3: _reset does text_encoder.to(cuda) while lingbot-va
@@ -1058,14 +1072,29 @@ Source authority
       __init__ getattr. Smoke: run_eval/server --help list both; Config
       accepts both; server consumption already proven by 44d --serial /
       44c --residency. User re-runs on the other server with these flags.
-- 44g cross_summary apples-to-apples peak = per-stage diffusion peak  [superseded]
-      DECISION (user 2026-06-29): re-run all variants on the other server
-      with --serve_residency (44f). T5 is then never co-resident, so
-      overall_peak IS already the diffusion working set across all variants
-      -> the per-stage extraction is unnecessary. 44g (reporting-only
-      max(transformer, action_head, vae_encode) from per_stage_peak_alloc_mb,
-      F4) stays available as a no-re-run fallback for legacy summaries but
-      is not the chosen path.
+- 44g cross_summary apples-to-apples peak = per-stage diffusion peak     [DONE]
+      RE-INSTATED (smoke finding F7, 2026-06-30): the 15x5 serve_residency
+      smoke showed serve_residency (44d/44f) badly DISTORTS wall-clock
+      latency/roofline (per-call total 2.5x inflated even single-worker:
+      11422 vs historical 4657, while the transformer GEMM stage stays
+      normal 2059~2091; in a 5-worker pool host-RAM/PCIe swap contention
+      inflates even the GEMM stage 2059->2899). Result: roofline showed
+      w8a8 SLOWER than bf16 (wrong); op_breakdown (kernel time, immune)
+      correctly showed w8a8 1.44x faster. Root cause: per-episode
+      transformer offload/reload + empty_cache() -> slow re-cudaMalloc
+      stalls between kernels that wall-clock captures.
+      => serve_residency is DEPLOYMENT-only; the eval runs WITHOUT it
+      (clean latency) and 44g supplies the apples-to-apples memory peak.
+      Impl: aggregator writes a MEASURED diffusion_peak_mb column =
+      max peak_alloc over {transformer, action_head, vae_encode} stages
+      (text_encoder stage excluded); _DIFFUSION_STAGES constant.
+      calc_cross_ckpt: SummaryRow.diffusion_peak_mb (optional) +
+      _apples_peak_mb() helper + headline "Mean diffusion peak
+      (T5-excluded, 44g)" + memory_breakdown eval-peak reference uses it
+      under --no-text_encoder_in_peak. Verified: historical w4a8 (T5 in
+      text_encoder stage) overall max 26562 -> diffusion 17328 MB (T5
+      -9233 MB), matching the serve_residency smoke peak 17328 -> same
+      apples-to-apples number, zero eval cost, no latency distortion.
 
 44.8 SCOPE (minimal)
 - 2 new modules + 1 server edit + 1 chart edit + 1 check script.
