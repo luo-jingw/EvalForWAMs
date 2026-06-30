@@ -872,8 +872,10 @@ def _make_plots(
                     pct = w / tot * 100 if tot > 0 else 0
                     center = lefts[i] + w / 2
                     txt_color = "white" if s_idx in (0, 1, 3) else "#1a1a1a"
-                    ax.text(center, i,
-                            f"{s_name.split(' (')[0]}\n{w:.1f} GB\n({pct:.0f}%)",
+                    # Segment NAME lives in the (outside) legend; the in-bar
+                    # label carries only the value + share to minimise
+                    # in-bar text / occlusion.
+                    ax.text(center, i, f"{w:.1f} GB\n({pct:.0f}%)",
                             ha="center", va="center", fontsize=8.5,
                             color=txt_color, fontweight="bold")
         # eval-peak reference line + sum-vs-peak gap per bar.
@@ -894,26 +896,29 @@ def _make_plots(
                   "Per-variant VRAM breakdown (text encoder cached off-GPU; "
                   "all segments measured)")
         ax.set_title(_title, fontsize=12, pad=8)
-        ax.legend(loc="lower right", framealpha=0.92, fontsize=8.5, ncol=2)
+        # Legend OUTSIDE the axes (upper-right) so it never overlaps the
+        # bars or the Sigma-seg annotations.
+        ax.legend(loc="upper left", bbox_to_anchor=(1.005, 1.0),
+                  framealpha=0.92, fontsize=8.5, borderaxespad=0.)
         ax.set_xlim(0, bar_max_gb * 1.40)
         ax.grid(True, axis="x", alpha=0.20)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
-        fig.subplots_adjust(left=0.18, bottom=0.16)
+        fig.subplots_adjust(left=0.13, right=0.80, bottom=0.22)
         _te_note = ("" if text_encoder_in_peak else
                     " Text encoder excluded from the stack (eval used the "
                     "precomputed cache, Phase 44c -> T5 off-GPU); measured T5 "
                     f"weight {next(iter(_meas.values()))['text_encoder_weight_mb']:.1f} "
                     "GB is the saving, not in the peak.")
         fig.text(
-            0.5, 0.03,
+            0.5, 0.015,
             "All segments are measured allocation deltas (measure_kv_cache.py): "
             "text-encoder / transformer / VAE weight deltas, KV container delta, "
             "activation = forward_peak - forward_resident. No residual, no "
             "theoretical value. Dashed red = eval per-task max peak (separate "
             "measurement); 'gap' = sum(segments) - eval-peak, observational."
             + _te_note,
-            ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
+            ha="center", va="bottom", fontsize=7.5, color="#444", wrap=True)
         p_mem = os.path.join(plots_dir, "memory_breakdown.png")
         fig.savefig(p_mem, dpi=130)
         plt.close(fig)
@@ -1195,7 +1200,9 @@ def _render_op_breakdown(
             if v <= 0:
                 continue
             share = v / totals[i] * 100.0 if totals[i] > 0 else 0.0
-            label = f"{op_labels[key]}: {unit_fmt.format(v)} {unit_label}\n({share:.1f}%)"
+            # Op NAME lives in the (outside) legend; in-bar label is value +
+            # share only, to minimise in-bar text / occlusion.
+            label = f"{unit_fmt.format(v)} {unit_label}\n({share:.1f}%)"
             # Show inner label only when segment is wide enough; small
             # segments rely on legend + the percentage in the next
             # widest segment's neighborhood.
@@ -1274,8 +1281,10 @@ def _render_op_breakdown(
     ax.invert_yaxis()
     ax.set_xlabel(xlabel, fontsize=10)
     ax.set_title(title, fontsize=12, pad=8)
-    ax.legend(loc="upper right", framealpha=0.92, fontsize=10)
-    right_pad = 1.20 if len(tags) >= 3 else 1.13
+    # Legend OUTSIDE the axes (upper-right) so it never overlaps the bars.
+    ax.legend(loc="upper left", bbox_to_anchor=(1.005, 1.0),
+              framealpha=0.92, fontsize=9, borderaxespad=0.)
+    right_pad = 1.12
     ax.set_xlim(0, bar_max * right_pad)
     ax.grid(True, axis="x", alpha=0.20)
     for s in ("top", "right"):
@@ -1298,9 +1307,9 @@ def _render_op_breakdown(
             full_caption = caption + "\n\nOther sub-cats — " + " | ".join(lines)
     # Reserve more vertical room when the caption grew.
     bottom_margin = 0.32 if (has_sub and sub_docs) else 0.20
-    fig.subplots_adjust(left=0.15, bottom=bottom_margin)
-    fig.text(0.5, 0.02, full_caption,
-             ha="center", va="bottom", fontsize=8.0, color="#444", wrap=True)
+    fig.subplots_adjust(left=0.13, right=0.80, bottom=bottom_margin)
+    fig.text(0.5, 0.015, full_caption,
+             ha="center", va="bottom", fontsize=7.5, color="#444", wrap=True)
     p = os.path.join(plots_dir, out_name)
     fig.savefig(p, dpi=130)
     plt.close(fig)
