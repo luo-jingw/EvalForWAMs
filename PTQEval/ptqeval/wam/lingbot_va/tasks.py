@@ -33,6 +33,15 @@ SELECTED_15_TASKS: list[str] = [
     "turn_switch",                                      # short (400 x7)
 ]
 
+# Smoke subset (5 tasks: 1 long + 1 medium-long + 3 short) for fast
+# end-to-end pipeline checks (e.g. the Phase 44 precompute / T5-free path).
+# A subset of SELECTED_15_TASKS; not a production scope.
+SMOKE_5_TASKS: list[str] = [
+    "put_bottles_dustbin",   # long
+    "stack_bowls_two",       # medium-long
+    "place_shoe", "click_bell", "turn_switch",  # short
+]
+
 # Phase 31 (v2): all 50 RoboTwin tasks for broader activation statistics.
 # Sourced from RoboTwin/task_config/_eval_step_limit.yml. Calibration runs
 # this list with 5 ep/task -> 250 trajectories worth of per-channel

@@ -174,6 +174,14 @@ def parse_args() -> Config:
                         "before the T5 encode so T5 and lingbot-va are never "
                         "co-resident (VRAM peak = max, not sum). Prompt-"
                         "agnostic; ~+7s per unique prompt. Default off.")
+    p.add_argument("--offload_target", default="cpu", choices=["cpu", "disk"],
+                   help="req-1a: transformer offload target on the "
+                        "--serve_residency path. cpu = host RAM (fast); disk "
+                        "= serialize to --offload_dir + free host (edge "
+                        "devices with tight RAM). Default cpu.")
+    p.add_argument("--offload_dir", type=Path, default=None,
+                   help="Directory for --offload_target disk (default "
+                        "<save_root>/_offload).")
 
     args = p.parse_args()
 
@@ -220,6 +228,8 @@ def parse_args() -> Config:
         save_visualization=args.save_visualization,
         text_cond_cache=str(args.text_cond_cache.resolve()) if args.text_cond_cache else "",
         serve_residency=args.serve_residency,
+        offload_target=args.offload_target,
+        offload_dir=str(args.offload_dir.resolve()) if args.offload_dir else "",
         gpu_ids=gpu_ids,
         max_gpus=args.max_gpus,
     )

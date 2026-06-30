@@ -225,19 +225,27 @@ class VA_Server:
             # websocket critical path, well under the multi-minute
             # reset budget. Steady-state VRAM saving matches the
             # original Phase 41 (11 GB freed).
-            self.text_encoder = load_text_encoder(
-                os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                             'text_encoder'),
-                torch_dtype=self.dtype,
-                torch_device='cpu',
-            )
-
-            # Phase 44c: precomputed text-condition cache. When set and a
-            # prompt is a hit, _reset injects the cached T5 embeds and skips
-            # the text encoder entirely (T5 never reaches GPU). Miss -> the
-            # existing transient swap path. None -> always swap.
+            # Phase 44c / req-2: precomputed text-condition cache. When a
+            # cache is provided the eval is fully T5-FREE: defer the ~11 GB
+            # text encoder load entirely and only materialize it (lazy, CPU)
+            # on a cache MISS. With complete coverage the text encoder never
+            # occupies host OR device memory. No cache -> load eagerly on CPU
+            # (the transient-swap / serve_residency direct-compute paths need
+            # it). _ensure_text_encoder() does the lazy load.
+            self._text_encoder_path = os.path.join(
+                job_config.wan22_pretrained_model_name_or_path, 'text_encoder')
             _tc_path = getattr(job_config, 'text_cond_cache', None)
             self.text_cond_cache = load_cache(_tc_path) if _tc_path else None
+            if self.text_cond_cache is not None:
+                self.text_encoder = None
+                logger.info("[text_cond] cache set -> text encoder NOT loaded "
+                            "(T5-free; lazy-load only on a cache miss)")
+            else:
+                self.text_encoder = load_text_encoder(
+                    self._text_encoder_path,
+                    torch_dtype=self.dtype,
+                    torch_device='cpu',
+                )
 
             # Phase 44d: deployment serial residency. When on (and no disk
             # cache hit), _reset encodes the prompt with the transformer
@@ -249,6 +257,19 @@ class VA_Server:
             self.serve_residency = bool(
                 getattr(job_config, 'serve_residency', False))
             self._mem_text_cond: dict = {}
+            # req-1a: where the transformer weights go while T5 is resident
+            # so the two are never co-resident in VRAM. 'cpu' = host RAM
+            # (fast). 'disk' = serialize to offload_dir + free host too
+            # (edge devices with tight RAM). Only consulted on the serial
+            # (serve_residency) direct-compute path.
+            self.offload_target = str(
+                getattr(job_config, 'offload_target', 'cpu'))
+            self.offload_dir = str(
+                getattr(job_config, 'offload_dir', '') or
+                os.path.join(self.save_root, '_offload'))
+            self._offload_path = os.path.join(
+                self.offload_dir,
+                f"transformer_offload_rank{job_config.local_rank}.pt")
 
             variant: Optional[str] = getattr(job_config, 'variant', None)
             variant_args_path: Optional[str] = getattr(job_config, 'variant_args', None)
@@ -304,6 +325,51 @@ class VA_Server:
         if self.probe is None:
             return contextlib.nullcontext()
         return self.probe.stage(name)
+
+    def _offload_transformer(self):
+        """req-1a: move the transformer weights off the GPU so T5 can load
+        without co-residency (peak = max, not sum). 'cpu' parks them in
+        host RAM; 'disk' serializes to offload_dir then drops the module to
+        meta so host RAM is freed too (edge devices). Mutually exclusive
+        with T5 residency by construction."""
+        if self.offload_target == 'disk':
+            os.makedirs(self.offload_dir, exist_ok=True)
+            # to('cpu') frees the GPU storage reliably (FSDP flat params +
+            # quant buffers alike); to('meta') alone does NOT (FSDP keeps the
+            # flat param on device). Then persist + drop host storage to meta
+            # so host RAM is freed too (edge devices). Weights come back from
+            # disk in _reload_transformer via assign=True.
+            self.transformer.to('cpu')
+            torch.cuda.empty_cache()
+            torch.save(self.transformer.state_dict(), self._offload_path)
+            self.transformer.to('meta')
+        else:
+            self.transformer.to('cpu')
+        torch.cuda.empty_cache()
+
+    def _reload_transformer(self):
+        """Bring the transformer weights back onto the GPU after the T5
+        encode. 'disk' reloads the saved state_dict straight to device
+        (assign=True replaces the meta params)."""
+        if self.offload_target == 'disk':
+            sd = torch.load(self._offload_path, map_location=self.device)
+            self.transformer.load_state_dict(sd, assign=True)
+            del sd
+        else:
+            self.transformer.to(self.device)
+        torch.cuda.synchronize(self.device)
+
+    def _ensure_text_encoder(self):
+        """Lazy-load the text encoder (CPU) on a cache miss. With a complete
+        precomputed cache this is never called -> T5 occupies neither host
+        nor device memory (req-2: eval fully T5-free)."""
+        if self.text_encoder is None:
+            logger.warning(
+                "[text_cond] cache MISS -> lazy-loading text encoder (~11 GB "
+                "host RAM). A complete precomputed cache avoids this.")
+            self.text_encoder = load_text_encoder(
+                self._text_encoder_path, torch_dtype=self.dtype,
+                torch_device='cpu')
 
     def _resolve_cached_embeds(self, prompt):
         """Return (pos_cpu, neg_cpu) cached T5 embeds for `prompt`, or None
@@ -617,10 +683,10 @@ class VA_Server:
         # uses the precomputed disk cache and never enters this path.
         if (self.serve_residency and prompt is not None
                 and self._resolve_cached_embeds(prompt) is None):
-            _step('serial residency: transformer -> CPU')
+            self._ensure_text_encoder()
+            _step(f'serial residency: transformer -> {self.offload_target}')
             with self._stage('serial_xfmr_offload'):
-                self.transformer.to('cpu')
-                torch.cuda.empty_cache()
+                self._offload_transformer()
             _step('serial residency: text_encoder -> GPU + encode')
             with self._stage('serial_text_encode'):
                 self.text_encoder.to(self.device)
@@ -643,8 +709,7 @@ class VA_Server:
                 _neg.detach().to('cpu') if _neg is not None else None)
             _step('serial residency: transformer -> GPU')
             with self._stage('serial_xfmr_reload'):
-                self.transformer.to(self.device)
-                torch.cuda.synchronize(self.device)
+                self._reload_transformer()
 
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
@@ -737,6 +802,7 @@ class VA_Server:
                 # text_encoder lives on CPU; move it to GPU just for the
                 # encode then immediately offload back. ~6-7 s per reset;
                 # steady-state VRAM saving: 11 GB.
+                self._ensure_text_encoder()
                 _step('text_encoder.to(cuda) begin (11 GB H2D)')
                 self.text_encoder.to(self.device)
                 torch.cuda.synchronize(self.device)
@@ -1102,6 +1168,9 @@ def run(args):
     if args.text_cond_cache is not None:
         config.text_cond_cache = args.text_cond_cache
     config.serve_residency = bool(args.serve_residency)
+    config.offload_target = args.offload_target
+    if args.offload_dir is not None:
+        config.offload_dir = args.offload_dir
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -1227,6 +1296,18 @@ def main():
              'reloads the transformer (T5 and lingbot-va never co-resident; '
              'peak = max not sum). Embeds are cached in-process so only the '
              'first reset per unique prompt pays the swap. Off by default.'
+    )
+    parser.add_argument(
+        "--offload_target", type=str, default="cpu", choices=["cpu", "disk"],
+        help='req-1a: where the transformer weights go while T5 is resident '
+             'on the serve_residency direct-compute path. cpu = host RAM '
+             '(fast). disk = serialize to --offload_dir + free host too '
+             '(edge devices with tight RAM). Default cpu.'
+    )
+    parser.add_argument(
+        "--offload_dir", type=str, default=None,
+        help='Directory for --offload_target disk (default '
+             '<save_root>/_offload).'
     )
     args = parser.parse_args()
     run(args)

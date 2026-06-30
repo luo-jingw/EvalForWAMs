@@ -112,6 +112,10 @@ class Config:
     # measured VRAM peak; default off preserves the Phase-41 swap behavior.
     text_cond_cache: str = ""
     serve_residency: bool = False
+    # req-1a: transformer offload target on the serve_residency direct-
+    # compute path ('cpu' | 'disk'); offload_dir for the disk variant.
+    offload_target: str = "cpu"
+    offload_dir: str = ""
     # Optional pool GPU selection (default = scan all 8 + filter by free
     # memory). When gpu_ids is set, only those GPUs are considered (still
     # subject to min_free_mb filter). When max_gpus is set, after the
@@ -311,6 +315,9 @@ def start_server(cfg: Config, gpu: int, port: int, master_port: int,
         extra.append(f"--text_cond_cache {cfg.text_cond_cache}")
     if cfg.serve_residency:
         extra.append("--serve_residency")
+        extra.append(f"--offload_target {cfg.offload_target}")
+        if cfg.offload_dir:
+            extra.append(f"--offload_dir {cfg.offload_dir}")
     extra_cli = " ".join(extra)
 
     cmd = (
