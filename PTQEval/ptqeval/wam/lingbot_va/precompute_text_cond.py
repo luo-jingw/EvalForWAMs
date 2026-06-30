@@ -59,7 +59,13 @@ def main() -> int:
                          "(e.g. results/bf16).")
     ap.add_argument("--model_path",
                     default="models/lingbot-va-posttrain-robotwin")
-    ap.add_argument("--output", required=True, help="Cache output .pt path.")
+    ap.add_argument("--output", required=True,
+                    help="Cache output path. A DIRECTORY path (no .pt "
+                         "extension) writes the LazyCache format (index + "
+                         "per-prompt embeds) so the eval server loads only "
+                         "the prompts it needs -- use this at full scope "
+                         "(thousands of prompts, tens of GB). A .pt path "
+                         "writes a single eager file (small caches / smoke).")
     ap.add_argument("--limit", type=int, default=0,
                     help="Encode only the first N prompts (0 = all). Smoke.")
     args = ap.parse_args()
