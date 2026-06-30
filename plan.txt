@@ -1335,3 +1335,103 @@ Contents:
 - calib_data.pth: pending upload.
 NOT uploaded: per-variant int_weights.pth (ViDiT-Q-bound buffers).
 README at results/calib_capture/README.md.
+
+
+===============================================================================
+DONE since 44e (2026-06-29/30, committed)
+- 44f  wire text_cond_cache + serve_residency through run_eval/_pool_runner.
+- 44g  measured diffusion_peak_mb (aggregator) + calc_cross_ckpt apples-to-
+       apples peak; serve_residency demoted to deployment-only (smoke F7:
+       it distorts wall-clock latency/roofline 2.5x; op_breakdown kernel
+       time immune).
+- 45.9-A executed (deleted 369 GB variant obs; measure_* -> calib_capture).
+- seed fix: eval_client random.seed(now_seed) -> RoboTwin instruction
+  phrasing reproducible (was unseeded; _base_task.py:60 commented out).
+  Verified 2/2 cache hits same-seed (was 0/3).
+- req-1a: _offload_transformer/_reload_transformer (cpu|disk) so T5 and
+  lingbot-va never co-resident (check_offload: 20677 vs 30418 MB additive).
+- req-1b: lazy text encoder (server loads T5 only on a cache MISS) ->
+  precompute eval fully T5-free. w4a4 SMOKE_5: 5/5 "text encoder NOT
+  loaded", 12/12 hits, peak 16716 MB = diffusion (gap 0).
+- LazyCache directory format (index + per-prompt embeds) so a per-task
+  server loads only its prompts (avoids tens-of-GB per-worker OOM).
+- calc_cross_ckpt charts: legends outside axes + names in legend (de-occlude).
+
+
+Phase 46: precompute redesign — direct expert-collection + unpadded cache
+-------------------------------------------------------------------------------
+46.0 FINDINGS (double-check, 2026-06-30)
+- F1 current collect runs a FULL VLA eval just to harvest prompts
+  (precompute_text_cond reads obs_data 'task' fields of a prior run).
+  Wasteful: the VLA diffusion is irrelevant to the prompt text.
+- F2 the prompt TEXT is RoboTwin-env-generated, NOT T5-generated. T5 only
+  ENCODES text->embeds. precompute = (a) get prompt texts from the env,
+  (b) T5-encode. T5 cannot "produce" the prompt.
+- F3 instruction dependency: generate_episode_descriptions needs
+  episode_info["info"], populated INSIDE play_once (the EXPERT rollout):
+  e.g. stack_bowls_two info["info"] = {A,B object types (scene-set),
+  a,b arm tags decided by the expert's move_bowl}. So the instruction
+  depends on the expert's arm choices -> setup_demo alone is NOT enough;
+  play_once (expert) is required (not a pure scene lookup).
+- F4 the expert is deterministic given seed (np.random+torch seeded) AND
+  succ_seed advances on EXPERT success (eval_client.py:494), so the seed
+  range + instructions are EXPERT-determined => MODEL-INDEPENDENT: one
+  collection covers ALL variants.
+- F5 cache space: the stored embed is padded to [512,4096]=4 MB, but the
+  real instruction is ~20 tokens (measured min1/max41/mean20). Storing
+  UNPADDED ([seq_len,4096], repad zeros on load) is ~26x smaller: full
+  w4a4 ~1.9 GB (not 49 GB). Padding was the space culprit.
+
+46.1 PROBLEM
+- precompute should harvest prompts directly from the env EXPERT path (no
+  VLA diffusion/server/T5), once, model-agnostic; cache should be ~GB.
+
+46.2 GOAL
+- collection = expert(play_once)+instruction only. one cache for all
+  variants. unpadded embeds. T5 loaded once (precompute), never in eval.
+
+46.3 STRUCTURE (modules + ownership)
+- M-PC1 prompt collection (expert env loop). Owner: (task,seed)->instruction.
+- M-PC2 T5 encode (precompute). Owner: instruction -> unpadded embed.
+- M-PC3 cache (unpadded LazyCache). Owner: on-disk schema + repad-on-load.
+
+46.4 INTERFACE
+- M-PC1: reuse eval_client's EXACT loop (setup_demo+play_once+
+  generate_episode_descriptions+random.seed) in a collect-only mode that
+  records (now_seed,instruction) right after set_instruction (line 518) and
+  skips the VLA inference (552+) + the server. Output: per-task instructions
+  file (jsonl {seed,instruction}). _pool_runner gains a collect mode that
+  launches clients WITHOUT servers (model unused).
+- M-PC2: precompute_text_cond reads the instructions file(s) (not obs),
+  loads T5 once, encodes unique instructions + neg "", stores UNPADDED.
+- M-PC3: TextCondEntry stores prompt_embeds at actual seq_len; load repads
+  to 512 (deterministic zeros). store/load detect padded vs unpadded.
+
+46.5 FLOW
+- collect (RoboTwin-jw env, NO server): per task expert loop -> instructions.
+- precompute (lingbot-jw, T5 only): instructions -> unpadded cache.
+- eval (T5-free): inject cached embeds (existing 44c path).
+
+46.6 CODE MAPPING
+- edit eval_client.py: collect-only branch in eval_policy (record + skip VLA).
+- edit run_eval.py + _pool_runner.py: collect mode (no server).
+- edit precompute_text_cond.py: instructions-file source (not obs).
+- edit text_cond_cache.py: unpadded store + repad-on-load.
+
+46.7 TASKS (minimal verifiable)
+- 46a unpadded cache (store seq_len, repad on load). check: round-trip
+  max_abs=0, file ~26x smaller.
+- 46b collect-only mode (eval_client + _pool_runner no-server). check:
+  collected instructions == a reference eval's instructions, same seed.
+- 46c precompute reads instructions file. check: cache -> 100% eval hit,
+  T5 not loaded.
+- 46d smoke (w4a4 SMOKE_5): collect-only -> precompute -> T5-free eval ->
+  cross_summary. observe hit rate + cache size + peak.
+
+46.8 SCOPE / NOTES
+- no kernel/PTQ/loader change. collection reuses the EXACT eval loop so the
+  prompts cannot diverge from eval-time.
+- the expert (play_once) cost is unavoidable (instruction depends on it) but
+  is paid ONCE, model-agnostic, and is strictly cheaper than the current
+  full-VLA collect (no diffusion). The eval already runs play_once/episode.
+- cache stays backward-compatible (.pt eager + dir lazy; padded + unpadded).
