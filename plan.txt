@@ -897,11 +897,45 @@ Phase 44: Text-condition precompute + serial text/diffusion residency
           (VRAM peak excludes co-resident text encoder)
 -------------------------------------------------------------------------------
 Source authority
-- Not a ViDiT-Q algorithm constraint. Engineering only: RoboTwin
-  per-task prompt is fixed => T5 (UMT5-XXL) output deterministic =>
-  cacheable. encode_prompt() already accepts a prompt_embeds override
-  (server.py L360 `if prompt_embeds is None`) => injection is in-API.
+- Not a ViDiT-Q algorithm constraint. Engineering only: get the
+  transient T5 (UMT5-XXL) co-residency out of the measured VRAM peak.
+  encode_prompt() already accepts a prompt_embeds override (server.py
+  L360 `if prompt_embeds is None`) => injection is in-API.
 - Predecessor: Phase 41 v3 transient swap created the co-residency.
+- CORRECTION (44.0 finding): the original premise "RoboTwin per-task
+  prompt is fixed => T5 output cacheable" is FALSE for demo_randomized
+  (the production task_config). See 44.0.
+
+44.0 DOUBLE-CHECK FINDINGS (2026-06-29, smoke-verified)
+- F1 prompt premise false. obs_data 'task' is a PER-EPISODE randomized
+  object-description instruction, not a per-task fixed string. Measured
+  unique prompts: results/bf16 365 / 371 ep; results/viditq_w4a8 5240 /
+  5000 ep (~1 unique per episode). Episode dirs = <prompt>_<timestamp>,
+  env-generated, not reproducible across runs without identical seeding.
+- F2 disk cache (44a/b/c) scope. precompute-from-a-prior-run prompts do
+  not match a fresh demo_randomized eval => mostly miss => swap
+  fallback. The disk precompute cache is effective only for reproducible
+  prompts (demo_clean, or a seeded replay), NOT production demo_randomized.
+- F3 serial residency (44d) is prompt-agnostic: correct peak regardless
+  of prompt variety, pays ~+7.3 s per UNIQUE prompt (transformer CPU
+  round-trip) = ~+7 s/episode under randomization. Valid deployment
+  mechanism; one reset/episode so it is a few % of a multi-minute episode.
+- F4 apples-to-apples peak is ALREADY MEASURED. PerfProbe resets peak
+  per stage; aggregator stores per_stage_peak_alloc_mb {init,
+  text_encoder, transformer, action_head, vae_encode}. Diffusion
+  working-set peak = max(transformer, action_head, vae_encode). w4a8
+  swap run: 17.3 GB vs overall 26.6 GB -> the 9.2 GB gap is exactly the
+  T5 transient, excludable in REPORTING with zero eval change.
+- F5 cross-variant inconsistency in the existing local runs: bf16/w8a8
+  ran T5 GPU-resident (init 23 GB -> T5 in EVERY stage); w4a8 ran the
+  transient swap (init 11.6 GB -> T5 only in the text_encoder stage). So
+  F4's per-stage exclusion cleanly fixes w4a8 but NOT bf16/w8a8 (T5 is
+  in all their stages). A clean 5-way needs either a consistent re-run
+  (44c/44d) or a T5-size subtraction.
+- F6 wiring gap: text_cond_cache (and serve_residency) are read by
+  server.__init__ via getattr but are NOT exposed through run_eval /
+  _pool_runner Config / runtime_args yaml. Production eval cannot reach
+  the cache or the serial path today. (44f, pending — see 44.7.)
 
 44.1 PROBLEM
 - Phase 41 v3: _reset does text_encoder.to(cuda) while lingbot-va
@@ -967,12 +1001,14 @@ Source authority
 44.5 FLOW
 - precompute: enumerate prompts -> T5 on GPU -> encode each + neg ""
   -> store_cache -> free T5 -> exit.
-- eval reset (precompute mode): _reset -> _resolve_text_cond(prompt)
-  -> cache hit -> encode_prompt(prompt_embeds=cached,
-  negative_prompt_embeds=cached) -> T5 never loaded -> text_encoder
-  stage peak = activation only. Coverage of the eval task set is
-  required (precompute enumerates the same task list); a stale-cache
-  miss emits a warning and flags the run (not a silent swap).
+- eval reset (precompute mode): _reset -> _resolve_cached_embeds(prompt)
+  -> cache hit -> inject cached embeds -> T5 never loaded -> text_encoder
+  stage peak = activation only. Coverage caveat (44.0 F1/F2): under
+  demo_randomized the per-episode prompt is not reproducible, so hits
+  require the eval to reuse the precompute source's exact prompts; a miss
+  falls through to the 44d serial path (serve_residency on) or the 41 v3
+  swap (off). For production demo_randomized the reporting path (44.0 F4
+  per-stage diffusion peak) is the recommended apples-to-apples number.
 - deployment serial: task start (lingbot-va not resident) -> load T5
   -> encode task prompts -> free T5 + empty_cache -> load lingbot-va
   -> run episodes -> free lingbot-va -> next task. Peak = max(T5,
@@ -1015,6 +1051,19 @@ Source authority
       T5 weight reported in the footnote as the saving (not reverse-fit).
       Smoke (synthetic complete measured_kv_cache): both render; the T5
       10.6 GB segment present (on) vs absent (off), sum drops by 10.6 GB.
+- 44f wire text_cond_cache + serve_residency through the eval pipeline   [pending]
+      (44.0 F6): run_eval CLI -> _pool_runner Config field -> client cmd
+      override -> eval_client usr_args -> server job_config. Without it
+      the cache/serial path is unreachable from production eval. Small;
+      local-smokeable (1 ep, observe cache-hit branch in server log).
+- 44g cross_summary apples-to-apples peak = per-stage diffusion peak     [pending]
+      (44.0 F4, RECOMMENDED for demo_randomized). calc_cross_ckpt reads
+      per_stage_peak_alloc_mb (already in summary.json) and reports
+      max(transformer, action_head, vae_encode) as the working-set peak
+      alongside overall_peak. Zero eval change; fixes the w4a8 swap run
+      directly. Caveat F5: bf16/w8a8 local runs are T5-resident in all
+      stages, so for those the diffusion peak still includes T5 until a
+      consistent re-run (44f cache / 44d serial) or a T5-size subtraction.
 
 44.8 SCOPE (minimal)
 - 2 new modules + 1 server edit + 1 chart edit + 1 check script.
@@ -1140,9 +1189,12 @@ Facts (measured):
 Task A — delete raw camera frames (obs_data) everywhere EXCEPT
   results/calib_capture/ (calib obs is model-input, kept raw).
   - keep latents_N.pt + actions_N.pt for now (negligible size).
-  - retain a small bf16 obs_data sample (>=1 task, few ep) for
-    measure_flops, OR re-point measure_flops at calib_capture.
-  - bf16 vs bf16_clean keep-which: still open (ask before delete).
+  - DECIDED (user 2026-06-29): keep BOTH results/bf16/ and
+    results/bf16_clean/ directories; delete their obs_data raw frames
+    too (same treatment as every other variant). No bf16 obs_data
+    sample retained -> re-point measure_flops at results/calib_capture/
+    (its obs chunks are the same shape, VAE-primed).
+  - calib_capture/ obs_data is NOT touched.
   - irreversible -> execute only on explicit user go.
 
 Task B — eval saves no video by default.
