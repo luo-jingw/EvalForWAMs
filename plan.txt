@@ -1419,19 +1419,61 @@ Phase 46: precompute redesign — direct expert-collection + unpadded cache
 - edit text_cond_cache.py: unpadded store + repad-on-load.
 
 46.7 TASKS (minimal verifiable)
-- 46a unpadded cache (store seq_len, repad on load). check: round-trip
-  max_abs=0, file ~26x smaller.
-- 46b collect-only mode (eval_client + _pool_runner no-server). check:
-  collected instructions == a reference eval's instructions, same seed.
-- 46c precompute reads instructions file. check: cache -> 100% eval hit,
-  T5 not loaded.
-- 46d smoke (w4a4 SMOKE_5): collect-only -> precompute -> T5-free eval ->
-  cross_summary. observe hit rate + cache size + peak.
+- 46a [DONE] unpadded cache (store seq_len, repad on load).
+  text_cond_cache.py: _trim_seq (drop trailing all-zero rows; .clone() not
+  .contiguous() so torch.save writes the compact storage, not the full
+  512-row backing) + _repad_seq (zero-pad back, no-op when >= target ->
+  old padded caches load unchanged). store trims, load/LazyCache repad.
+  CHECK (cpu, no GPU): dir + .pt round-trip max_abs=0.000e+00; disk 25.4x
+  smaller (329 KB vs 8 MB padded for a 20-token prompt).
+- 46b [DONE] collect-only mode (eval_client + _pool_runner no-server).
+  eval_client.eval_policy gains collect_out: after set_instruction (line
+  518) record {seed,instruction} jsonl + skip VLA/video/metrics; main sets
+  model=None when collect_out. _pool_runner: Config.collect_out,
+  run_client_blocking injects --collect_out <dir>/<task>.jsonl, run_collect
+  = server-less pool (no start_server/wait_for_port, no min_free_mb gate).
+  run_eval: --mode collect + --collect_out. CHECK (A6000, SMOKE_5, tn=2,
+  demo_randomized, 5 GPU): 5/5 tasks wrote jsonl; stack_bowls_two recorded
+  seeds {10000,10002} (10001 = expert-fail skipped) -> model-independent
+  seed set as designed (46.0 F4).
+- 46c [DONE] precompute reads instructions file (not obs). collect_prompts
+  reads <dir>/*.jsonl or a .jsonl; --instructions replaces --videos_root.
+  CHECK (lingbot-jw, GPU0): 10 instr + empty neg = 11 entries; cache dir
+  1.9 MB total (unpadded; per-prompt 84-332 KB vs 4 MB padded).
+- 46d [DONE] smoke (w4a4 SMOKE_5): collect -> precompute -> T5-free eval ->
+  aggregator -> cross_summary. OBSERVED: 5 servers all "text encoder NOT
+  loaded (T5-free)"; 9/10 resets cache HIT, 1 MISS (put_bottles_dustbin);
+  diffusion_peak_mb = 16715 MB UNIFORM across all 5 tasks INCLUDING the
+  missed one (whose peak_alloc rose to 25949 MB from the lazy T5 load) ->
+  44g T5-exclusion holds even under a miss. cache 1.9 MB.
+
+46.7.1 FINDING F6 (46d, the miss) -- the sapien EXPERT is not bit-
+  reproducible run-to-run. collect's expert succeeded at put_bottles seed
+  10001; eval's expert FAILED 10001 and succeeded at 10002 (instruction
+  not collected -> MISS -> server lazy-loaded T5 for that one prompt).
+  Same-seed instructions ARE stable (seed 10000 hit; 4/5 tasks 100% hit);
+  the divergence is WHICH seeds the physics expert succeeds on. Root: GPU
+  physics non-determinism, NOT controllable by setup_demo's np/torch seed.
+  CONSEQUENCE: 100% hit is not guaranteed for the RoboTwin expert path.
+  The lazy-load-on-miss path is the DESIGNED safety net (correct embeds,
+  just a one-time T5 load for that task's server), and 44g keeps T5 out of
+  the headline VRAM peak regardless (proven above: 16715 MB uniform).
+  MITIGATION (no code): over-collect -- run --mode collect with test_num
+  >= the eval test_num (margin, e.g. 1.2x) to widen the collected seed set
+  so eval's (possibly shifted) successful seeds are more likely covered.
+  Real edge DEPLOYMENT is unaffected: deployment prompts come from the
+  task, not a non-reproducible expert -> precompute them directly = 100%.
 
 46.8 SCOPE / NOTES
-- no kernel/PTQ/loader change. collection reuses the EXACT eval loop so the
-  prompts cannot diverge from eval-time.
-- the expert (play_once) cost is unavoidable (instruction depends on it) but
-  is paid ONCE, model-agnostic, and is strictly cheaper than the current
-  full-VLA collect (no diffusion). The eval already runs play_once/episode.
-- cache stays backward-compatible (.pt eager + dir lazy; padded + unpadded).
+- no kernel/PTQ/loader change. collection reuses the EXACT eval expert/
+  instruction prefix; same-seed instructions match (F6: seed-set, not
+  per-seed text, is the residual divergence).
+- the expert (play_once) cost is paid ONCE, model-agnostic, strictly
+  cheaper than the old full-VLA collect (no diffusion).
+- cache stays backward-compatible (.pt eager + dir lazy; padded + unpadded
+  via _repad_seq no-op).
+- PRE-EXISTING (out of scope): run_eval._ensure_kv_cache_measurement runs
+  measure_kv_cache via sys.executable (base conda python) which lacks
+  easydict -> the one-shot measured_kv_cache.json fails and the
+  memory_breakdown chart falls back to theoretical defaults. Unrelated to
+  Phase 46; fix = run that subprocess under the lingbot-jw env.

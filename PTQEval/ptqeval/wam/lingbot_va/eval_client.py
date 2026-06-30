@@ -398,7 +398,10 @@ def main(usr_args):
     test_num = usr_args["test_num"]
 
     
-    model = WebsocketClientPolicy(port=usr_args['port'])
+    # Phase 46b: collect-only -> no server/model (instructions come from the
+    # expert path alone). The eval path keeps the websocket policy.
+    collect_out = usr_args.get("collect_out")
+    model = None if collect_out else WebsocketClientPolicy(port=usr_args['port'])
 
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -410,7 +413,8 @@ def main(usr_args):
                                    instruction_type=instruction_type,
                                    save_visualization=usr_args.get("save_visualization", False),
                                    video_guidance_scale=video_guidance_scale,
-                                   action_guidance_scale=action_guidance_scale)
+                                   action_guidance_scale=action_guidance_scale,
+                                   collect_out=collect_out)
     suc_nums.append(suc_num)
 
     file_path = os.path.join(save_dir, f"_result.txt")
@@ -452,7 +456,8 @@ def eval_policy(task_name,
                 instruction_type=None,
                 save_visualization=False,
                 video_guidance_scale=5.0,
-                action_guidance_scale=5.0):
+                action_guidance_scale=5.0,
+                collect_out=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -467,6 +472,17 @@ def eval_policy(task_name,
 
     now_seed = st_seed
     clear_cache_freq = args["clear_cache_freq"]
+
+    # Phase 46b: collect-only mode. The instruction is a pure function of
+    # the EXPERT rollout (play_once -> episode_info["info"]) + the seed
+    # (model-independent, see plan 46.0 F3/F4), so we run the EXACT same
+    # expert/instruction prefix as eval and record (seed, instruction)
+    # right after set_instruction, then skip the VLA inference + server.
+    # The jsonl this writes is the precompute source (no obs needed).
+    collect_f = None
+    if collect_out is not None:
+        Path(collect_out).parent.mkdir(parents=True, exist_ok=True)
+        collect_f = open(collect_out, "w")
 
     args["eval_mode"] = True
 
@@ -516,6 +532,17 @@ def eval_policy(task_name,
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
         instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
+
+        if collect_f is not None:
+            collect_f.write(json.dumps(
+                {"seed": int(now_seed), "instruction": instruction}) + "\n")
+            collect_f.flush()
+            now_id += 1
+            TASK_ENV.close_env(
+                clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
+            TASK_ENV.test_num += 1
+            now_seed += 1
+            continue
 
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
@@ -664,6 +691,9 @@ def eval_policy(task_name,
             f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
         now_seed += 1
+
+    if collect_f is not None:
+        collect_f.close()
 
     return now_seed, TASK_ENV.suc
 

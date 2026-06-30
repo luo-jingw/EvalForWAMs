@@ -43,6 +43,7 @@ from ptqeval.eval._pool_runner import (
     _set_cleanup_context,
     cleanup_all_sessions,
     install_signal_handlers,
+    run_collect,
     run_pool,
     run_single,
     run_smoke,
@@ -56,7 +57,12 @@ def parse_args() -> Config:
     )
 
     # --- mode + per-task ---
-    p.add_argument("--mode", choices=["smoke", "single", "pool"], required=True)
+    p.add_argument("--mode", choices=["smoke", "single", "pool", "collect"],
+                   required=True,
+                   help="collect (Phase 46b): server-less expert/instruction "
+                        "harvest -> <collect_out>/<task>.jsonl, the precompute "
+                        "source. Model-independent; run once, reuse for all "
+                        "variants. Requires --collect_out.")
     p.add_argument("--task_name",
                    help="smoke / single only. Default adjust_bottle for smoke.")
     p.add_argument("--test_num", type=int,
@@ -182,6 +188,10 @@ def parse_args() -> Config:
     p.add_argument("--offload_dir", type=Path, default=None,
                    help="Directory for --offload_target disk (default "
                         "<save_root>/_offload).")
+    p.add_argument("--collect_out", type=Path, default=None,
+                   help="Phase 46b: --mode collect output directory for "
+                        "per-task instruction jsonl (precompute source). "
+                        "Required for --mode collect.")
 
     args = p.parse_args()
 
@@ -230,6 +240,7 @@ def parse_args() -> Config:
         serve_residency=args.serve_residency,
         offload_target=args.offload_target,
         offload_dir=str(args.offload_dir.resolve()) if args.offload_dir else "",
+        collect_out=str(args.collect_out.resolve()) if args.collect_out else "",
         gpu_ids=gpu_ids,
         max_gpus=args.max_gpus,
     )
@@ -309,6 +320,12 @@ def main() -> int:
             run_single(cfg)
         elif cfg.mode == "pool":
             run_pool(cfg)
+        elif cfg.mode == "collect":
+            if not cfg.collect_out:
+                print("[run_eval] --mode collect requires --collect_out",
+                      file=sys.stderr)
+                return 2
+            run_collect(cfg)
     finally:
         cleanup_all_sessions()
     return 0

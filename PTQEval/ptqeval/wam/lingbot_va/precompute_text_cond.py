@@ -1,32 +1,29 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-"""Phase 44b: precompute the text-condition cache (offline).
+"""Phase 46c: precompute the text-condition cache (offline).
 
-Builds the VA server (T5 on GPU), encodes every unique RoboTwin prompt
-plus the empty negative prompt, and stores the T5 outputs via
+Builds the VA server (T5 on GPU), encodes every unique RoboTwin
+instruction plus the empty negative prompt, and stores the T5 outputs via
 text_cond_cache so eval can inject them (server _reset) and skip the
 text encoder entirely -- so T5 never occupies VRAM during eval.
 
-Prompts are read from the `task` field of obs_data_*.pt under
-<videos_root>/visualization/real/ (the exact strings the model saw), so
-a cached key matches the eval-time prompt verbatim.
+Instructions are read from the collect-mode jsonl (`--instructions`, a
+directory of <task>.jsonl or a single jsonl), each line
+{"seed": int, "instruction": str}. The collect step (run_eval --mode
+collect) produces these from the EXACT eval expert/instruction prefix
+(plan 46b), so a cached key matches the eval-time prompt verbatim WITHOUT
+a prior full VLA run (the old obs-harvest path, plan 46.0 F1).
 
 Observational (principle.txt L12): prints per-prompt seq_len + embed L2;
 no assert / no PASS judgement.
 
     python -m ptqeval.wam.lingbot_va.precompute_text_cond \\
-        --videos_root results/bf16 \\
+        --instructions results/collect_w4a4 \\
         --output results/text_cond_cache
-
-Two-machine workflow (ship a tiny git-friendly prompt list, encode on the
-target so the cache embeds -- ~4 MB/prompt -- never go through git):
-    # machine A (has obs): extract prompts, no model load (~1 MB at full scope)
-    ... --videos_root results/<collect> --dump_prompts results/prompts.txt
-    # git add/commit/pull results/prompts.txt to machine B, then on B:
-    ... --prompts_file results/prompts.txt --output results/text_cond_cache
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -40,98 +37,63 @@ from ptqeval.wam.lingbot_va.text_cond_cache import (
 _MAX_SEQ = 512
 
 
-def collect_prompts(videos_root: Path) -> list[str]:
-    """Unique prompt strings from obs_data_*.pt 'task' fields under
-    <videos_root>/visualization/real/, in first-seen order."""
-    vis = videos_root / "visualization" / "real"
-    if not vis.exists():
-        raise FileNotFoundError(f"no visualization/real/ under {videos_root}")
+def collect_prompts(instructions: Path) -> list[str]:
+    """Unique instruction strings from the collect jsonl, first-seen order.
+    `instructions` is a directory of <task>.jsonl or a single .jsonl; each
+    line is {"seed": int, "instruction": str}."""
+    if instructions.is_dir():
+        files = sorted(instructions.glob("*.jsonl"))
+    elif instructions.suffix == ".jsonl":
+        files = [instructions]
+    else:
+        raise FileNotFoundError(
+            f"--instructions must be a dir of *.jsonl or a .jsonl file: "
+            f"{instructions}")
+    if not files:
+        raise FileNotFoundError(f"no *.jsonl under {instructions}")
     seen: dict[str, None] = {}
-    for ep in sorted(vis.iterdir()):
-        if not ep.is_dir():
-            continue
-        chunks = sorted(ep.glob("obs_data_*.pt"))
-        if not chunks:
-            continue
-        first = torch.load(chunks[0], weights_only=False, map_location="cpu")
-        seen[first[0]["task"]] = None
-    return list(seen)
-
-
-def read_prompts_file(path: Path) -> list[str]:
-    """Unique prompts from a text file, one per line, first-seen order.
-    The git-friendly transfer artifact: text only (~1 MB at full scope),
-    vs the ~4 MB/prompt embeds. Encode it on the target machine."""
-    seen: dict[str, None] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.rstrip("\n")
-        if line:
-            seen[line] = None
+    for f in files:
+        with open(f) as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                seen[json.loads(line)["instruction"]] = None
     return list(seen)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--videos_root", type=Path, default=None,
-                    help="Root with visualization/real/<prompt>/ obs chunks "
-                         "(e.g. results/bf16). Source of prompts unless "
-                         "--prompts_file is given.")
-    ap.add_argument("--prompts_file", type=Path, default=None,
-                    help="Read prompts from this text file (one per line) "
-                         "instead of obs. Pairs with a --dump_prompts file "
-                         "shipped via git -> encode on the target machine "
-                         "without re-running collect.")
-    ap.add_argument("--dump_prompts", type=Path, default=None,
-                    help="Write the collected prompts to this text file (one "
-                         "per line) and EXIT -- no model load. The tiny, "
-                         "git-friendly artifact (~1 MB) to ship; encode it "
-                         "elsewhere with --prompts_file.")
+    ap.add_argument("--instructions", type=Path, required=True,
+                    help="Collect-mode jsonl source: a directory of "
+                         "<task>.jsonl or a single .jsonl (run_eval --mode "
+                         "collect output). Each line {seed, instruction}.")
     ap.add_argument("--model_path",
                     default="models/lingbot-va-posttrain-robotwin")
-    ap.add_argument("--output", default=None,
+    ap.add_argument("--output", required=True,
                     help="Cache output path. A DIRECTORY path (no .pt "
                          "extension) writes the LazyCache format (index + "
                          "per-prompt embeds) so the eval server loads only "
                          "the prompts it needs -- use this at full scope "
                          "(thousands of prompts, tens of GB). A .pt path "
-                         "writes a single eager file (small caches / smoke). "
-                         "Required unless --dump_prompts.")
+                         "writes a single eager file (small caches / smoke).")
     ap.add_argument("--limit", type=int, default=0,
                     help="Encode only the first N prompts (0 = all). Smoke.")
     args = ap.parse_args()
-
-    # Prompt source: explicit file, else extract from obs.
-    if args.prompts_file is not None:
-        prompts = read_prompts_file(args.prompts_file)
-        src = str(args.prompts_file)
-    elif args.videos_root is not None:
-        prompts = collect_prompts(args.videos_root)
-        src = str(args.videos_root)
-    else:
-        ap.error("need --videos_root or --prompts_file")
-    if args.limit > 0:
-        prompts = prompts[:args.limit]
-
-    # Dump mode: write the prompt list (git-friendly) and exit; no model.
-    if args.dump_prompts is not None:
-        args.dump_prompts.parent.mkdir(parents=True, exist_ok=True)
-        args.dump_prompts.write_text(
-            "\n".join(prompts) + "\n", encoding="utf-8")
-        print(f"dumped {len(prompts)} prompts from {src} to "
-              f"{args.dump_prompts}")
-        return 0
-
-    if args.output is None:
-        ap.error("--output is required when encoding (no --dump_prompts)")
 
     from ptqeval.eval.measure_flops import _build_server
     server = _build_server(args.model_path,
                            Path("/tmp/precompute_text_cond_scratch"))
     server.text_encoder.to(server.device)
+
+    prompts = collect_prompts(args.instructions)
+    if args.limit > 0:
+        prompts = prompts[:args.limit]
     # Empty negative prompt is shared across all tasks; encode it too.
     todo = [""] + prompts
-    print(f"encoding {len(todo)} prompts (incl. empty negative) from {src}")
+    print(f"encoding {len(todo)} prompts (incl. empty negative) "
+          f"from {args.instructions}")
 
     entries: dict[str, TextCondEntry] = {}
     for prompt in todo:

@@ -116,6 +116,12 @@ class Config:
     # compute path ('cpu' | 'disk'); offload_dir for the disk variant.
     offload_target: str = "cpu"
     offload_dir: str = ""
+    # Phase 46b: collect-only mode. When set, clients run the expert /
+    # instruction prefix WITHOUT a server (no model, no T5) and write
+    # per-task instruction jsonl to <collect_out>/<task>.jsonl -- the
+    # precompute source. Model-independent (plan 46.0 F4), so one collection
+    # serves all variants. Empty -> normal eval.
+    collect_out: str = ""
     # Optional pool GPU selection (default = scan all 8 + filter by free
     # memory). When gpu_ids is set, only those GPUs are considered (still
     # subject to min_free_mb filter). When max_gpus is set, after the
@@ -374,7 +380,9 @@ def run_client_blocking(cfg: Config, gpu: int, task_name: str, port: int,
         f"    --action_guidance_scale 1"
         f"    --test_num {test_num}"
         f"    --save_visualization {cfg.save_visualization}"
-        f"    --port {port}\n"
+        + (f"    --collect_out {cfg.collect_out}/{task_name}.jsonl"
+           if cfg.collect_out else "")
+        + f"    --port {port}\n"
     )
     proc = launch_in_session(cmd, client_log)
     with _SESSIONS_LOCK:
@@ -678,3 +686,90 @@ def run_pool(cfg: Config) -> None:
     if total_failed:
         print(f"[pool] per-worker breakdown: done={worker_done_counts}, "
               f"failed={worker_failed_counts}")
+
+
+# ---------------------------------------------------------------------------
+# Collect-only (Phase 46b): expert/instruction harvest, NO server
+# ---------------------------------------------------------------------------
+
+def collect_task_done(cfg: Config, task: str, target: int) -> bool:
+    """A collect task is done when <collect_out>/<task>.jsonl has >= target
+    instruction lines."""
+    f = Path(cfg.collect_out) / f"{task}.jsonl"
+    if not f.exists():
+        return False
+    try:
+        with open(f) as fp:
+            return sum(1 for _ in fp) >= target
+    except OSError:
+        return False
+
+
+def run_collect(cfg: Config) -> None:
+    """Server-less pool: each worker runs the eval_client collect prefix
+    (expert play_once + instruction) and writes <collect_out>/<task>.jsonl.
+    No model server is launched (the instruction is model-independent --
+    plan 46.0 F4). GPU is still pinned (sapien renders the scene), but the
+    per-worker footprint is small, so this does NOT gate on min_free_mb."""
+    test_num = cfg.test_num if cfg.test_num is not None else 100
+    os.makedirs(cfg.collect_out, exist_ok=True)
+    all_tasks = load_tasks(cfg)
+    pending = [t for t in all_tasks
+                if cfg.rerun_all or not collect_task_done(cfg, t, test_num)]
+    if not pending:
+        print(f"[collect] all tasks already have >= {test_num} instructions "
+              f"in {cfg.collect_out}. Nothing to do.")
+        return
+
+    print(f"[collect] queue ({len(pending)} tasks) -> {cfg.collect_out}:")
+    for t in pending:
+        print(f"  - {t}")
+
+    candidates = cfg.gpu_ids if cfg.gpu_ids else list(range(8))
+    usable = candidates[:]
+    if cfg.max_gpus is not None and cfg.max_gpus > 0:
+        usable = usable[:cfg.max_gpus]
+    n_workers = min(len(usable), len(pending))
+    print(f"[collect] using GPUs: {usable[:n_workers]} (server-less)")
+
+    q: queue.Queue[str] = queue.Queue()
+    for t in pending:
+        q.put(t)
+
+    log_dir = cfg.save_root / "logs" / "collect"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    done_counts: dict[int, int] = {g: 0 for g in usable[:n_workers]}
+    failed_counts: dict[int, int] = {g: 0 for g in usable[:n_workers]}
+
+    def worker(gpu: int) -> None:
+        port = 29556 + gpu  # unused (no server); kept for cmd shape
+        while True:
+            try:
+                task = q.get(block=False)
+            except queue.Empty:
+                print(f"[collect worker gpu={gpu}] queue drained "
+                      f"(done={done_counts[gpu]}, failed={failed_counts[gpu]}).")
+                return
+            client_log = log_dir / f"client_{gpu}_{task}.log"
+            print(f"[collect worker gpu={gpu}] task={task} starting")
+            rc = run_client_blocking(cfg, gpu, task, port, test_num, client_log)
+            if rc != 0:
+                print(f"[collect worker gpu={gpu}] task={task} FAILED "
+                      f"(client rc={rc}; see {client_log})", file=sys.stderr)
+                failed_counts[gpu] += 1
+            else:
+                done_counts[gpu] += 1
+                print(f"[collect worker gpu={gpu}] task={task} done "
+                      f"(worker total={done_counts[gpu]})")
+
+    threads = [threading.Thread(target=worker, args=(g,), daemon=True)
+                for g in usable[:n_workers]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    total_done = sum(done_counts.values())
+    total_failed = sum(failed_counts.values())
+    print(f"[collect] all workers exited. completed {total_done}, "
+          f"failed {total_failed} out of {len(pending)} queued.")

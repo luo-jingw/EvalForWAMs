@@ -30,6 +30,35 @@ class TextCondEntry:
     dim: int
 
 
+def _trim_seq(emb: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Drop trailing all-zero rows on the sequence axis (-2). WAN's
+    _get_t5_prompt_embeds zero-pads positions past the real token count
+    (server.py:425 `u.new_zeros(...)`), so an exactly-zero row is padding,
+    never a real T5 output (a layernorm row is not all-zero across 4096
+    dims). Returns (unpadded [..., real, dim], real). real=0 -> empty
+    prompt; we keep >=1 row so the repad/concat stays well-shaped."""
+    nonzero = emb.abs().sum(dim=-1) > 0                 # [..., seq]
+    flat = nonzero.reshape(-1, nonzero.shape[-1]).any(dim=0)   # [seq]
+    idx = torch.nonzero(flat, as_tuple=False)
+    real = int(idx.max().item()) + 1 if idx.numel() else 1
+    # .clone() (not .contiguous()): a prefix slice of a contiguous tensor
+    # stays a view over the FULL backing storage, so torch.save would still
+    # write all 512 rows. clone() forces a compact [.., real, dim] storage.
+    return emb[..., :real, :].clone(), real
+
+
+def _repad_seq(emb: torch.Tensor, max_sequence_length: int) -> torch.Tensor:
+    """Zero-pad the sequence axis (-2) back to max_sequence_length, the
+    inverse of _trim_seq. No-op when already >= target (so an OLD padded
+    cache loads unchanged -- backward compatible)."""
+    real = emb.shape[-2]
+    if real >= max_sequence_length:
+        return emb
+    pad_shape = list(emb.shape)
+    pad_shape[-2] = max_sequence_length - real
+    return torch.cat([emb, emb.new_zeros(pad_shape)], dim=-2)
+
+
 def cache_key(prompt: str, max_sequence_length: int) -> str:
     """Stable key for (prompt, max_sequence_length): sha1 of the raw
     prompt + the sequence length. Keying on the raw prompt (not a
@@ -69,6 +98,10 @@ class LazyCache:
             meta = self._index[key]
             emb = torch.load(os.path.join(self._path, "embeds", f"{key}.pt"),
                              map_location="cpu", weights_only=True)
+            # 46a: embeds are stored UNPADDED ([real, dim]); repad to the
+            # eval-time max_sequence_length so the server sees the same
+            # padded tensor the swap path produced.
+            emb = _repad_seq(emb, meta["max_sequence_length"])
             self._mem[key] = TextCondEntry(
                 prompt=meta["prompt"],
                 max_sequence_length=meta["max_sequence_length"],
@@ -93,20 +126,36 @@ def load_cache(path: str):
     holds TextCondEntry instances)."""
     if os.path.isdir(path):
         return LazyCache(path)
-    return torch.load(path, map_location="cpu", weights_only=False)
+    entries = torch.load(path, map_location="cpu", weights_only=False)
+    # 46a: eager .pt is also stored UNPADDED; repad each entry to its
+    # max_sequence_length so the server sees the padded tensor.
+    for e in entries.values():
+        e.prompt_embeds = _repad_seq(e.prompt_embeds, e.max_sequence_length)
+    return entries
 
 
 def store_cache(path: str, entries: dict[str, TextCondEntry]) -> None:
     """Persist the cache. A path ending in .pt -> single eager file (small
     caches / smoke). Otherwise -> a LazyCache directory: index.pt (metadata
     only) + embeds/<key>.pt per prompt, so the eval server can load just
-    the prompts it needs."""
+    the prompts it needs.
+
+    46a: embeds are trimmed to their real token length (trailing zero
+    padding dropped) before write -- ~26x smaller on disk (real prompts
+    are ~20 tokens vs the 512-pad). load_cache / LazyCache repad on read,
+    so the server sees the original padded shape."""
+    trimmed: dict[str, TextCondEntry] = {}
+    for k, e in entries.items():
+        emb, real = _trim_seq(e.prompt_embeds)
+        trimmed[k] = TextCondEntry(
+            prompt=e.prompt, max_sequence_length=e.max_sequence_length,
+            prompt_embeds=emb, seq_len=real, dim=e.dim)
     if path.endswith(".pt"):
-        torch.save(entries, path)
+        torch.save(trimmed, path)
         return
     os.makedirs(os.path.join(path, "embeds"), exist_ok=True)
     index: dict[str, dict] = {}
-    for k, e in entries.items():
+    for k, e in trimmed.items():
         torch.save(e.prompt_embeds, os.path.join(path, "embeds", f"{k}.pt"))
         index[k] = dict(prompt=e.prompt,
                         max_sequence_length=e.max_sequence_length,
