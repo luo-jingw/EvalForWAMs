@@ -1099,6 +1099,9 @@ def run(args):
         config.variant_args = args.variant_args
     config.profile_ops = bool(args.profile_ops)
     config.profile_n_calls = int(args.profile_n_calls)
+    if args.text_cond_cache is not None:
+        config.text_cond_cache = args.text_cond_cache
+    config.serve_residency = bool(args.serve_residency)
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -1205,6 +1208,25 @@ def main():
         default=5,
         help='Number of post-warmup infer() calls to profile when '
              '--profile_ops is set.'
+    )
+    parser.add_argument(
+        "--text_cond_cache",
+        type=str,
+        default=None,
+        help='Phase 44c: path to a precomputed text-condition cache '
+             '(precompute_text_cond.py). On a prompt hit, _reset injects '
+             'the cached T5 embeds and never moves the text encoder to '
+             'GPU. Miss falls through to --serve_residency / the transient '
+             'swap. Unset -> always swap.'
+    )
+    parser.add_argument(
+        "--serve_residency",
+        action="store_true",
+        help='Phase 44d: serial text/diffusion residency. On a cache miss '
+             '_reset offloads the transformer to CPU, encodes the prompt, '
+             'reloads the transformer (T5 and lingbot-va never co-resident; '
+             'peak = max not sum). Embeds are cached in-process so only the '
+             'first reset per unique prompt pays the swap. Off by default.'
     )
     args = parser.parse_args()
     run(args)

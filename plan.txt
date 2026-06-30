@@ -1051,11 +1051,13 @@ Source authority
       T5 weight reported in the footnote as the saving (not reverse-fit).
       Smoke (synthetic complete measured_kv_cache): both render; the T5
       10.6 GB segment present (on) vs absent (off), sum drops by 10.6 GB.
-- 44f wire text_cond_cache + serve_residency through the eval pipeline   [pending]
-      (44.0 F6): run_eval CLI -> _pool_runner Config field -> client cmd
-      override -> eval_client usr_args -> server job_config. Without it
-      the cache/serial path is unreachable from production eval. Small;
-      local-smokeable (1 ep, observe cache-hit branch in server log).
+- 44f wire text_cond_cache + serve_residency through the eval pipeline   [DONE]
+      (44.0 F6): run_eval --text_cond_cache/--serve_residency -> Config
+      (text_cond_cache:str, serve_residency:bool) -> start_server extra_cli
+      -> server argparse -> config.{text_cond_cache,serve_residency} ->
+      __init__ getattr. Smoke: run_eval/server --help list both; Config
+      accepts both; server consumption already proven by 44d --serial /
+      44c --residency. User re-runs on the other server with these flags.
 - 44g cross_summary apples-to-apples peak = per-stage diffusion peak     [pending]
       (44.0 F4, RECOMMENDED for demo_randomized). calc_cross_ckpt reads
       per_stage_peak_alloc_mb (already in summary.json) and reports
@@ -1124,7 +1126,11 @@ Phase 45: Eval reporting + task-list naming hygiene
   measure_kv_cache text/activation). smoke A6000: text=10.6 GB, all
   segments measured, no residual.
 - 45.9 Task B (eval save_visualization default off).                 [DONE]
-  45.9 Task A (delete raw frames) — PLAN ONLY, user executes.        [pending]
+  45.9 Task A (delete raw frames) executed 2026-06-29.               [DONE]
+  freed 369 GB (63722 obs_data_*.pt across bf16/bf16_clean/bf16_speed/
+  viditq_w8a8/viditq_w8a8_speed/viditq_w4a8); calib_capture 2079
+  obs_data kept; latents/actions kept; measure_flops + measure_kv_cache
+  re-pointed at calib_capture.
 
 45.7 SEQUENCING NOTE
 - 45a interacts with Phase 44: the w4a8 16.92/25.94 bimodality is the
@@ -1195,7 +1201,9 @@ Task A — delete raw camera frames (obs_data) everywhere EXCEPT
     sample retained -> re-point measure_flops at results/calib_capture/
     (its obs chunks are the same shape, VAE-primed).
   - calib_capture/ obs_data is NOT touched.
-  - irreversible -> execute only on explicit user go.
+  - EXECUTED 2026-06-29: 63722 files / 369 GB deleted; verified 0
+    obs_data remain outside calib_capture, calib_capture 2079 intact,
+    latents/actions intact.
 
 Task B — eval saves no video by default.
   - server/eval_client save_visualization default False.

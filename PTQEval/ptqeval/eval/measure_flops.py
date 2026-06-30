@@ -41,9 +41,12 @@ KV cache stayed empty).
 
 Usage (one shot, ~5-10 min including 36-chunk warmup):
     python -m ptqeval.eval.measure_flops \\
-        --videos_root results/bf16 \\
+        --videos_root results/calib_capture \\
         --warmup 36 --n_calls 3 \\
         --output results/measured_flops.json
+  (Phase 45.9-A removed the variant obs_data raw frames; calib_capture
+   keeps its VAE-primed obs chunks, the same format, so it is now the
+   obs source for measure_flops.)
 
 Output JSON schema:
     {
@@ -260,7 +263,8 @@ def main() -> int:
     )
     p.add_argument("--videos_root", type=Path, required=True,
                    help="Root with visualization/real/<prompt>/ obs chunks; "
-                        "usually results/bf16/.")
+                        "results/calib_capture/ (variant obs removed in "
+                        "Phase 45.9-A).")
     p.add_argument("--task", default=None,
                    help="Episode prompt substring filter (e.g. 'adjust_bottle').")
     p.add_argument("--n_calls", type=int, default=3,

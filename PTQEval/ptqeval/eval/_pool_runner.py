@@ -104,6 +104,14 @@ class Config:
     # raw camera frames, ~20 MB/ep, not needed for SR/latency/memory).
     # collect_calib_videos sets True (the .pt files ARE the calib corpus).
     save_visualization: bool = False
+    # Phase 44f: text-condition residency controls passed to each server.
+    # text_cond_cache (path, "" = none) -> server injects precomputed T5
+    # embeds on a prompt hit (44c). serve_residency -> on a miss the server
+    # offloads the transformer to CPU before the T5 encode so T5 and
+    # lingbot-va are never co-resident (44d). Both keep T5 out of the
+    # measured VRAM peak; default off preserves the Phase-41 swap behavior.
+    text_cond_cache: str = ""
+    serve_residency: bool = False
     # Optional pool GPU selection (default = scan all 8 + filter by free
     # memory). When gpu_ids is set, only those GPUs are considered (still
     # subject to min_free_mb filter). When max_gpus is set, after the
@@ -299,6 +307,10 @@ def start_server(cfg: Config, gpu: int, port: int, master_port: int,
     if cfg.profile_ops:
         extra.append("--profile_ops")
         extra.append(f"--profile_n_calls {cfg.profile_n_calls}")
+    if cfg.text_cond_cache:
+        extra.append(f"--text_cond_cache {cfg.text_cond_cache}")
+    if cfg.serve_residency:
+        extra.append("--serve_residency")
     extra_cli = " ".join(extra)
 
     cmd = (

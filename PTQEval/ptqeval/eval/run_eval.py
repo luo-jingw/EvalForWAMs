@@ -160,6 +160,20 @@ def parse_args() -> Config:
                         "frames ~20 MB/ep, not needed for SR/latency/memory). "
                         "Pass --save_visualization to opt in for inspection; "
                         "calibration (collect_calib_videos) always saves.")
+    p.add_argument("--text_cond_cache", type=Path, default=None,
+                   help="Phase 44c/44f: path to a precomputed text-condition "
+                        "cache (precompute_text_cond.py). Each server injects "
+                        "the cached T5 embeds on a prompt hit -> text encoder "
+                        "stays off-GPU. Effective only when the eval prompts "
+                        "match the cache (see plan 44.0 F2: demo_randomized "
+                        "prompts are per-episode). Unset -> swap each reset.")
+    p.add_argument("--serve_residency", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Phase 44d/44f: serial text/diffusion residency. On a "
+                        "cache miss the server offloads the transformer to CPU "
+                        "before the T5 encode so T5 and lingbot-va are never "
+                        "co-resident (VRAM peak = max, not sum). Prompt-"
+                        "agnostic; ~+7s per unique prompt. Default off.")
 
     args = p.parse_args()
 
@@ -204,6 +218,8 @@ def parse_args() -> Config:
         profile_ops=args.profile_ops,
         profile_n_calls=args.profile_n_calls,
         save_visualization=args.save_visualization,
+        text_cond_cache=str(args.text_cond_cache.resolve()) if args.text_cond_cache else "",
+        serve_residency=args.serve_residency,
         gpu_ids=gpu_ids,
         max_gpus=args.max_gpus,
     )

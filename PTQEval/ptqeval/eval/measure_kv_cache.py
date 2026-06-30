@@ -256,7 +256,8 @@ def measure_activation(model_path: str, videos_root: str,
 
     Returns: forward_resident_mb, forward_peak_mb, activation_peak_mb
     (= forward_peak - forward_resident). Needs obs chunks under
-    videos_root/visualization/real/ (bf16 run keeps a sample)."""
+    videos_root/visualization/real/ (use results/calib_capture/; variant
+    obs removed in Phase 45.9-A)."""
     from pathlib import Path
     from ptqeval.eval.measure_flops import (
         _build_server, _pick_episode, _CHUNK_RE)
@@ -318,7 +319,8 @@ def main() -> int:
                              "activation+scratch transient via a real "
                              "server._infer (reuses measure_flops harness). "
                              "Points at a root with visualization/real/ obs "
-                             "chunks (e.g. results/bf16). Empty -> "
+                             "chunks (results/calib_capture; variant obs "
+                             "removed Phase 45.9-A). Empty -> "
                              "activation_peak_mb stays None.")
     parser.add_argument("--activation_task", default=None,
                         help="Episode prompt substring filter for activation.")
