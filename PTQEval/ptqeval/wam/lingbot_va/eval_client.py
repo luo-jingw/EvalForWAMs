@@ -1,5 +1,6 @@
 import sys
 import os
+import random
 import subprocess
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
@@ -503,6 +504,15 @@ def eval_policy(task_name,
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         episode_info_list = [episode_info["info"]]
+        # RoboTwin reproducibility fix: _base_task seeds np.random + torch
+        # (scene/objects) but leaves the `random.seed(seed)` line commented
+        # (envs/_base_task.py:60), so generate_episode_descriptions' global
+        # `random.shuffle`/`random.choice` (instruction PHRASING) is NOT
+        # seed-determined -> the language varies run-to-run for the same
+        # seed. Seed the global random here so the instruction is a pure
+        # function of now_seed: reproducible across runs and identical
+        # across variants (fair comparison + precomputable text tokens).
+        random.seed(now_seed)
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
         instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
