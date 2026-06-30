@@ -15,7 +15,14 @@ no assert / no PASS judgement.
 
     python -m ptqeval.wam.lingbot_va.precompute_text_cond \\
         --videos_root results/bf16 \\
-        --output results/text_cond_cache.pt
+        --output results/text_cond_cache
+
+Two-machine workflow (ship a tiny git-friendly prompt list, encode on the
+target so the cache embeds -- ~4 MB/prompt -- never go through git):
+    # machine A (has obs): extract prompts, no model load (~1 MB at full scope)
+    ... --videos_root results/<collect> --dump_prompts results/prompts.txt
+    # git add/commit/pull results/prompts.txt to machine B, then on B:
+    ... --prompts_file results/prompts.txt --output results/text_cond_cache
 """
 from __future__ import annotations
 
@@ -51,37 +58,80 @@ def collect_prompts(videos_root: Path) -> list[str]:
     return list(seen)
 
 
+def read_prompts_file(path: Path) -> list[str]:
+    """Unique prompts from a text file, one per line, first-seen order.
+    The git-friendly transfer artifact: text only (~1 MB at full scope),
+    vs the ~4 MB/prompt embeds. Encode it on the target machine."""
+    seen: dict[str, None] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.rstrip("\n")
+        if line:
+            seen[line] = None
+    return list(seen)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--videos_root", type=Path, required=True,
+    ap.add_argument("--videos_root", type=Path, default=None,
                     help="Root with visualization/real/<prompt>/ obs chunks "
-                         "(e.g. results/bf16).")
+                         "(e.g. results/bf16). Source of prompts unless "
+                         "--prompts_file is given.")
+    ap.add_argument("--prompts_file", type=Path, default=None,
+                    help="Read prompts from this text file (one per line) "
+                         "instead of obs. Pairs with a --dump_prompts file "
+                         "shipped via git -> encode on the target machine "
+                         "without re-running collect.")
+    ap.add_argument("--dump_prompts", type=Path, default=None,
+                    help="Write the collected prompts to this text file (one "
+                         "per line) and EXIT -- no model load. The tiny, "
+                         "git-friendly artifact (~1 MB) to ship; encode it "
+                         "elsewhere with --prompts_file.")
     ap.add_argument("--model_path",
                     default="models/lingbot-va-posttrain-robotwin")
-    ap.add_argument("--output", required=True,
+    ap.add_argument("--output", default=None,
                     help="Cache output path. A DIRECTORY path (no .pt "
                          "extension) writes the LazyCache format (index + "
                          "per-prompt embeds) so the eval server loads only "
                          "the prompts it needs -- use this at full scope "
                          "(thousands of prompts, tens of GB). A .pt path "
-                         "writes a single eager file (small caches / smoke).")
+                         "writes a single eager file (small caches / smoke). "
+                         "Required unless --dump_prompts.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Encode only the first N prompts (0 = all). Smoke.")
     args = ap.parse_args()
+
+    # Prompt source: explicit file, else extract from obs.
+    if args.prompts_file is not None:
+        prompts = read_prompts_file(args.prompts_file)
+        src = str(args.prompts_file)
+    elif args.videos_root is not None:
+        prompts = collect_prompts(args.videos_root)
+        src = str(args.videos_root)
+    else:
+        ap.error("need --videos_root or --prompts_file")
+    if args.limit > 0:
+        prompts = prompts[:args.limit]
+
+    # Dump mode: write the prompt list (git-friendly) and exit; no model.
+    if args.dump_prompts is not None:
+        args.dump_prompts.parent.mkdir(parents=True, exist_ok=True)
+        args.dump_prompts.write_text(
+            "\n".join(prompts) + "\n", encoding="utf-8")
+        print(f"dumped {len(prompts)} prompts from {src} to "
+              f"{args.dump_prompts}")
+        return 0
+
+    if args.output is None:
+        ap.error("--output is required when encoding (no --dump_prompts)")
 
     from ptqeval.eval.measure_flops import _build_server
     server = _build_server(args.model_path,
                            Path("/tmp/precompute_text_cond_scratch"))
     server.text_encoder.to(server.device)
-
-    prompts = collect_prompts(args.videos_root)
-    if args.limit > 0:
-        prompts = prompts[:args.limit]
     # Empty negative prompt is shared across all tasks; encode it too.
     todo = [""] + prompts
-    print(f"encoding {len(todo)} prompts (incl. empty negative) "
-          f"from {args.videos_root}")
+    print(f"encoding {len(todo)} prompts (incl. empty negative) from {src}")
 
     entries: dict[str, TextCondEntry] = {}
     for prompt in todo:
