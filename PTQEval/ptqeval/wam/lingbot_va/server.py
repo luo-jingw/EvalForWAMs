@@ -121,6 +121,7 @@ from modules.utils import (
     load_transformer,
     load_vae,
 )
+from ptqeval.wam.lingbot_va.text_cond_cache import cache_key, load_cache
 from utils import (
     FlowMatchScheduler,
     data_seq_to_patch,
@@ -230,6 +231,13 @@ class VA_Server:
                 torch_dtype=self.dtype,
                 torch_device='cpu',
             )
+
+            # Phase 44c: precomputed text-condition cache. When set and a
+            # prompt is a hit, _reset injects the cached T5 embeds and skips
+            # the text encoder entirely (T5 never reaches GPU). Miss -> the
+            # existing transient swap path. None -> always swap.
+            _tc_path = getattr(job_config, 'text_cond_cache', None)
+            self.text_cond_cache = load_cache(_tc_path) if _tc_path else None
 
             variant: Optional[str] = getattr(job_config, 'variant', None)
             variant_args_path: Optional[str] = getattr(job_config, 'variant_args', None)
@@ -639,31 +647,48 @@ class VA_Server:
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
-            # Phase 41 v3: transient GPU swap. text_encoder lives on
-            # CPU; here we move it to GPU just for the encode then
-            # immediately offload back. GPU forward 0.3 s, swap costs
-            # ~3 s each direction for 11 GB over PCIe. Net per-reset
-            # cost ~6-7 s. Steady-state VRAM saving: 11 GB.
-            _step('text_encoder.to(cuda) begin (11 GB H2D)')
-            self.text_encoder.to(self.device)
-            torch.cuda.synchronize(self.device)
-            _step('text_encoder.to(cuda) done')
-            with self._stage('text_encoder'):
-                self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
-                    prompt=prompt,
-                    negative_prompt=None,
-                    do_classifier_free_guidance=self.job_config.guidance_scale > 1,
-                    num_videos_per_prompt=1,
-                    prompt_embeds=None,
-                    negative_prompt_embeds=None,
-                    max_sequence_length=512,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-            _step('encode_prompt done')
-            self.text_encoder.to('cpu')
-            torch.cuda.empty_cache()
-            _step('text_encoder.to(cpu) done (VRAM reclaimed)')
+            _tc = getattr(self, 'text_cond_cache', None)
+            _k_pos = cache_key(prompt, 512) if _tc is not None else None
+            _k_neg = cache_key("", 512) if _tc is not None else None
+            if _tc is not None and _k_pos in _tc and _k_neg in _tc:
+                # Phase 44c: inject precomputed T5 embeds. The text encoder
+                # is never moved to GPU -> it contributes 0 to the eval
+                # VRAM peak. Same (prompt_embeds, negative_prompt_embeds)
+                # shapes the swap path produces.
+                _step('text_cond cache hit (text encoder skipped)')
+                with self._stage('text_encoder'):
+                    self.prompt_embeds = _tc[_k_pos].prompt_embeds.to(
+                        device=self.device, dtype=self.dtype)
+                    self.negative_prompt_embeds = (
+                        _tc[_k_neg].prompt_embeds.to(
+                            device=self.device, dtype=self.dtype)
+                        if self.job_config.guidance_scale > 1 else None)
+                _step('text_cond inject done')
+            else:
+                # Phase 41 v3: transient GPU swap (cache miss / no cache).
+                # text_encoder lives on CPU; move it to GPU just for the
+                # encode then immediately offload back. ~6-7 s per reset;
+                # steady-state VRAM saving: 11 GB.
+                _step('text_encoder.to(cuda) begin (11 GB H2D)')
+                self.text_encoder.to(self.device)
+                torch.cuda.synchronize(self.device)
+                _step('text_encoder.to(cuda) done')
+                with self._stage('text_encoder'):
+                    self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
+                        prompt=prompt,
+                        negative_prompt=None,
+                        do_classifier_free_guidance=self.job_config.guidance_scale > 1,
+                        num_videos_per_prompt=1,
+                        prompt_embeds=None,
+                        negative_prompt_embeds=None,
+                        max_sequence_length=512,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                _step('encode_prompt done')
+                self.text_encoder.to('cpu')
+                torch.cuda.empty_cache()
+                _step('text_encoder.to(cpu) done (VRAM reclaimed)')
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)

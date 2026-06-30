@@ -38,6 +38,11 @@ def main() -> int:
                          "max_abs vs cached (needs GPU + model). 0 = skip.")
     ap.add_argument("--model_path",
                     default="models/lingbot-va-posttrain-robotwin")
+    ap.add_argument("--residency", action="store_true",
+                    help="Build the server with this cache and print the "
+                         "reset peak_alloc for a cache-hit vs a cache-miss "
+                         "prompt (shows whether the text encoder enters the "
+                         "VRAM peak). Needs GPU + model.")
     args = ap.parse_args()
 
     cache = load_cache(args.cache)
@@ -69,6 +74,26 @@ def main() -> int:
             cached = e.prompt_embeds.float()
             max_abs = (live - cached).abs().max().item()
             print(f"  max_abs={max_abs:.3e}  '{e.prompt[:40]}'")
+        server.text_encoder.to("cpu")
+
+    if args.residency:
+        from pathlib import Path
+        from ptqeval.eval.measure_flops import _build_server
+        server = _build_server(args.model_path,
+                               Path("/tmp/check_text_cond_residency"))
+        server.text_cond_cache = cache   # inject the loaded cache
+        cached_prompt = next(e.prompt for e in cache.values() if e.prompt)
+        print("\n--residency reset peak_alloc (hit vs miss):")
+        for label, prompt in (("cache-hit", cached_prompt),
+                              ("cache-miss", "an uncached prompt zzz 123")):
+            torch.cuda.reset_peak_memory_stats()
+            server.infer({"reset": True, "prompt": prompt,
+                          "save_visualization": False})
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() / 1024 / 1024
+            hit = cache_key(prompt, _MAX_SEQ) in cache
+            print(f"  {label:10} hit={hit} reset_peak_alloc={peak:.1f} MB "
+                  f"embeds_set={server.prompt_embeds is not None}")
         server.text_encoder.to("cpu")
     return 0
 
