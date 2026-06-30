@@ -1058,14 +1058,14 @@ Source authority
       __init__ getattr. Smoke: run_eval/server --help list both; Config
       accepts both; server consumption already proven by 44d --serial /
       44c --residency. User re-runs on the other server with these flags.
-- 44g cross_summary apples-to-apples peak = per-stage diffusion peak     [pending]
-      (44.0 F4, RECOMMENDED for demo_randomized). calc_cross_ckpt reads
-      per_stage_peak_alloc_mb (already in summary.json) and reports
-      max(transformer, action_head, vae_encode) as the working-set peak
-      alongside overall_peak. Zero eval change; fixes the w4a8 swap run
-      directly. Caveat F5: bf16/w8a8 local runs are T5-resident in all
-      stages, so for those the diffusion peak still includes T5 until a
-      consistent re-run (44f cache / 44d serial) or a T5-size subtraction.
+- 44g cross_summary apples-to-apples peak = per-stage diffusion peak  [superseded]
+      DECISION (user 2026-06-29): re-run all variants on the other server
+      with --serve_residency (44f). T5 is then never co-resident, so
+      overall_peak IS already the diffusion working set across all variants
+      -> the per-stage extraction is unnecessary. 44g (reporting-only
+      max(transformer, action_head, vae_encode) from per_stage_peak_alloc_mb,
+      F4) stays available as a no-re-run fallback for legacy summaries but
+      is not the chosen path.
 
 44.8 SCOPE (minimal)
 - 2 new modules + 1 server edit + 1 chart edit + 1 check script.
