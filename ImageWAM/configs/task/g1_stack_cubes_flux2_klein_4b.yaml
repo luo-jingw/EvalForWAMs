@@ -1,0 +1,62 @@
+# @package _global_
+
+# Unitree G1 SINGLE-TASK (Stack-the-cubes) finetune of the RoboTwin FLUX.2-klein-4B checkpoint.
+# Train uses gripper-transition loss weighting (see configs/data/g1_stack_cubes.yaml).
+#
+# Training mode: LoRA on the video expert, full training on the action expert.
+# ImageWAM.apply_trainable_policy freezes the video expert down to its LoRA params
+# when flux2_lora_config.enabled is true; the action expert and proprio_encoder
+# stay fully trainable.
+#
+# Scale: 100 episodes, 95966 frames, single task.
+# effective batch = 4 GPU x batch_size 2 x grad_accum 12 = 96, ~1073 step/epoch.
+
+defaults:
+  - override /data: g1_stack_cubes
+  - override /model: imagewam_flux2_klein_4b_base
+  - _self_
+
+model:
+  proprio_dim: ${data.train.processor.proprio_output_dim}
+  qwen_context_len: ${data.train.qwen_context_len}
+  flux2_lora_config:
+    enabled: true
+    rank: 16
+    alpha: 16.0
+    dropout: 0.0
+    save_lora_merged: true
+    save_trainable_only: false
+    target_suffixes:
+      - qkv
+      - proj
+      - linear1
+      - linear2
+      - img_mlp.0
+      - img_mlp.2
+      - txt_mlp.0
+      - txt_mlp.2
+
+batch_size: 2
+num_workers: 8
+prefetch_factor: 2
+persistent_workers: true
+keep_latest_state_only: true
+
+lr_scheduler_type: "cosine"
+learning_rate: 5e-5
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 1000
+eval_every: 500
+eval_num_samples: 4
+
+gradient_accumulation_steps: 12
+weight_decay: 1e-2
+mixed_precision: "bf16"
+resume: null
+
+wandb:
+  enabled: true
+  project: imagewam
+  name: g1_stack_cubes_flux2_klein_4b

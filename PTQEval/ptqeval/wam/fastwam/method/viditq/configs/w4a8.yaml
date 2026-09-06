@@ -1,0 +1,17 @@
+# FastWAM ViDiT-Q W4A8: unsigned per-channel ASYMMETRIC INT4 weight (QServe
+# nibble pack + szeros) + per-token symmetric dynamic INT8 activation.
+# Homogeneous over both experts' self_attn.{q,k,v,o} + ffn.{0,2}.
+# QuaRoT on; SmoothQuant off (W4A8 kernel path, matching lingbot_va w4a8
+# mixed lineage but here applied to all target Linears).
+
+remain_fp_regex: '^(?!.*\.(?:self_attn\.[qkvo]|ffn\.[02])$).*$'
+
+weight_bits: 4
+weight_sym: false
+act_bits: 8
+act_sym: true
+weight_pack: int4_qserve
+
+smooth_quant: false
+quarot: true
+quarot_seed_base: 0

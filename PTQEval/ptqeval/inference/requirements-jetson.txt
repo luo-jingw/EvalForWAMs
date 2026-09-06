@@ -1,0 +1,55 @@
+# Server-side deps for lingbot-va + ptqeval inference on Jetson
+# (JetPack 5.1.1 = CUDA 11.4, Ubuntu 20.04, Python 3.8, Orin = sm_87).
+#
+# WHY these versions differ from lingbot-va/requirements.txt (which targets
+# x86 / Python 3.10 / torch 2.9): lingbot-va's only version-sensitive
+# external symbols are transformers.UMT5EncoderModel + T5TokenizerFast and
+# diffusers.AutoencoderKLWan + pipelines.wan.prompt_clean. The transformer
+# itself (WanTransformer3DModel) is wan_va's OWN torch code. So the deploy
+# stack needs only:
+#   - transformers >= 4.30 (UMT5) and <= 4.46 (last Python 3.8 release);
+#     4.47 requires Python 3.9+.
+#   - diffusers >= 0.32 (AutoencoderKLWan / Wan pipeline); 0.32-0.34 keep
+#     Python 3.8. 0.34.0 is closest to the 0.35.0.dev0 the checkpoint was
+#     saved with -> least VAE config drift.
+# All verified py3.8-installable (pip Requires-Python check).
+#
+# NOT installed here:
+#   - torch / torchvision: install the NVIDIA Jetson wheel FIRST, matched to
+#     JetPack 5.1.1 (cp38, CUDA 11.4) from
+#     developer.download.nvidia.com/compute/redist/jp/v511/pytorch/
+#     (torch ~2.1). Do NOT `pip install torch` (pulls the x86 build / a
+#     version with no aarch64+CUDA-11.4 wheel).
+#   - flash_attn: NOT needed. The deploy forward uses attn_mode="torch"
+#     (F.scaled_dot_product_attention); model.py imports flash_attn
+#     optionally now.
+#   - lerobot / wandb: post-training only, not used for inference.
+#
+# Install order on the device:
+#   1) NVIDIA Jetson torch/torchvision wheel (see above)
+#   2) pip install -r this file
+#   3) pip install -e PTQEval/            (omegaconf/websockets/msgpack + pkg)
+#   4) build the w4a4 kernel:
+#      cd PTQEval/ptqeval/wam/lingbot_va/method/viditq/kernel
+#      TORCH_CUDA_ARCH_LIST="8.7" pip install -e .
+
+diffusers==0.34.0
+transformers==4.46.3
+# py3.8 ceilings: numpy>=1.25 / scipy>=1.11 / matplotlib>=3.8 all dropped
+# Python 3.8. These are the last 3.8-compatible releases.
+numpy==1.24.4
+scipy==1.10.1
+matplotlib==3.7.5
+einops
+easydict
+safetensors
+opencv-python
+ftfy
+imageio[ffmpeg]
+tqdm
+Pillow
+accelerate
+# ptqeval transport / config (also pulled by `pip install -e PTQEval/`)
+omegaconf>=2.3
+websockets>=11
+msgpack>=1.0

@@ -1,0 +1,3 @@
+# Runtime args for lingbot_va --variant viditq, W4A4 + SmoothQuant (D6).
+layer_config: PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/w4a4_smooth.yaml
+int_weights_ckpt: results/lingbot_va/viditq_w4a4_smooth/calib/int_weights.pth

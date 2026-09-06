@@ -1,0 +1,32 @@
+# FastWAM ViDiT-Q W4A4 mixed-precision (data-free). Adapts the lingbot_va /
+# ViDiT-Q pixart W4A4-MP recipe to FastWAM's two experts:
+#   blocks.0 (both experts) stays FP.
+#   blocks 1-29 per-Linear, both experts:
+#     self_attn.{q,k,v} + ffn.2 -> W4A4 (per-group SYM INT4, group=128 along K)
+#     self_attn.o + ffn.0       -> W8A8 (per-channel asym int8 + int16 zp)
+#
+# Data-free: W4A4 (per-group dynamic) and QuaRoT need no calibration;
+# SmoothQuant is off. weight_sym stays true as a marker for the W4A4 tier;
+# the W8A8 fallthrough tier flips to asym inside _quantize_one.
+#
+# remain_fp_regex keeps FP: blocks.0 of either expert, OR any Linear that is
+# not one of the 6 target suffixes (negative lookahead).
+
+remain_fp_regex: '(?:\.blocks\.0\.)|(?:^(?!.*\.(?:self_attn\.[qkvo]|ffn\.[02])$).*$)'
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "4_4":
+    - "self_attn.q"
+    - "self_attn.k"
+    - "self_attn.v"
+    - "ffn.2"
+weight_sym: true            # W4A4 tier sym; W8A8 tier flips to asym in _quantize_one
+act_sym: true
+weight_pack: int4_sym
+
+smooth_quant: false
+quarot: true
+quarot_seed_base: 0
+quarot_layer_regex: 'self_attn\.[qkv]|ffn\.[02]'

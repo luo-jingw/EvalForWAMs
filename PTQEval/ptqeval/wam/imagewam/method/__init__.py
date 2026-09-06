@@ -1,0 +1,1 @@
+# fastwam method package.

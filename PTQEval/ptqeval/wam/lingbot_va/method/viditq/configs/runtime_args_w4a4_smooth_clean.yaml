@@ -1,0 +1,7 @@
+# Runtime args for lingbot_va --variant viditq, W4A4 + SmoothQuant, CLEAN calib.
+# Loads the demo_clean-calibrated int_weights so the clean eval is calibration-
+# matched (fixes the shared-calib mismatch; see runtime_args_w4a4_smooth.yaml for
+# the randomized variant). layer_config only matters at derive time (calib_data
+# is baked into int_weights); kept as the _clean config for consistency.
+layer_config: PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/w4a4_smooth_clean.yaml
+int_weights_ckpt: results/lingbot_va/viditq_w4a4_smooth/calib/int_weights_clean.pth

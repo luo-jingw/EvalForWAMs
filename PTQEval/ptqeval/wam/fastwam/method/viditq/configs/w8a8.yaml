@@ -1,0 +1,26 @@
+# FastWAM ViDiT-Q W8A8 (paper-namesake): per-channel ASYMMETRIC INT8 weight
+# + per-token symmetric dynamic INT8 activation, stacked with SmoothQuant
+# (alpha-blend) and QuaRoT Hadamard rotation. Same method as lingbot_va
+# configs/w8a8.yaml; only the target regex differs for FastWAM module names.
+#
+# Targets both experts' self_attn.{q,k,v,o} + ffn.{0,2} (360 Linears total).
+# remain_fp_regex keeps every OTHER Linear FP via a negative lookahead: a name
+# is kept FP unless it ends with a target suffix. cross_attn.*, text/patch/time
+# embeddings, head, proprio/action encoders all stay FP.
+#
+# SmoothQuant needs a FastWAM calib_data.pth (per-input-channel act absmax for
+# each target Linear). Produce it before running this config.
+
+remain_fp_regex: '^(?!.*\.(?:self_attn\.[qkvo]|ffn\.[02])$).*$'
+
+weight_bits: 8
+weight_sym: false
+act_bits: 8
+act_sym: true
+weight_pack: int8
+
+smooth_quant: true
+smooth_alpha: 0.99
+calib_data_path: results/fastwam/fastwam_w8a8/calib/calib_data.pth
+quarot: true
+quarot_seed_base: 0

@@ -1,0 +1,34 @@
+# FastWAM W4A4 mixed-precision + SmoothQuant (the ViDiT-Q "combined" method
+# applied to W4A4). This is NOT ViDiT-Q's released W4A4 recipe — the released
+# w4a4_mixed_precision.yaml is QuaRoT-only / data-free (see NO_CALIBRATION.md).
+# This config adds SmoothQuant (scaling) on top of QuaRoT (rotation), matching
+# the "combining scaling and rotation-based channel balancing" method the paper
+# uses for its headline W8A8 / W4A8. It therefore REQUIRES calibration data.
+#
+# Kept alongside (not replacing) w4a4.yaml so the QuaRoT-only vs
+# QuaRoT+SmoothQuant results can be compared later.
+#
+# Same tier layout / regex / quarot scope as w4a4.yaml; the only additions are
+# smooth_quant + smooth_alpha + calib_data_path.
+
+remain_fp_regex: '(?:\.blocks\.0\.)|(?:^(?!.*\.(?:self_attn\.[qkvo]|ffn\.[02])$).*$)'
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "4_4":
+    - "self_attn.q"
+    - "self_attn.k"
+    - "self_attn.v"
+    - "ffn.2"
+weight_sym: true            # W4A4 tier sym; W8A8 tier flips to asym in _quantize_one
+act_sym: true
+weight_pack: int4_sym
+
+# SmoothQuant ON (needs calib). alpha 0.99 = ViDiT-Q combined `viditq` block.
+smooth_quant: true
+smooth_alpha: 0.99
+calib_data_path: results/fastwam/fastwam_w4a4_smooth/calib/calib_data.pth
+quarot: true
+quarot_seed_base: 0
+quarot_layer_regex: 'self_attn\.[qkv]|ffn\.[02]'

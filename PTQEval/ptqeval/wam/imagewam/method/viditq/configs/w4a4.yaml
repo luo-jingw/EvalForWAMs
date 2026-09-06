@@ -1,0 +1,46 @@
+# ImageWAM (FLUX.2 Klein-4B) ViDiT-Q W4A4 mixed-precision (data-free). Adapts the
+# lingbot_va / ViDiT-Q W4A4-MP recipe to the FLUX.2 MMDiT (video expert) +
+# SlimFlux2 (action expert). Target Linears (all bias=False):
+#   video  double_blocks.N: {img,txt}_attn.{qkv,proj} + {img,txt}_mlp.{0,2}
+#   video  single_blocks.N: linear1 / linear2
+#   action double_blocks.N: img_attn.{qkv,proj} + img_mlp.{0,2}
+#   action single_blocks.N: linear1 / linear2
+# double_blocks.0 (both experts) kept FP (fastwam-analogous blocks.0-FP).
+#
+# W4A4 tier (per-group SYM INT4, group=128 along K): the attention qkv +
+# down/second projections (img/txt_mlp.2, linear2). W8A8 fallthrough (per-channel
+# asym int8): the attn output proj + up projections (img/txt_mlp.0, linear1).
+# NOTE: the W4A4/W8A8 split is a first-version choice; revisit when tuning.
+#
+# Data-free: W4A4 (per-group dynamic) + QuaRoT need no calibration; SmoothQuant off.
+#
+# remain_fp_regex keeps FP: double_blocks.0 of either expert, OR any Linear not
+# ending in one of the 10 target suffixes (negative lookahead). Modulation `.lin`,
+# img_in/txt_in/time_in/final_layer, AE, and the Qwen3 text encoder are all
+# excluded because they never end in these suffixes.
+
+remain_fp_regex: '(?:\.double_blocks\.0\.)|(?:^(?!.*\.(?:img_attn\.(?:qkv|proj)|txt_attn\.(?:qkv|proj)|img_mlp\.[02]|txt_mlp\.[02]|linear[12])$).*$)'
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "4_4":
+    - "img_attn.qkv"
+    - "txt_attn.qkv"
+    - "img_mlp.2"
+    - "txt_mlp.2"
+    - "linear2"
+weight_sym: true            # W4A4 tier sym; W8A8 tier flips to asym in _quantize_one
+act_sym: true
+weight_pack: int4_sym
+
+smooth_quant: false
+quarot: true
+quarot_seed_base: 0
+# Rotate the had-legal input-side projections (attention qkv, mlp up-proj, single
+# linear1/linear2). EXCLUDES {img,txt}_mlp.2: the VIDEO double-block mlp down-proj
+# has in_features=9216 (=9*2^10), not factorable by QuaRoT's had12/had28/butterfly
+# -> would raise. (Action mlp.2 is 4096 and could be rotated, but is excluded by
+# the same suffix for simplicity.) REFINEMENT: add a had36 head to lingbot_va
+# quarot.py (ViDiT-Q get_had36 exists; 9216=36*2^8) to rotate mlp.2 faithfully.
+quarot_layer_regex: 'img_attn\.qkv|txt_attn\.qkv|img_mlp\.0|txt_mlp\.0|linear[12]'

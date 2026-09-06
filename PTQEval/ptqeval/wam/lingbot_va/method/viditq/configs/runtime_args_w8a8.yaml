@@ -1,0 +1,4 @@
+# Runtime args for --variant viditq, paper-namesake "ViDiT-Q" method
+# (SmoothQuant + QuaRoT composed; Phase 38; dynamic per-token act).
+layer_config: PTQEval/ptqeval/wam/lingbot_va/method/viditq/configs/w8a8.yaml
+int_weights_ckpt: results/viditq_w8a8/calib/int_weights.pth

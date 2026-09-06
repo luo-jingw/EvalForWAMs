@@ -1,0 +1,50 @@
+# Sample deployment config for ptqeval.inference.InferenceConfig.
+# Keys = InferenceConfig field names. Use ABSOLUTE paths on the device.
+# Load with: InferenceConfig.from_yaml("<this file>").
+#
+# This sample targets the Unitree G1 red-bottle model with w4a4.
+
+# base_config selects the robot/model STRUCTURAL layout (env_type, action
+# channel mapping, norm_stat, cameras, attn_window, frame_chunk_size, ...).
+# g1_server = Unitree G1 (env_type=none, attn_window=30, joint actions).
+# robotwin  = RoboTwin (attn_window=72, EEF actions). Get this right --
+# a wrong base_config silently corrupts actions.
+base_config: g1_server
+
+# Assembled model dir (transformer/ vae/ text_encoder/ tokenizer/). Build it
+# with models/lingbot-pick-red-bottle-3k/convert_to_lingbot_va.py. int_weights
+# is an OVERLAY on this FP transformer -- ship BOTH to the device.
+model_path: /abs/path/to/models/lingbot-pick-red-bottle-3k
+
+# w4a4 quantized weights (weight_prep output) + its layer config.
+# Leave int_weights_ckpt / layer_config empty to run the bf16 baseline.
+int_weights_ckpt: /abs/path/to/models/lingbot-pick-red-bottle-3k/int_weights_w4a4.pth
+layer_config: /abs/path/to/PTQEval/ptqeval/inference/configs/w4a4.yaml
+variant: viditq
+
+# Precomputed text-cond cache (ships inside the self-contained HF model dir)
+# -> device stays T5-free. The fixed prompt "pick the red bottle" always hits.
+text_cond_cache: /abs/path/to/models/lingbot-pick-red-bottle-3k/text_cond_cache
+# serve_residency = serial T5 fallback on a cache MISS (transformer offloaded
+# to CPU before T5 loads, never co-resident). Keep FALSE for the lean deploy:
+# no text_encoder/ is shipped, so a miss would fail anyway. Set true ONLY if
+# you added a text_encoder/ to the model dir for arbitrary-prompt support.
+serve_residency: false
+offload_target: cpu
+
+dtype: bf16
+device: cuda:0
+save_root: /tmp/va_infer
+
+# Sliding window = the dominant KV-cache memory knob. On the G1 EDU (~14 GB
+# usable after motion control) 48 is the deploy default (down from 72):
+# smaller window -> smaller KV cache -> fits the budget. Lower further (e.g.
+# 30, the g1 training window) if you still OOM; raise for more temporal
+# context if memory allows. Structural params other than this are inherited
+# from base_config (g1_server): env_type, action mapping, norm_stat, cams,
+# frame_chunk_size, num_inference_steps, ...
+attn_window: 48
+
+# Other overrides stay unset (inherit g1_server): env_type, enable_offload,
+# guidance_scale, action_guidance_scale, num_inference_steps,
+# action_num_inference_steps.

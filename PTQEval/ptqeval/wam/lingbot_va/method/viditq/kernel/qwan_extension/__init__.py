@@ -1,0 +1,56 @@
+# Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+"""qwan_extension: BF16-native int8 GEMM kernels.
+
+Re-exports the C++/CUDA entry points from the compiled extension so callers
+can write `from qwan_extension import act_quant_bf16_with_sum,
+w8a8_obf16_bias_weight_asym`.
+"""
+# Import torch first so libc10.so / libtorch.so are loaded into the
+# process before the compiled extension dlopens against them.
+import torch  # noqa: F401
+
+from qwan_extension._C import (
+    act_quant_bf16,
+    act_quant_bf16_with_sum,
+    act_quant_bf16_group128,
+    w8a8_of16_bias_weight_asym,
+    w8a8_obf16_bias_weight_asym,
+    w8a8_obf16_bias_weight_sym,
+    w8a8_obf16_nobias_weight_asym,
+    w8a8_obf16_nobias_weight_sym,
+    w4a8_of16_nobias_weight_asym,
+    w4a8_obf16_nobias_weight_asym,
+    w4a8_of16_bias_weight_asym,
+    w4a8_obf16_bias_weight_asym,
+    w4a4_of16_nobias_weight_sym,
+    w4a4_obf16_nobias_weight_sym,
+    w4a4_of16_bias_weight_sym,
+    w4a4_obf16_bias_weight_sym,
+    pack_atom_scale_a_fp16,
+    pack_atom_scale_a_bf16,
+    pack_atom_scale_b_fp16,
+    pack_atom_scale_b_bf16,
+)
+
+__all__ = [
+    "act_quant_bf16",
+    "act_quant_bf16_with_sum",
+    "act_quant_bf16_group128",
+    "w8a8_of16_bias_weight_asym",
+    "w8a8_obf16_bias_weight_asym",
+    "w8a8_obf16_bias_weight_sym",
+    "w8a8_obf16_nobias_weight_asym",
+    "w8a8_obf16_nobias_weight_sym",
+    "w4a8_of16_nobias_weight_asym",
+    "w4a8_obf16_nobias_weight_asym",
+    "w4a8_of16_bias_weight_asym",
+    "w4a8_obf16_bias_weight_asym",
+    "w4a4_of16_nobias_weight_sym",
+    "w4a4_obf16_nobias_weight_sym",
+    "w4a4_of16_bias_weight_sym",
+    "w4a4_obf16_bias_weight_sym",
+    "pack_atom_scale_a_fp16",
+    "pack_atom_scale_a_bf16",
+    "pack_atom_scale_b_fp16",
+    "pack_atom_scale_b_bf16",
+]

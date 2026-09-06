@@ -1,0 +1,171 @@
+推理部署包计划 (PTQEval/ptqeval/inference)
+按 principle.txt: 问题 -> 结构 -> 接口 -> 流程 -> 任务。信息最小化，一句一信息。
+状态: v2 (纳入用户 4 项决策 + 2 项核对发现)。
+
+===============================================================================
+0 用户决策 (v2)
+===============================================================================
+D1 text-cond 必须串行；可预计算。-> 单独一个文件专做预计算 (M5)，引擎支持
+   串行注入 (serve_residency，T5 与 transformer 互斥)。
+D2 calib 默认在远程资源充足服务器做；仅需适配 w4a4。
+D3 server 适配层先留接口；不便则记为待办。
+D4 env_type 先按 robotwin_tshape，拿到 server 脚本再改。
+
+核对发现 (影响设计):
+F1 w4a4 是「权重量化 + QuaRoT」，data-free：w4a4.yaml smooth_quant=false、无
+   calib_data_path，激活为运行时 per-token 动态量化。=> 生成 w4a4 权重
+   不需要 calib_data，只需 FP transformer + w4a4 配置。(D2 的 calib 对 w4a4
+   非必需；仅 smooth_quant 类配置才需要。)
+F2 VA_Server 依赖 dist 进程组 (init_distributed nccl env://)。单卡机器人需
+   引擎在构建前做一次单进程 bootstrap (world_size=1)。量化路径跳过 FSDP。
+
+===============================================================================
+1 问题定义
+===============================================================================
+现状:
+- 推理前向逻辑在 server.py 的 VA_Server (reset/_infer/_compute_kv_cache/
+  _encode_obs/postprocess_action)，但混入 websocket/perf/多变体/FSDP，且模型
+  路径硬编码 (va_robotwin_cfg.py:9)。attn_window 默认 72 (同文件:11)。
+- 量化权重生成在 method/viditq/ptq.py。
+问题:
+- 部署到机器人需自包含、精简、可 clone 的包，只做「生成 w4a4 权重」+「推理」，
+  参数显式暴露，设备内存紧张 -> 推理 T5-free (预计算文本 embed) 或串行。
+目标:
+- inference/ 下组件：权重生成 (M1) + 预计算文本 (M5) + 推理引擎 (M3) + 配置
+  (M2) + 可选观测 (M4)。最大复用 ptq.py/loader.py/VA_Server/text_cond_cache。
+- server 适配层留接口 (D3)，本轮不实现。
+
+===============================================================================
+2 系统结构 (模块 + 职责 + 状态归属)
+===============================================================================
+M1 weight_prep   FP(bf16) + w4a4 配置 -> int_weights.pth。薄封装 ptq.py。
+                 data-free (F1)。离线(远程)运行。归属: 量化权重(磁盘)。
+M5 precompute    prompt(s) -> 文本 embed 缓存 (T5 编码一次)。离线运行。
+                 归属: 文本 embed 缓存(磁盘)。专用文件 (D1)。
+M2 config        部署参数显式载体 (dataclass) + yaml；以 va_robotwin_cfg 为底覆盖。
+                 归属: 运行参数(唯一真源，只读)。
+M3 engine        单进程 dist bootstrap (F2) + 构建量化模型(loader)+VAE+文本注入；
+                 转发 reset/infer/compute_kv_cache 到 VA_Server。
+                 归属: 模型 + KV cache + prompt_embeds(运行时)。
+M4 metrics       (可选) 包裹引擎：整体 peak VRAM + 每次 infer 墙钟时间。观测型。
+                 归属: 观测量。
+[待办 D3] server 适配层：拿到接口后新增 inference/server_*.py，仅调用 M3。
+
+关键状态唯一归属: 参数只属 M2；模型/cache 只属 M3；M4 只观测。
+
+===============================================================================
+3 接口设计 (输入 / 输出 / 状态变化)
+===============================================================================
+M1 weight_prep.build_int_weights(
+       fp_transformer_dir: str, output: str,
+       layer_config: str = <inference/configs/w4a4.yaml 或指向 method/viditq>,
+       device: str = "cuda:0") -> str
+   复用: subprocess 调 method.viditq.ptq (与 derive_calib_ptq 同法)，不复制算法。
+   无 calib_data 参数 (F1)。输出 int_weights.pth 路径。仅写磁盘。
+
+M5 precompute.build_text_cond_cache(
+       prompts: list[str], model_path: str, output: str,
+       device: str = "cuda:0") -> str
+   复用: text_cond_cache.store_cache + T5 编码 (同 precompute_text_cond 的
+   encode 逻辑，独立成部署文件)。编码含空负样本 ""。输出缓存路径。仅写磁盘。
+
+M2 InferenceConfig (dataclass，全字段类型标注):
+   model_path: str                 # FP transformer 目录 (transformer/ vae/ text_encoder/)
+   int_weights_ckpt: str = ""      # M1 产物；空 -> bf16 基线
+   layer_config: str = ""          # w4a4 配置；空 -> bf16
+   variant: str = "viditq"
+   text_cond_cache: str = ""       # M5 产物 (T5-free 注入)
+   serve_residency: bool = False   # 串行注入 (miss 时 transformer 让位 T5) (D1)
+   offload_target: str = "cpu"     # 串行/直算时 transformer 卸载去处 cpu|disk
+   offload_dir: str = ""
+   attn_window: int = 72           # 滑窗，默认 72 (与原设计一致)
+   guidance_scale: float = 5.0; action_guidance_scale: float = 1.0
+   num_inference_steps: int = 25; action_num_inference_steps: int = 50
+   dtype: str = "bf16"; device: str = "cuda:0"
+   enable_offload: bool = True     # VAE/text_encoder 常驻 CPU 省显存
+   save_root: str = "/tmp/va_infer"
+   env_type: str = "robotwin_tshape"   # (D4)
+   classmethod from_yaml(path) -> InferenceConfig
+   to_job_config() -> EasyDict     # copy(VA_CONFIGS['robotwin']) + 覆盖上述字段
+                                   # + 写临时 variant_args yaml(int_weights+layer_config)
+
+M3 InferenceEngine(config: InferenceConfig):
+   __init__: 单进程 dist bootstrap (MASTER_ADDR/PORT/RANK/WORLD_SIZE + init_distributed)
+             -> 构建 job_config -> VA_Server(job_config)。
+   infer(request: dict) -> dict    # 直接转发 VA_Server.infer；按 request 键三分支
+                                   # (reset / compute_kv_cache / else)。与未来 server 同形。
+   reset(prompt: str | None) -> None   # 便捷: infer({'reset':True,'prompt':prompt})
+   状态变化: reset 重置 KV cache + prompt_embeds；infer 推进。
+
+M4 metrics.MeasuredEngine(engine):
+   infer(request) -> dict          # 透传，记录墙钟
+   peak_alloc_mb() -> float        # torch.cuda.max_memory_allocated
+   last_infer_ms() -> float; reset_peak() -> None
+   观测型，无阈值判定 (principle L12)。
+
+===============================================================================
+4 运行流程
+===============================================================================
+离线 (远程/工作站):
+  (a) M1: FP(bf16) + w4a4 配置 -> int_weights.pth (data-free)。
+  (b) M5: 部署 prompt -> 文本 embed 缓存 (T5 编码一次)。
+机器人 (clone 本包):
+  启动: M2 读 config -> M3 dist bootstrap -> 加载 FP transformer(loader: FP+int
+        overlay) + VAE(可选 offload) + 文本缓存。全程不常驻 T5。
+  每 episode: reset(prompt) -> loop[ infer(obs)->action ; infer(compute_kv_cache) ]。
+  文本注入: 命中缓存直接注入 (T5-free)；未命中且 serve_residency -> 串行编码。
+  可选: M4 记录整体 peak + infer 时间。
+cache 更新: VA_Server 内部 create_empty_cache/clear_cache (复用)。
+
+===============================================================================
+5 代码映射 (模块 -> 文件)
+===============================================================================
+inference/infer_plan.txt      本计划
+inference/__init__.py          导出声明 (只 export，不放实现)
+inference/config.py            M2 InferenceConfig
+inference/engine.py            M3 InferenceEngine (复用 server.VA_Server)
+inference/weight_prep.py       M1 build_int_weights (复用 method.viditq.ptq)
+inference/precompute_text.py   M5 build_text_cond_cache (复用 text_cond_cache)
+inference/metrics.py           M4 MeasuredEngine (可选)
+inference/server_ws.py         Phase 6 websocket 部署服务 (包 InferenceEngine)
+inference/configs/deploy.yaml  部署配置样例
+inference/configs/w4a4.yaml    指向/复制 method/viditq w4a4 layer 配置 (仅 w4a4, D2)
+
+复用映射 (不复制算法):
+- 量化算法      <- method/viditq/ptq.py
+- 量化模型加载  <- method/viditq/loader.py (load_quant_model)
+- 前向/KV/VAE   <- server.py (VA_Server)
+- 文本编码/存储 <- wam/lingbot_va/precompute_text_cond.py + text_cond_cache.py
+- 配置基线      <- wan_va/configs/va_robotwin_cfg.py
+依赖前提 (需一并 clone):
+- lingbot-va/ (wan_va: VA_Server 的 configs/distributed/modules 依赖)。
+- FP transformer checkpoint (int_weights 是 overlay，非自包含)。
+
+===============================================================================
+6 实现阶段 (目标 / 文件 / 新增 / 影响)
+===============================================================================
+Phase 1  显式配置面。config.py + configs/{deploy.yaml,w4a4.yaml} + __init__.py。
+         新增 InferenceConfig。验证(观测): from_yaml -> to_job_config，打印
+         attn_window/model_path/variant 等关键字段。(无 GPU)
+Phase 2  推理引擎。engine.py。新增 InferenceEngine (dist bootstrap + VA_Server)。
+         验证(观测): 用 calib_capture 的一段 obs，reset -> infer -> 打印
+         action.shape；无 pass 判定。(需 GPU)
+Phase 3  权重生成。weight_prep.py。新增 build_int_weights (w4a4, data-free)。
+         验证: 生成 int_weights.pth，打印 key 数 + 大小。(需 GPU)
+Phase 4  预计算文本。precompute_text.py。新增 build_text_cond_cache。
+         验证: 给定 prompt 列表 -> 缓存目录，打印 entry 数 + 大小。(需 GPU:T5)
+Phase 5  (可选) 观测。metrics.py。MeasuredEngine。验证: 几次 infer 打印
+         peak_alloc_mb + last_infer_ms。
+Phase 6  [DONE] server 适配层 = inference/server_ws.py。参考 wan_va_server.py：
+         build InferenceEngine -> wan_va run_async_server_mode (WebsocketPolicy
+         server 调 model.infer)。协议 = VA_Server.infer dict，与 g1-client
+         (g1_client/lingbot_va) 的 msgpack + infer 协议一致 -> 现有 client 不改
+         即可连；仅需 --server-host/--server-port + 任务 prompt。加载量化 +
+         T5-free (区别于 wan_va_server 的 bf16)。
+
+===============================================================================
+7 备注
+===============================================================================
+- 加载侧「静默失败」风险 (缺 key/quarot、错配 FP 模型) 与本包正交，属 loader
+  加固议题，另行处理，不在本包范围。
+- 内存紧张设备优先 T5-free (M5 预计算)；serve_residency 为串行兜底路径。

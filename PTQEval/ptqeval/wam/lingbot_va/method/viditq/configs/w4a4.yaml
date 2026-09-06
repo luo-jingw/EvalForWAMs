@@ -1,0 +1,55 @@
+# Phase 42: ViDiT-Q W4A4 mixed-precision (paper Sec D.4 + Table 5).
+# Upstream authority:
+#   ViDiT-Q/examples/pixart/configs/w4a4_mixed_precision.yaml
+#
+# Bit allocation (per plan.txt Phase 42, decoded from upstream yaml):
+#   blocks.0 stays fully FP (remain_fp_regex).
+#   block 1-29 per-Linear:
+#     attn1.to_q + attn1.to_k + attn1.to_v + ffn.net.2 -> W4A4 (4 of 6, 116)
+#     attn1.to_out[0] + ffn.net.0.proj                  -> W8A8 (2 of 6,  58)
+#
+# Quant convention:
+#   W4A4 layers: per-group SYMMETRIC INT4 (group=128 along K) for both
+#     weight and activation. Kernel-faithful per plan G5 — atom.cu's
+#     dequant is sym-only with no zp / sum buffers in its signature.
+#     The yaml's weight/act sym=false in the upstream Atom yaml is W4A8
+#     template residue (G1: yaml never met kernel pre-fix).
+#   W8A8 layers: per-channel ASYMMETRIC weight (int8 signed + int16 zp)
+#     + per-token symmetric INT8 activation. Unchanged from Phase 24d /
+#     Phase 26a-1.
+#
+# Preprocessing:
+#   SmoothQuant: OFF. Upstream w4a4_mixed_precision.yaml omits the
+#     smooth_quant / viditq blocks; paper offers no rationale beyond
+#     Sec D.4 "future direction, without careful tuning". We follow
+#     the published plan rather than inventing one.
+#   QuaRoT:      ON, scope = 5 of 6 quantizable layers per block
+#     ({to_q, to_k, to_v, ffn.net[0].proj, ffn.net[2]}). to_out is
+#     excluded because its input is post-attention head-concat, already
+#     structured (yaml quarot.layer_name_regex matches exactly).
+#
+# weight_sym is left true here as a documentation marker (W4A4 tier is
+# sym per G5); the W8A8 fallthrough tier inside ptq.py picks its own
+# asym path via _quantize_one. ptq.py's weight_sym guard tolerates
+# weight_sym=true ONLY when bit_alloc declares a (4, 4) tier.
+
+remain_fp_regex: "blocks.0|patch_embedding_mlp|action_embedder|proj_out|action_proj_out|condition_embedder|condition_embedder_action|scale_shift_table|time_proj"
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "4_4":
+    - "attn1.to_q"
+    - "attn1.to_k"
+    - "attn1.to_v"
+    - "ffn.net.2"
+weight_sym: true            # W4A4 tier; W8A8 tier flips to asym inside _quantize_one
+act_sym: true
+weight_pack: int4_sym       # weight_pack is resolved per-Linear at PTQ time;
+                            # this top-level marker reflects the W4A4 tier choice.
+
+# Phase 42: QuaRoT only — no SmoothQuant per upstream W4A4-MP yaml.
+smooth_quant: false
+quarot: true
+quarot_seed_base: 0
+quarot_layer_regex: "attn1.to_q|attn1.to_k|attn1.to_v|ffn.net"

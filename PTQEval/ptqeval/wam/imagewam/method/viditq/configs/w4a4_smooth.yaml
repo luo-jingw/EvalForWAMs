@@ -1,0 +1,32 @@
+# ImageWAM (FLUX.2 Klein-4B) W4A4 mixed-precision + SmoothQuant (ViDiT-Q
+# "combined" method = SmoothQuant scaling + QuaRoT rotation; the standard/D1
+# baseline). This is the PRIMARY ImageWAM config (per plan_multiwam D6). It
+# REQUIRES calibration data (on-policy, collected via eval_pool --calib_out;
+# see get_calib_data.py). Kept alongside the data-free w4a4.yaml for A/B.
+#
+# Same tier layout / regex / quarot scope as w4a4.yaml; the only additions are
+# smooth_quant + smooth_alpha + calib_data_path. See w4a4.yaml for the target
+# set, the W4A4/W8A8 split rationale, and the quarot 9216-exclusion note.
+
+remain_fp_regex: '(?:\.double_blocks\.0\.)|(?:^(?!.*\.(?:img_attn\.(?:qkv|proj)|txt_attn\.(?:qkv|proj)|img_mlp\.[02]|txt_mlp\.[02]|linear[12])$).*$)'
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "4_4":
+    - "img_attn.qkv"
+    - "txt_attn.qkv"
+    - "img_mlp.2"
+    - "txt_mlp.2"
+    - "linear2"
+weight_sym: true
+act_sym: true
+weight_pack: int4_sym
+
+# SmoothQuant ON (needs calib). alpha 0.99 = ViDiT-Q combined `viditq` block.
+smooth_quant: true
+smooth_alpha: 0.99
+calib_data_path: results/imagewam/imagewam_w4a4_smooth/calib/calib_data.pth
+quarot: true
+quarot_seed_base: 0
+quarot_layer_regex: 'img_attn\.qkv|txt_attn\.qkv|img_mlp\.0|txt_mlp\.0|linear[12]'

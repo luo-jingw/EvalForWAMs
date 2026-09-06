@@ -1,0 +1,29 @@
+# lingbot_va W4A4 + SmoothQuant, CLEAN-calibrated variant.
+# Identical to w4a4_smooth.yaml except calib_data_path points to the
+# demo_clean on-policy calibration (calib_data_clean.pth) instead of the
+# demo_randomized one. Used to fix the calibration mismatch: the original
+# w4a4_smooth eval derived a single int_weights.pth from demo_randomized calib
+# and reused it for BOTH clean and randomized evals. This config lets the derive
+# produce a clean-calibrated int_weights_clean.pth so the clean eval is
+# calibration-matched like the other three WAMs. See FOUR_WAM_W4A4_SMOOTH_REPORT.md.
+
+remain_fp_regex: "blocks.0|patch_embedding_mlp|action_embedder|proj_out|action_proj_out|condition_embedder|condition_embedder_action|scale_shift_table|time_proj"
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "4_4":
+    - "attn1.to_q"
+    - "attn1.to_k"
+    - "attn1.to_v"
+    - "ffn.net.2"
+weight_sym: true            # W4A4 tier; W8A8 tier flips to asym inside _quantize_one
+act_sym: true
+weight_pack: int4_sym
+
+smooth_quant: true
+smooth_alpha: 0.99
+calib_data_path: results/lingbot_va/viditq_w4a4_smooth/calib/calib_data_clean.pth
+quarot: true
+quarot_seed_base: 0
+quarot_layer_regex: "attn1.to_q|attn1.to_k|attn1.to_v|ffn.net"

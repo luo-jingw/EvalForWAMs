@@ -1,0 +1,1319 @@
+# Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import argparse
+import contextlib
+import json
+import os
+import sys
+import time
+from functools import partial
+from typing import Optional
+
+
+# Substring rules for classifying CUDA kernels under --profile_ops.
+# Order matters: ATTENTION first because record_function markers we
+# install below (e.g. "ATTENTION_SDPA") wrap GEMM children -- without
+# the marker check the inner cutlass GEMM would falsely match LINEAR.
+_ATTENTION_TOKENS = (
+    "attention_sdpa", "attention_diffusers",
+    "sdpa", "scaled_dot_product", "flash", "fmha", "mha",
+    "attention_kernel",
+)
+_LINEAR_TOKENS = (
+    "gemm", "cublas", "cutlass", "w8a8", "w4a8", "qlinear",
+    "linear", "addmm", "mm_kernel", "mm_out", "act_quant",
+    # ViDiT-Q / QServe W4A8 kernel function name is literally
+    # `dense_kernel0<OutT, ...>` -- no GEMM substring, so without this
+    # token it would (and historically did) leak into the "other" bucket
+    # and falsely report W4A8 GEMM as ~1000ms/call of unaccounted-for
+    # overhead. Added 2026-06-17 after audit of W4A8 op_breakdown.
+    "dense_kernel",
+)
+_MEMCPY_TOKENS = ("memcpy",)
+
+
+def _classify_kernel(name: str) -> str:
+    n = name.lower()
+    for tok in _ATTENTION_TOKENS:
+        if tok in n:
+            return "attention"
+    for tok in _LINEAR_TOKENS:
+        if tok in n:
+            return "linear"
+    for tok in _MEMCPY_TOKENS:
+        if tok in n:
+            return "memcpy"
+    return "other"
+
+
+_SDPA_PATCH_INSTALLED = False
+
+
+def _install_attention_markers() -> None:
+    """Monkey-patch F.scaled_dot_product_attention and diffusers
+    Attention.forward so PyTorch profiler attributes their GEMM
+    children under a named record_function event (rather than the
+    bare cutlass kernel name which is identical to nn.Linear's).
+
+    Called once when --profile_ops is enabled; idempotent."""
+    global _SDPA_PATCH_INSTALLED
+    if _SDPA_PATCH_INSTALLED:
+        return
+    _SDPA_PATCH_INSTALLED = True
+    try:
+        from torch.profiler import record_function
+    except ImportError:
+        return
+
+    # 1) SDPA fast path (most diffusers AttnProcessor2_0 calls this).
+    try:
+        import torch.nn.functional as _F
+        _orig_sdpa = _F.scaled_dot_product_attention
+
+        def _sdpa_wrap(*a, **kw):
+            with record_function("ATTENTION_SDPA"):
+                return _orig_sdpa(*a, **kw)
+        _F.scaled_dot_product_attention = _sdpa_wrap
+        logger.info("[profile_ops] wrapped F.scaled_dot_product_attention")
+    except Exception as e:
+        logger.warning(f"[profile_ops] SDPA wrap failed: {e}")
+
+    # 2) diffusers Attention.forward (covers manual matmul + softmax
+    # attention paths that don't go through SDPA).
+    try:
+        from diffusers.models.attention_processor import Attention as _DiffAttn
+        _orig_forward = _DiffAttn.forward
+
+        def _attn_wrap(self, *a, **kw):
+            with record_function("ATTENTION_DIFFUSERS"):
+                return _orig_forward(self, *a, **kw)
+        _DiffAttn.forward = _attn_wrap
+        logger.info("[profile_ops] wrapped diffusers Attention.forward")
+    except Exception as e:
+        logger.warning(f"[profile_ops] diffusers Attention wrap failed: {e}")
+from PIL import Image
+from diffusers.video_processor import VideoProcessor
+from diffusers.utils import export_to_video
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from diffusers.pipelines.wan.pipeline_wan import prompt_clean
+from einops import rearrange
+from tqdm import tqdm
+
+# M5 fork: triggers ptqeval.wam.lingbot_va package init, which appends
+# LINGBOT_VA_PATH (== <repo_root>/lingbot-va/) to sys.path so that
+# `from wan_va.* import ...` resolves.
+import ptqeval.wam.lingbot_va as _lingbot_va_pkg
+# Upstream server.py uses bare imports like `from configs import VA_CONFIGS`,
+# which are relative to lingbot-va/wan_va/; add that directory too.
+_WAN_VA_DIR = os.path.join(_lingbot_va_pkg.LINGBOT_VA_PATH, "wan_va")
+if _WAN_VA_DIR not in sys.path:
+    sys.path.insert(0, _WAN_VA_DIR)
+
+from configs import VA_CONFIGS
+from distributed.fsdp import shard_model
+from distributed.util import _configure_model, init_distributed
+from modules.utils import (
+    WanVAEStreamingWrapper,
+    load_text_encoder,
+    load_tokenizer,
+    load_transformer,
+    load_vae,
+)
+from ptqeval.wam.lingbot_va.text_cond_cache import cache_key, load_cache
+from utils import (
+    FlowMatchScheduler,
+    data_seq_to_patch,
+    get_mesh_id,
+    init_logger,
+    logger,
+    run_async_server_mode,
+    save_async,
+)
+from omegaconf import OmegaConf
+
+from ptqeval.eval.perf_probe import PerfProbe
+
+
+class VA_Server:
+
+    def __init__(self, job_config):
+        self.cache_name = 'pos'
+        self.job_config = job_config
+        self.save_root = job_config.save_root
+        self.dtype = job_config.param_dtype
+        self.device = torch.device(f"cuda:{job_config.local_rank}")
+        self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+
+        perf_log_dir: Optional[str] = getattr(job_config, 'perf_log_dir', None)
+        perf_task_name: str = getattr(job_config, 'perf_task_name', 'unknown')
+        self.probe: Optional[PerfProbe] = None
+        if perf_log_dir:
+            log_path = os.path.join(
+                perf_log_dir,
+                f"{perf_task_name}_rank{job_config.local_rank}_{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
+            )
+            self.probe = PerfProbe(
+                log_path=log_path,
+                task_name=perf_task_name,
+                device=job_config.local_rank,
+            )
+
+        # Optional op-level kernel profiling: when on, the first
+        # `_profile_target` post-warmup full _infer() calls (the ones
+        # that hit the `else` branch in infer() -- not reset / not
+        # compute_kv_cache) run inside torch.profiler.profile and the
+        # accumulated per-kernel CUDA time is classified into
+        # linear/attention/other and written to
+        # <perf_log_dir>/<task>_op_profile.json. Off by default so
+        # production eval pays nothing. Profiler overhead is real
+        # (~5-10x slowdown for the instrumented calls only), so this
+        # path is meant for short --test_num runs.
+        self._profile_ops = bool(getattr(job_config, 'profile_ops', False))
+        self._profile_target = int(getattr(job_config, 'profile_n_calls', 5))
+        self._profile_warmup = 1
+        self._profile_calls_seen = 0
+        self._op_us: dict = {"linear": 0.0, "attention": 0.0,
+                              "memcpy": 0.0, "other": 0.0}
+        self._op_kernel_top: list = []
+        self._profile_dump_path: Optional[str] = None
+        if self._profile_ops and perf_log_dir:
+            self._profile_dump_path = os.path.join(
+                perf_log_dir, f"{perf_task_name}_op_profile.json")
+            logger.info(f"[profile_ops] will instrument first "
+                        f"{self._profile_target} infer() calls "
+                        f"(+{self._profile_warmup} warmup); dump to "
+                        f"{self._profile_dump_path}")
+            _install_attention_markers()
+
+        init_stage_ctx = None
+        if self.probe is not None:
+            self.probe.begin_call()
+            init_stage_ctx = self.probe.stage('init')
+            init_stage_ctx.__enter__()
+        try:
+            self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
+                                                sigma_min=0.0,
+                                                extra_one_step=True)
+            self.action_scheduler = FlowMatchScheduler(
+                shift=self.job_config.action_snr_shift,
+                sigma_min=0.0,
+                extra_one_step=True)
+            self.scheduler.set_timesteps(1000, training=True)
+            self.action_scheduler.set_timesteps(1000, training=True)
+
+            self.vae = load_vae(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'vae'),
+                torch_dtype=self.dtype,
+                torch_device='cpu' if self.enable_offload else self.device,
+            )
+            self.streaming_vae = WanVAEStreamingWrapper(self.vae)
+
+            self.tokenizer = load_tokenizer(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'tokenizer'), )
+
+            # Phase 41 v3 (2026-06-22): text encoder loads on CPU but
+            # _reset() swaps it to GPU for the encode then immediately
+            # offloads back. CPU-only forward (v1) took 30-75 s and
+            # blocked the asyncio event loop -> ConnectionClosedError.
+            # GPU-resident (v2) worked but burned 11 GB VRAM the whole
+            # episode. Transient swap costs ~0.3 s encode + 2x ~3 s
+            # 11 GB HBM<->host copy per reset; total ~6-7 s on the
+            # websocket critical path, well under the multi-minute
+            # reset budget. Steady-state VRAM saving matches the
+            # original Phase 41 (11 GB freed).
+            # Phase 44c / req-2: precomputed text-condition cache. When a
+            # cache is provided the eval is fully T5-FREE: defer the ~11 GB
+            # text encoder load entirely and only materialize it (lazy, CPU)
+            # on a cache MISS. With complete coverage the text encoder never
+            # occupies host OR device memory. No cache -> load eagerly on CPU
+            # (the transient-swap / serve_residency direct-compute paths need
+            # it). _ensure_text_encoder() does the lazy load.
+            self._text_encoder_path = os.path.join(
+                job_config.wan22_pretrained_model_name_or_path, 'text_encoder')
+            _tc_path = getattr(job_config, 'text_cond_cache', None)
+            self.text_cond_cache = load_cache(_tc_path) if _tc_path else None
+            if self.text_cond_cache is not None:
+                self.text_encoder = None
+                logger.info("[text_cond] cache set -> text encoder NOT loaded "
+                            "(T5-free; lazy-load only on a cache miss)")
+            else:
+                self.text_encoder = load_text_encoder(
+                    self._text_encoder_path,
+                    torch_dtype=self.dtype,
+                    torch_device='cpu',
+                )
+
+            # Phase 44d: deployment serial residency. When on (and no disk
+            # cache hit), _reset encodes the prompt with the transformer
+            # offloaded to CPU, so T5 and lingbot-va are never co-resident:
+            # peak during encode = T5 alone (KV buffer not yet allocated),
+            # then the transformer reloads. The result is cached in
+            # _mem_text_cond so only the first reset per unique prompt pays
+            # the swap. Off by default; eval uses the precomputed disk cache.
+            self.serve_residency = bool(
+                getattr(job_config, 'serve_residency', False))
+            self._mem_text_cond: dict = {}
+            # req-1a: where the transformer weights go while T5 is resident
+            # so the two are never co-resident in VRAM. 'cpu' = host RAM
+            # (fast). 'disk' = serialize to offload_dir + free host too
+            # (edge devices with tight RAM). Only consulted on the serial
+            # (serve_residency) direct-compute path.
+            self.offload_target = str(
+                getattr(job_config, 'offload_target', 'cpu'))
+            self.offload_dir = str(
+                getattr(job_config, 'offload_dir', '') or
+                os.path.join(self.save_root, '_offload'))
+            self._offload_path = os.path.join(
+                self.offload_dir,
+                f"transformer_offload_rank{job_config.local_rank}.pt")
+
+            variant: Optional[str] = getattr(job_config, 'variant', None)
+            variant_args_path: Optional[str] = getattr(job_config, 'variant_args', None)
+            transformer_dir = os.path.join(
+                job_config.wan22_pretrained_model_name_or_path, 'transformer')
+            if variant:
+                import importlib
+                loader_mod = importlib.import_module(
+                    f"ptqeval.wam.lingbot_va.method.{variant}.loader")
+                variant_args_dict: dict = {}
+                if variant_args_path:
+                    variant_args_dict = OmegaConf.to_container(
+                        OmegaConf.load(variant_args_path), resolve=True)
+                self.transformer = loader_mod.load_quant_model(
+                    wan_model_path=transformer_dir,
+                    variant_args=variant_args_dict,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                # Quantized variants run single-GPU. Skip FSDP wrap.
+                self.transformer.eval().requires_grad_(False)
+            else:
+                self.transformer = load_transformer(
+                    transformer_dir,
+                    torch_dtype=self.dtype,
+                    torch_device=self.device,
+                    attn_mode="torch"
+                )
+                shard_fn = shard_model
+                self.transformer = _configure_model(model=self.transformer,
+                                                    shard_fn=shard_fn,
+                                                    param_dtype=self.dtype,
+                                                    device=self.device,
+                                                    eval_mode=True,
+                                                    )
+
+            self.env_type = job_config.env_type
+            self.streaming_vae_half = None
+            if self.env_type == 'robotwin_tshape':
+                vae_half = load_vae(
+                    os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                                 'vae'),
+                    torch_dtype=self.dtype,
+                    torch_device='cpu' if self.enable_offload else self.device,
+                )
+                self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+        finally:
+            if init_stage_ctx is not None:
+                init_stage_ctx.__exit__(None, None, None)
+                self.probe.end_call()
+
+    def _stage(self, name: str):
+        if self.probe is None:
+            return contextlib.nullcontext()
+        return self.probe.stage(name)
+
+    def _offload_transformer(self):
+        """req-1a: move the transformer weights off the GPU so T5 can load
+        without co-residency (peak = max, not sum). 'cpu' parks them in
+        host RAM; 'disk' serializes to offload_dir then drops the module to
+        meta so host RAM is freed too (edge devices). Mutually exclusive
+        with T5 residency by construction."""
+        if self.offload_target == 'disk':
+            os.makedirs(self.offload_dir, exist_ok=True)
+            # to('cpu') frees the GPU storage reliably (FSDP flat params +
+            # quant buffers alike); to('meta') alone does NOT (FSDP keeps the
+            # flat param on device). Then persist + drop host storage to meta
+            # so host RAM is freed too (edge devices). Weights come back from
+            # disk in _reload_transformer via assign=True.
+            self.transformer.to('cpu')
+            torch.cuda.empty_cache()
+            torch.save(self.transformer.state_dict(), self._offload_path)
+            self.transformer.to('meta')
+        else:
+            self.transformer.to('cpu')
+        torch.cuda.empty_cache()
+
+    def _reload_transformer(self):
+        """Bring the transformer weights back onto the GPU after the T5
+        encode. 'disk' reloads the saved state_dict straight to device
+        (assign=True replaces the meta params)."""
+        if self.offload_target == 'disk':
+            sd = torch.load(self._offload_path, map_location=self.device)
+            self.transformer.load_state_dict(sd, assign=True)
+            del sd
+        else:
+            self.transformer.to(self.device)
+        torch.cuda.synchronize(self.device)
+
+    def _ensure_text_encoder(self):
+        """Lazy-load the text encoder (CPU) on a cache miss. With a complete
+        precomputed cache this is never called -> T5 occupies neither host
+        nor device memory (req-2: eval fully T5-free)."""
+        if self.text_encoder is None:
+            logger.warning(
+                "[text_cond] cache MISS -> lazy-loading text encoder (~11 GB "
+                "host RAM). A complete precomputed cache avoids this.")
+            self.text_encoder = load_text_encoder(
+                self._text_encoder_path, torch_dtype=self.dtype,
+                torch_device='cpu')
+
+    def _resolve_cached_embeds(self, prompt):
+        """Return (pos_cpu, neg_cpu) cached T5 embeds for `prompt`, or None
+        on miss. Single resolver for both cache sources: the in-memory
+        deployment cache (44d serial residency) first, then the precomputed
+        disk cache (44c). neg_cpu may be None. Both tensors are CPU; the
+        caller moves them to GPU. No T5 forward here."""
+        _mem = self._mem_text_cond
+        if prompt in _mem:
+            return _mem[prompt]
+        _tc = self.text_cond_cache
+        if _tc is not None:
+            k_pos = cache_key(prompt, 512)
+            k_neg = cache_key("", 512)
+            if k_pos in _tc and k_neg in _tc:
+                return (_tc[k_pos].prompt_embeds, _tc[k_neg].prompt_embeds)
+        return None
+
+    def _get_t5_prompt_embeds(
+        self,
+        prompt=None,
+        num_videos_per_prompt=1,
+        max_sequence_length=512,
+        device=None,
+        dtype=None,
+    ):
+        device = device or self.device
+        dtype = dtype or self.dtype
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        prompt = [prompt_clean(u) for u in prompt]
+        batch_size = len(prompt)
+
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
+        seq_lens = mask.gt(0).sum(dim=1).long()
+
+        text_encoder_device = next(self.text_encoder.parameters()).device
+        prompt_embeds = self.text_encoder(text_input_ids.to(text_encoder_device),
+                                          mask.to(text_encoder_device)).last_hidden_state
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+        prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
+        prompt_embeds = torch.stack([
+            torch.cat(
+                [u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
+            for u in prompt_embeds
+        ],
+                                    dim=0)
+
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        _, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt,
+                                           seq_len, -1)
+
+        return prompt_embeds.to(device)
+
+    def encode_prompt(
+        self,
+        prompt,
+        negative_prompt=None,
+        do_classifier_free_guidance=True,
+        num_videos_per_prompt=1,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        max_sequence_length=226,
+        device=None,
+        dtype=None,
+    ):
+        r"""
+        TODO
+        """
+        device = device or self.device
+        dtype = dtype or self.dtype
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        if prompt is not None:
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        if prompt_embeds is None:
+            prompt_embeds = self._get_t5_prompt_embeds(
+                prompt=prompt,
+                num_videos_per_prompt=num_videos_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=device,
+                dtype=dtype,
+            )
+
+        if do_classifier_free_guidance and negative_prompt_embeds is None:
+            negative_prompt = negative_prompt or ""
+            negative_prompt = batch_size * [negative_prompt] if isinstance(
+                negative_prompt, str) else negative_prompt
+
+            if prompt is not None and type(prompt) is not type(
+                    negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}.")
+            elif batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                    " the batch size of `prompt`.")
+
+            negative_prompt_embeds = self._get_t5_prompt_embeds(
+                prompt=negative_prompt,
+                num_videos_per_prompt=num_videos_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=device,
+                dtype=dtype,
+            )
+        return prompt_embeds, negative_prompt_embeds
+
+    def normalize_latents(
+        self,
+        latents: torch.Tensor,
+        latents_mean: torch.Tensor,
+        latents_std: torch.Tensor,
+    ) -> torch.Tensor:
+        latents_mean = latents_mean.view(1, -1, 1, 1,
+                                         1).to(device=latents.device)
+        latents_std = latents_std.view(1, -1, 1, 1,
+                                       1).to(device=latents.device)
+        latents = ((latents.float() - latents_mean) * latents_std).to(latents)
+        return latents
+
+    def preprocess_action(self, action):
+        action_model_input = torch.from_numpy(action)
+        CA, FA, HA = action_model_input.shape  # C, F, H
+        action_model_input_paded = F.pad(action_model_input,
+                                         [0, 0, 0, 0, 0, 1],
+                                         mode='constant',
+                                         value=0)
+
+        action_model_input = action_model_input_paded[
+            self.job_config.inverse_used_action_channel_ids]
+
+        if self.action_norm_method == 'quantiles':
+            action_model_input = (action_model_input - self.actions_q01) / (
+                self.actions_q99 - self.actions_q01 + 1e-6) * 2. - 1.
+        else:
+            raise NotImplementedError
+        return action_model_input.unsqueeze(0).unsqueeze(-1)  # B, C, F, H, W
+
+    def postprocess_action(self, action):
+        action = action.cpu()  # B, C, F, H, W
+
+        action = action[0, ..., 0]  #C, F, H
+        if self.action_norm_method == 'quantiles':
+            action = (action + 1) / 2 * (self.actions_q99 - self.actions_q01 +
+                                         1e-6) + self.actions_q01
+        else:
+            raise NotImplementedError
+        action = action.squeeze(0).detach().cpu().numpy()
+        return action[self.job_config.used_action_channel_ids]
+    
+    def _repeat_input_for_cfg(self, input_dict):
+        if self.use_cfg:
+            input_dict['noisy_latents'] = input_dict['noisy_latents'].repeat(2, 1, 1, 1, 1)
+            input_dict['text_emb'] = torch.cat([self.prompt_embeds.to(self.dtype).clone(), self.negative_prompt_embeds.to(self.dtype).clone()], dim=0)
+            input_dict['grid_id'] = input_dict['grid_id'][None].repeat(2, 1, 1)
+            input_dict['timesteps'] = input_dict['timesteps'][None].repeat(2, 1)
+        else:
+            input_dict['grid_id'] = input_dict['grid_id'][None]
+            input_dict['timesteps'] = input_dict['timesteps'][None]
+        return input_dict
+
+    def _prepare_latent_input(self,
+                              latent_model_input,
+                              action_model_input,
+                              latent_t=0,
+                              action_t=0,
+                              latent_cond=None,
+                              action_cond=None,
+                              frame_st_id=0,
+                              patch_size=(1, 2, 2)):
+        logger.info(f"FRAME START ID: {frame_st_id}")
+        input_dict = dict()
+        if latent_model_input is not None:
+            input_dict['latent_res_lst'] = {
+                'noisy_latents':
+                latent_model_input,
+                'timesteps':
+                torch.ones([latent_model_input.shape[2]],
+                           dtype=torch.float32,
+                           device=self.device) * latent_t,
+                'grid_id':
+                get_mesh_id(latent_model_input.shape[-3] // patch_size[0],
+                            latent_model_input.shape[-2] // patch_size[1],
+                            latent_model_input.shape[-1] // patch_size[2], 0,
+                            1, frame_st_id).to(self.device),
+                'text_emb':
+                self.prompt_embeds.to(self.dtype).clone(),
+            }
+            if latent_cond is not None:
+                input_dict['latent_res_lst'][
+                    'noisy_latents'][:, :, 0:1] = latent_cond[:, :, 0:1]
+                input_dict['latent_res_lst']['timesteps'][0:1] *= 0
+
+        if action_model_input is not None:
+            input_dict['action_res_lst'] = {
+                'noisy_latents':
+                action_model_input,
+                'timesteps':
+                torch.ones([action_model_input.shape[2]],
+                           dtype=torch.float32,
+                           device=self.device) * action_t,
+                'grid_id':
+                get_mesh_id(action_model_input.shape[-3],
+                            action_model_input.shape[-2],
+                            action_model_input.shape[-1],
+                            1,
+                            1,
+                            frame_st_id,
+                            action=True).to(self.device),
+                'text_emb':
+                self.prompt_embeds.to(self.dtype).clone(),
+            }
+
+            if action_cond is not None:
+                input_dict['action_res_lst'][
+                    'noisy_latents'][:, :, 0:1] = action_cond[:, :, 0:1]
+                input_dict['action_res_lst']['timesteps'][0:1] *= 0
+            input_dict['action_res_lst']['noisy_latents'][:, ~self.
+                                                          action_mask] *= 0
+        return input_dict
+
+    def _encode_obs(self, obs):
+        images = obs['obs']
+        if not isinstance(images, list):
+            images = [images]
+        if len(images) < 1:
+            return None
+        with self._stage('vae_encode'):
+            videos = []
+            for k_i, k in enumerate(self.job_config.obs_cam_keys):
+                if self.env_type == 'robotwin_tshape':
+                    if k_i == 0:  # camera high
+                        height_i, width_i = self.height, self.width
+                    else:
+                        height_i, width_i = self.height // 2, self.width // 2
+                else:
+                    height_i, width_i = self.height, self.width
+
+                history_video_k = torch.from_numpy(
+                    np.stack([each[k]
+                              for each in images])).float().permute(3, 0, 1, 2)
+                history_video_k = F.interpolate(history_video_k,
+                                                size=(height_i, width_i),
+                                                mode='bilinear',
+                                                align_corners=False).unsqueeze(0)
+                videos.append(history_video_k)
+
+            if self.env_type == 'robotwin_tshape':
+                videos_high = videos[0] / 255.0 * 2.0 - 1.0
+                videos_left_and_right = torch.cat(videos[1:],
+                                                  dim=0) / 255.0 * 2.0 - 1.0
+                vae_device = next(self.streaming_vae.vae.parameters()).device
+                enc_out_high = self.streaming_vae.encode_chunk(
+                    videos_high.to(vae_device).to(self.dtype))
+                enc_out_left_and_right = self.streaming_vae_half.encode_chunk(
+                    videos_left_and_right.to(vae_device).to(self.dtype))
+                enc_out = torch.cat([
+                    torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1),
+                    enc_out_high
+                ],
+                                    dim=-2)
+            else:
+                videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
+                vae_device = next(self.streaming_vae.vae.parameters()).device
+                videos_chunk = videos.to(vae_device).to(self.dtype)
+                enc_out = self.streaming_vae.encode_chunk(videos_chunk)
+
+            mu, logvar = torch.chunk(enc_out, 2, dim=1)
+            latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
+            latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
+            mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
+            video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+            return video_latent.to(self.device)
+
+    def _reset(self, prompt=None):
+        # Per-step timestamps so a hung reset shows up in the log instead
+        # of a 36-second silence followed by an external SIGTERM.
+        _rt = time.time()
+        def _step(msg):
+            nonlocal _rt
+            now = time.time()
+            logger.info(f'[reset {now - _rt:5.2f}s] {msg}')
+            _rt = now
+
+        logger.info('Reset.')
+        _step('begin')
+
+        # Phase 44d: deployment serial residency. Encode the prompt here,
+        # BEFORE create_empty_cache allocates the KV buffer, with the
+        # transformer offloaded to CPU. T5 and lingbot-va are never
+        # co-resident: peak during the encode window = T5 alone. The
+        # embeds land in _mem_text_cond, so the prompt block below resolves
+        # them as a hit (no second encode) and every later reset on the
+        # same prompt skips the swap entirely. Only runs on a miss; eval
+        # uses the precomputed disk cache and never enters this path.
+        if (self.serve_residency and prompt is not None
+                and self._resolve_cached_embeds(prompt) is None):
+            self._ensure_text_encoder()
+            _step(f'serial residency: transformer -> {self.offload_target}')
+            with self._stage('serial_xfmr_offload'):
+                self._offload_transformer()
+            _step('serial residency: text_encoder -> GPU + encode')
+            with self._stage('serial_text_encode'):
+                self.text_encoder.to(self.device)
+                torch.cuda.synchronize(self.device)
+                _pos, _neg = self.encode_prompt(
+                    prompt=prompt,
+                    negative_prompt=None,
+                    do_classifier_free_guidance=self.job_config.guidance_scale > 1,
+                    num_videos_per_prompt=1,
+                    prompt_embeds=None,
+                    negative_prompt_embeds=None,
+                    max_sequence_length=512,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                self.text_encoder.to('cpu')
+                torch.cuda.empty_cache()
+            self._mem_text_cond[prompt] = (
+                _pos.detach().to('cpu'),
+                _neg.detach().to('cpu') if _neg is not None else None)
+            _step('serial residency: transformer -> GPU')
+            with self._stage('serial_xfmr_reload'):
+                self._reload_transformer()
+
+        self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
+        #### Reset all parameters
+        self.frame_st_id = 0
+        self.init_latent = None
+        #### clean vae and transformer cache
+        self.transformer.clear_cache(self.cache_name)
+        self.streaming_vae.clear_cache()
+        _step('clear_cache done')
+
+        self.action_per_frame = self.job_config.action_per_frame
+        self.height, self.width = self.job_config.height, self.job_config.width
+
+        if self.env_type == 'robotwin_tshape':
+            self.latent_height, self.latent_width = (
+                (self.height // 16) * 3) // 2, self.width // 16
+            self.streaming_vae_half.clear_cache()
+        else:
+            self.latent_height, self.latent_width = self.height // 16, self.width // 16 * len(
+                self.job_config.obs_cam_keys)
+
+        patch_size = self.job_config.patch_size
+        latent_token_per_chunk = (self.job_config.frame_chunk_size *
+                                  self.latent_height * self.latent_width) // (
+                                      patch_size[0] * patch_size[1] *
+                                      patch_size[2])
+        action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
+        self.transformer.create_empty_cache(self.cache_name,
+                                            self.job_config.attn_window,
+                                            latent_token_per_chunk,
+                                            action_token_per_chunk,
+                                            dtype=self.dtype,
+                                            device=self.device,
+                                            batch_size = 2 if self.use_cfg else 1
+                                            )
+        torch.cuda.synchronize(self.device)
+        _step('create_empty_cache done (KV buffer allocated)')
+
+        # Wire up KV occupancy introspection for PerfProbe. After
+        # create_empty_cache, every block's attn1 owns an attn_caches
+        # dict keyed by cache_name. The 'mask' tensor has 1 element per
+        # slot; mask.sum() is the # of valid (currently-attended) slots.
+        # All blocks share the same allocation pattern, so reporting
+        # block[0] is representative. Cheap query (~1 us per stage).
+        if self.probe is not None:
+            cache_name = self.cache_name
+            first_block_attn = self.transformer.blocks[0].attn1
+
+            def _kv_introspect() -> "tuple[int, int]":  # quoted: py3.8-safe (Jetson)
+                cache = first_block_attn.attn_caches.get(cache_name)
+                if cache is None or cache.get('mask') is None:
+                    return (0, 0)
+                mask = cache['mask']
+                return (int(mask.sum().item()), int(mask.numel()))
+
+            self.probe.kv_introspect = _kv_introspect
+
+        self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
+        self.action_mask[self.job_config.used_action_channel_ids] = True
+
+        self.actions_q01 = torch.tensor(self.job_config.norm_stat['q01'],
+                                        dtype=torch.float32).reshape(-1, 1, 1)
+        self.actions_q99 = torch.tensor(self.job_config.norm_stat['q99'],
+                                        dtype=torch.float32).reshape(-1, 1, 1)
+        self.action_norm_method = self.job_config.action_norm_method
+
+        ##### get prompt
+        if prompt is None:
+            self.prompt_embeds = self.negative_prompt_embeds = None
+        else:
+            _cached = self._resolve_cached_embeds(prompt)
+            if _cached is not None:
+                # Phase 44c/44d: inject cached T5 embeds (disk precompute or
+                # the in-memory serial-residency cache). The text encoder is
+                # never moved to GPU here -> it contributes 0 to the eval
+                # VRAM peak. Same (prompt_embeds, negative_prompt_embeds)
+                # shapes the swap path produces.
+                _pos_cpu, _neg_cpu = _cached
+                _step('text_cond cache hit (text encoder skipped)')
+                with self._stage('text_encoder'):
+                    self.prompt_embeds = _pos_cpu.to(
+                        device=self.device, dtype=self.dtype)
+                    self.negative_prompt_embeds = (
+                        _neg_cpu.to(device=self.device, dtype=self.dtype)
+                        if (_neg_cpu is not None
+                            and self.job_config.guidance_scale > 1) else None)
+                _step('text_cond inject done')
+            else:
+                # Phase 41 v3: transient GPU swap (cache miss / no cache).
+                # text_encoder lives on CPU; move it to GPU just for the
+                # encode then immediately offload back. ~6-7 s per reset;
+                # steady-state VRAM saving: 11 GB.
+                self._ensure_text_encoder()
+                _step('text_encoder.to(cuda) begin (11 GB H2D)')
+                self.text_encoder.to(self.device)
+                torch.cuda.synchronize(self.device)
+                _step('text_encoder.to(cuda) done')
+                with self._stage('text_encoder'):
+                    self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
+                        prompt=prompt,
+                        negative_prompt=None,
+                        do_classifier_free_guidance=self.job_config.guidance_scale > 1,
+                        num_videos_per_prompt=1,
+                        prompt_embeds=None,
+                        negative_prompt_embeds=None,
+                        max_sequence_length=512,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                _step('encode_prompt done')
+                self.text_encoder.to('cpu')
+                torch.cuda.empty_cache()
+                _step('text_encoder.to(cpu) done (VRAM reclaimed)')
+
+        self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
+        self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
+        os.makedirs(self.exp_save_root, exist_ok=True)
+        torch.cuda.empty_cache()
+        _step('reset complete')
+
+    def _infer(self, obs, frame_st_id=0):
+        frame_chunk_size = self.job_config.frame_chunk_size
+        if frame_st_id == 0:
+            init_latent = self._encode_obs(obs)
+            self.init_latent = init_latent
+
+        latents = torch.randn(1,
+                              48,
+                              frame_chunk_size,
+                              self.latent_height,
+                              self.latent_width,
+                              device=self.device,
+                              dtype=self.dtype)
+        actions = torch.randn(1,
+                              self.job_config.action_dim,
+                              frame_chunk_size,
+                              self.action_per_frame,
+                              1,
+                              device=self.device,
+                              dtype=self.dtype)
+
+        video_inference_step = self.job_config.num_inference_steps
+        action_inference_step = self.job_config.action_num_inference_steps
+        video_step = self.job_config.video_exec_step
+
+        self.scheduler.set_timesteps(video_inference_step)
+        self.action_scheduler.set_timesteps(action_inference_step)
+        timesteps = self.scheduler.timesteps
+        action_timesteps = self.action_scheduler.timesteps
+
+        timesteps = F.pad(timesteps, (0, 1), mode='constant', value=0)
+
+        if video_step != -1:
+            timesteps = timesteps[:video_step]
+
+        action_timesteps = F.pad(
+            action_timesteps,
+            (0,
+             1),  # pad 1 element at the end (right side) of the last dimension
+            mode='constant',
+            value=0)
+
+        with (
+                torch.no_grad(),
+        ):
+            # 1. Video Generation Loop
+            with self._stage('transformer'):
+                for i, t in enumerate(tqdm(timesteps)):
+                    last_step = i == len(timesteps) - 1
+                    latent_cond = init_latent[:, :, 0:1].to(
+                        self.dtype) if frame_st_id == 0 else None
+                    input_dict = self._prepare_latent_input(
+                        latents,
+                        None,
+                        t,
+                        t,
+                        latent_cond,
+                        None,
+                        frame_st_id=frame_st_id)
+
+                    video_noise_pred = self.transformer(
+                        self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                        update_cache=1 if last_step else 0,
+                        cache_name=self.cache_name,
+                        action_mode=False)
+
+                    if not last_step or video_step != -1:
+                        video_noise_pred = data_seq_to_patch(
+                            self.job_config.patch_size, video_noise_pred,
+                            frame_chunk_size, self.latent_height,
+                            self.latent_width, batch_size=2 if self.use_cfg else 1)
+                        if self.job_config.guidance_scale > 1:
+                            video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                        else:
+                            video_noise_pred = video_noise_pred[:1]
+                        latents = self.scheduler.step(video_noise_pred,
+                                                      t,
+                                                      latents,
+                                                      return_dict=False)
+
+                    latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+
+            with self._stage('action_head'):
+                for i, t in enumerate(tqdm(action_timesteps)):
+                    last_step = i == len(action_timesteps) - 1
+                    action_cond = torch.zeros(
+                        [
+                            1, self.job_config.action_dim, 1,
+                            self.action_per_frame, 1
+                        ],
+                        device=self.device,
+                        dtype=self.dtype) if frame_st_id == 0 else None
+
+                    input_dict = self._prepare_latent_input(
+                        None,
+                        actions,
+                        t,
+                        t,
+                        None,
+                        action_cond,
+                        frame_st_id=frame_st_id)
+                    action_noise_pred = self.transformer(
+                        self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                        update_cache=1 if last_step else 0,
+                        cache_name=self.cache_name,
+                        action_mode=True)
+
+                    if not last_step:
+                        action_noise_pred = rearrange(action_noise_pred,
+                                                      'b (f n) c -> b c f n 1',
+                                                      f=frame_chunk_size)
+                        if self.job_config.action_guidance_scale > 1:
+                            action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
+                        else:
+                            action_noise_pred = action_noise_pred[:1]
+                        actions = self.action_scheduler.step(action_noise_pred,
+                                                             t,
+                                                             actions,
+                                                             return_dict=False)
+
+                    actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+
+        actions[:, ~self.action_mask] *= 0
+
+        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+
+        actions = self.postprocess_action(actions)
+        torch.cuda.empty_cache()
+        return actions, latents
+
+    def _compute_kv_cache(self, obs):
+        ### optional async save obs for debug
+        self.transformer.clear_pred_cache(self.cache_name)
+        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        latent_model_input = self._encode_obs(obs)
+        if self.frame_st_id == 0:
+            latent_model_input = torch.cat(
+                [self.init_latent, latent_model_input],
+                dim=2) if latent_model_input is not None else self.init_latent
+
+        action_model_input = self.preprocess_action(obs['state'])
+        action_model_input = action_model_input.to(latent_model_input)
+        logger.info(
+            f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
+        )
+        input_dict = self._prepare_latent_input(latent_model_input,
+                                                action_model_input,
+                                                frame_st_id=self.frame_st_id)
+
+        with (
+                torch.no_grad(),
+        ):
+            with self._stage('transformer'):
+                self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                                 update_cache=2,
+                                 cache_name=self.cache_name,
+                                 action_mode=False)
+
+            with self._stage('action_head'):
+                self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                                 update_cache=2,
+                                 cache_name=self.cache_name,
+                                 action_mode=True)
+        torch.cuda.empty_cache()
+        self.frame_st_id += latent_model_input.shape[2]
+
+    @torch.no_grad()
+    def infer(self, obs):
+        reset = obs.get('reset', False)
+        prompt = obs.get('prompt', None)
+        compute_kv_cache = obs.get('compute_kv_cache', False)
+
+        if self.probe is not None:
+            self.probe.begin_call()
+
+        try:
+            if reset:
+                logger.info(f"******************* Reset server ******************")
+                self._reset(prompt=prompt)
+                return dict()
+            elif compute_kv_cache:
+                logger.info(
+                    f"################# Compute KV Cache #################")
+                self._compute_kv_cache(obs)
+                return dict()
+            else:
+                logger.info(f"################# Infer One Chunk #################")
+                action = self._infer_with_optional_op_profile(obs)
+                return dict(action=action)
+        finally:
+            if self.probe is not None:
+                self.probe.end_call()
+
+    def _infer_with_optional_op_profile(self, obs):
+        """Wrap _infer in torch.profiler.profile for the first
+        _profile_target post-warmup calls; otherwise call _infer
+        directly. Dumps op_profile JSON once target reached."""
+        if (not self._profile_ops
+                or self._profile_calls_seen >= (self._profile_target + self._profile_warmup)):
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            return action
+
+        try:
+            from torch.profiler import profile as _profile, ProfilerActivity
+        except ImportError:
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            return action
+
+        with _profile(activities=[ProfilerActivity.CUDA]) as prof:
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+
+        # Skip warmup calls (compile / autotune noise). torch>=2.5
+        # renamed self_cuda_time_total -> self_device_time_total
+        # (device-agnostic); fall back to the old name on older builds.
+        if self._profile_calls_seen >= self._profile_warmup:
+            for row in prof.key_averages():
+                cuda_us = float(getattr(row, "self_device_time_total",
+                                getattr(row, "self_cuda_time_total", 0.0)))
+                if cuda_us <= 0:
+                    continue
+                cat = _classify_kernel(row.key)
+                self._op_us[cat] += cuda_us
+                self._op_kernel_top.append(
+                    {"name": row.key, "cat": cat,
+                     "self_cuda_us": cuda_us, "count": int(row.count)})
+
+        self._profile_calls_seen += 1
+        if (self._profile_calls_seen == self._profile_target + self._profile_warmup
+                and self._profile_dump_path is not None):
+            per_call_ms = {
+                k: v / 1000.0 / max(1, self._profile_target)
+                for k, v in self._op_us.items()
+            }
+            top = sorted(self._op_kernel_top, key=lambda r: -r["self_cuda_us"])[:50]
+            payload = {
+                "_meta": {
+                    "unit": "ms",
+                    "source": "torch.profiler + record_function markers",
+                    "n_calls": self._profile_target,
+                    "warmup": self._profile_warmup,
+                    "categories": ["linear", "attention", "memcpy", "other"],
+                    "note": ("Profiler overhead inflates absolute ms; "
+                             "compare op-type share within a variant. "
+                             "attention attribution relies on "
+                             "ATTENTION_SDPA / ATTENTION_DIFFUSERS "
+                             "record_function markers wrapping the "
+                             "attention forward; bare cutlass GEMM "
+                             "outside those markers counts as linear."),
+                },
+                "op_per_call_ms": per_call_ms,
+                "_per_kernel_top50": top,
+            }
+            try:
+                os.makedirs(os.path.dirname(self._profile_dump_path), exist_ok=True)
+                with open(self._profile_dump_path, "w") as f:
+                    json.dump(payload, f, indent=2)
+                logger.info(f"[profile_ops] wrote {self._profile_dump_path}: "
+                            f"linear={per_call_ms['linear']:.1f}ms "
+                            f"attention={per_call_ms['attention']:.1f}ms "
+                            f"other={per_call_ms['other']:.1f}ms")
+            except OSError as e:
+                logger.warning(f"[profile_ops] failed to write "
+                               f"{self._profile_dump_path}: {e}")
+        return action
+    
+    def decode_one_video(self, latents, output_type):
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        video = self.vae.decode(latents, return_dict=False)[0]
+        video = self.video_processor.postprocess_video(video, output_type=output_type)
+        return video
+    
+    def load_init_obs(self):
+        imf_dict = {v: np.array(Image.open(os.path.join(self.job_config.input_img_path, f"{v}.png")).convert("RGB")) for v in self.job_config.obs_cam_keys}
+        init_obs = {}
+        init_obs['obs'] = [imf_dict]
+        return init_obs
+    
+    @torch.no_grad()
+    def generate(self):
+        self.video_processor = VideoProcessor(vae_scale_factor=1)
+        self._reset(self.job_config.prompt)
+        init_obs = self.load_init_obs()
+        pred_latent_lst = []
+        pred_action_lst = []
+        for chunk_id in range(self.job_config.num_chunks_to_infer):
+            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            actions = torch.from_numpy(actions)
+            pred_latent_lst.append(latents)
+            pred_action_lst.append(actions)
+        pred_latent = torch.cat(pred_latent_lst, dim=2)
+        pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
+        self.transformer.clear_cache(self.cache_name)
+        self.streaming_vae.clear_cache()
+        if self.streaming_vae_half:
+            self.streaming_vae_half.clear_cache()
+        del self.transformer
+        del self.streaming_vae_half
+        del self.text_encoder
+        torch.cuda.empty_cache()
+        
+        # Move VAE to GPU for decoding
+        if self.enable_offload:
+            self.vae = self.vae.to(self.device).to(self.dtype)
+        
+        decoded_video = self.decode_one_video(pred_latent, 'np')[0]
+        export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
+
+def run(args):
+
+    config = VA_CONFIGS[args.config_name]
+    port = config.port if args.port is None else args.port
+    if args.save_root is not None:
+        config.save_root = args.save_root
+    if args.perf_log_dir is not None:
+        config.perf_log_dir = args.perf_log_dir
+    if args.perf_task_name is not None:
+        config.perf_task_name = args.perf_task_name
+    if args.model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.model_path
+    if args.variant is not None:
+        config.variant = args.variant
+    if args.variant_args is not None:
+        config.variant_args = args.variant_args
+    config.profile_ops = bool(args.profile_ops)
+    config.profile_n_calls = int(args.profile_n_calls)
+    if args.text_cond_cache is not None:
+        config.text_cond_cache = args.text_cond_cache
+    config.serve_residency = bool(args.serve_residency)
+    config.offload_target = args.offload_target
+    if args.offload_dir is not None:
+        config.offload_dir = args.offload_dir
+    rank = int(os.getenv("RANK", 0))
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    init_distributed(world_size, local_rank, rank)
+    config.rank = rank
+    config.local_rank = local_rank
+    config.world_size = world_size
+    model = VA_Server(config)
+    if config.infer_mode == 'i2va':
+        logger.info(f"******************************USE I2AV mode******************************")
+        model.generate()
+    elif config.infer_mode == 'server':
+        logger.info(f"******************************USE Server mode******************************")
+        run_async_server_mode(model, local_rank, config.host, port)
+    else:
+        raise ValueError(f"Unknown infer mode: {config.infer_mode}")
+
+def _install_pdeathsig() -> None:
+    """Kernel-level orphan prevention: ask Linux to SIGTERM us the
+    moment our parent dies. PR_SET_PDEATHSIG is cleared on fork (and
+    we are forked from torch.distributed.run, which itself is forked
+    from a bash launcher); so each leaf process has to re-register.
+    Without this, killing the orchestrator (or it OOM-crashing) would
+    leave the server holding 20+ GB of GPU memory until manually
+    killed -- the 2026-06-21 incident."""
+    import ctypes as _ct
+    try:
+        _libc = _ct.CDLL("libc.so.6", use_errno=True)
+        # PR_SET_PDEATHSIG = 1
+        _libc.prctl(1, 15, 0, 0, 0)   # SIGTERM = 15
+    except OSError:
+        pass
+
+
+def main():
+    """
+    TODO
+    """
+    _install_pdeathsig()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config-name",
+        type=str,
+        required=False,
+        default='robotwin',
+        help="config name.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help='(start) port'
+    )
+    parser.add_argument(
+        "--save_root",
+        type=str,
+        default=None,
+        help='save root'
+    )
+    parser.add_argument(
+        "--perf_log_dir",
+        type=str,
+        default=None,
+        help='directory to write per-call perf JSONL log. Disabled if not set.'
+    )
+    parser.add_argument(
+        "--perf_task_name",
+        type=str,
+        default=None,
+        help='task name tag used in perf log filename and records.'
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help='override wan22_pretrained_model_name_or_path from config (e.g. quantized variant).'
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help='quant variant name. Resolves to ptqeval.wam.lingbot_va.method.<variant>.loader. '
+             'If unset, the original bf16 from_pretrained path is used.'
+    )
+    parser.add_argument(
+        "--variant_args",
+        type=str,
+        default=None,
+        help='path to a yaml file with method-specific args; loaded via '
+             'OmegaConf and passed to load_quant_model as a plain dict.'
+    )
+    parser.add_argument(
+        "--profile_ops",
+        action="store_true",
+        help='Wrap the first --profile_n_calls infer() calls (after 1 '
+             'warmup) in torch.profiler and dump '
+             '<perf_log_dir>/<task>_op_profile.json with kernel time '
+             'classified into linear / attention / other. Off by '
+             'default; only enable for short test_num=5/10 speed runs.'
+    )
+    parser.add_argument(
+        "--profile_n_calls",
+        type=int,
+        default=5,
+        help='Number of post-warmup infer() calls to profile when '
+             '--profile_ops is set.'
+    )
+    parser.add_argument(
+        "--text_cond_cache",
+        type=str,
+        default=None,
+        help='Phase 44c: path to a precomputed text-condition cache '
+             '(precompute_text_cond.py). On a prompt hit, _reset injects '
+             'the cached T5 embeds and never moves the text encoder to '
+             'GPU. Miss falls through to --serve_residency / the transient '
+             'swap. Unset -> always swap.'
+    )
+    parser.add_argument(
+        "--serve_residency",
+        action="store_true",
+        help='Phase 44d: serial text/diffusion residency. On a cache miss '
+             '_reset offloads the transformer to CPU, encodes the prompt, '
+             'reloads the transformer (T5 and lingbot-va never co-resident; '
+             'peak = max not sum). Embeds are cached in-process so only the '
+             'first reset per unique prompt pays the swap. Off by default.'
+    )
+    parser.add_argument(
+        "--offload_target", type=str, default="cpu", choices=["cpu", "disk"],
+        help='req-1a: where the transformer weights go while T5 is resident '
+             'on the serve_residency direct-compute path. cpu = host RAM '
+             '(fast). disk = serialize to --offload_dir + free host too '
+             '(edge devices with tight RAM). Default cpu.'
+    )
+    parser.add_argument(
+        "--offload_dir", type=str, default=None,
+        help='Directory for --offload_target disk (default '
+             '<save_root>/_offload).'
+    )
+    args = parser.parse_args()
+    run(args)
+    logger.info("Finish all process!!!!!!!!!!!!")
+
+
+if __name__ == "__main__":
+    init_logger()
+    main()

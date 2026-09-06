@@ -1,0 +1,24 @@
+# FastWAM stream-level mixed precision (G2, plan.txt §1.3). Assigns a
+# DIFFERENT bit-width to each expert stream — impossible on lingbot_va
+# (shared weight, token-interleaved) and not done in the ViDiT-Q paper.
+#
+# This example: video expert -> W8A8, action expert -> W4A8. Sweep other
+# (video, action) combinations by editing the two prefixes below. Routing is
+# by module-name prefix: every target Linear under video_expert vs
+# action_expert. blocks and suffixes within an expert are homogeneous here.
+
+remain_fp_regex: '^(?!.*\.(?:self_attn\.[qkvo]|ffn\.[02])$).*$'
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "8_8":
+    - "video_expert"
+  "4_8":
+    - "action_expert"
+weight_sym: false
+act_sym: true
+
+smooth_quant: false
+quarot: true
+quarot_seed_base: 0

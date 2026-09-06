@@ -1,0 +1,26 @@
+# RoboTwin deploy config for the motus ViDiT-Q variant. = Motus's own
+# deploy_policy.yml + the wan_path/vlm_path (Motus get_model needs them) + the
+# ptqeval variant-dispatch keys. RoboTwin script/eval_policy.py loads this as
+# base usr_args, applies --overrides, imports policy_name (symlink motus_viditq)
+# -> ptqeval.wam.motus.policy get_model/eval/reset_model.
+policy_name: motus_viditq
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+eval_num_episodes: 100
+eval_output_dir: null
+
+# Motus model config source (read by Motus get_model relative to its own dir)
+model_config: robotwin.yml
+wan_path: null
+vlm_path: null
+
+# ptqeval ViDiT-Q variant dispatch
+variant: ""
+int_weights_ckpt: null
+layer_config: null
+calib_out: null
+profile_ops: "true"
+perf_log_path: null

@@ -1,0 +1,31 @@
+# Motus ViDiT-Q W4A4 mixed-precision (data-free). 3 experts (video / und /
+# action), 30 blocks each. Target Linears:
+#   video : video_model.wan_model.blocks.N.self_attn.{q,k,v,o} + ffn.{0,2}
+#   action: action_expert.blocks.N.wan_action_o + ffn.{0,2}
+#   und   : und_expert.blocks.N.wan_und_o + ffn.{0,2}
+# blocks.0 (all experts) kept FP. action/und Q/K/V are fused nn.Parameter -> not
+# quantizable (only their output proj + FFN are; only video gets full-attn quant).
+#
+# W4A4 tier (per-group SYM INT4): video self_attn.{q,k,v} + all ffn.2. W8A8
+# fallthrough: self_attn.o, wan_{action,und}_o, all ffn.0.
+# Data-free: W4A4 + QuaRoT need no calibration; SmoothQuant off. All target dims
+# are QuaRoT-legal (had12/had28/butterfly) — no new Hadamard head needed.
+
+remain_fp_regex: '(?:\.blocks\.0\.)|(?:^(?!.*\.(?:self_attn\.[qkvo]|wan_(?:action|und)_o|ffn\.[02])$).*$)'
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "4_4":
+    - "self_attn.q"
+    - "self_attn.k"
+    - "self_attn.v"
+    - "ffn.2"
+weight_sym: true            # W4A4 tier sym; W8A8 tier flips to asym in _quantize_one
+act_sym: true
+weight_pack: int4_sym
+
+smooth_quant: false
+quarot: true
+quarot_seed_base: 0
+quarot_layer_regex: 'self_attn\.[qkv]|ffn\.[02]'

@@ -1,0 +1,255 @@
+from typing import Any, Dict, List, Callable, Optional
+import os
+import random
+import collections
+
+import torch
+import torch.distributed as dist
+import numpy as np
+
+
+def _resolve_global_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", os.environ.get("LOCAL_RANK", "0"))))
+
+
+def set_global_seed(seed: int, get_worker_init_fn: bool = False) -> Optional[Callable[[int], None]]:
+    """Sets seed for all randomness libraries (mostly random, numpy, torch) and produces a `worker_init_fn`"""
+    assert np.iinfo(np.uint32).min < seed < np.iinfo(np.uint32).max, "Seed outside the np.uint32 bounds!"
+
+    # Set Seed as an Environment Variable
+    os.environ["EXPERIMENT_GLOBAL_SEED"] = str(seed)
+
+    # Process-specific seeding: offset by global rank so each process gets a different seed
+    global_rank = _resolve_global_rank()
+    process_seed = seed + global_rank
+
+    random.seed(process_seed)
+    np.random.seed(process_seed)
+    torch.manual_seed(process_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(process_seed)
+
+    return worker_init_function if get_worker_init_fn else None
+
+
+def worker_init_function(worker_id: int) -> None:
+    """
+    Borrowed directly from PyTorch-Lightning; inspired by this issue comment in the PyTorch repo:
+        > Ref: https://github.com/pytorch/pytorch/issues/5059#issuecomment-817392562
+
+    Intuition: You can think of the seed sequence spawn function as a "janky" torch.Generator() or jax.PRNGKey that
+    you can run iterative splitting on to get new (predictable) randomness.
+
+    :param worker_id: Identifier for the given worker [0, num_workers) for the Dataloader in question.
+    """
+    # Apply glibc malloc tuning + a one-shot trim per worker; this is the same
+    # memory-fix path used by scripts/bench_dataloader.py. Reads
+    # IMAGEWAM_M_TRIM_THRESHOLD / IMAGEWAM_M_MMAP_THRESHOLD / IMAGEWAM_M_TOP_PAD /
+    # IMAGEWAM_M_ARENA_MAX from the env. No-op if unset.
+    # Apply glibc malloc tuning + a one-shot trim per worker; this is the same
+    # memory-fix path used by scripts/bench_dataloader.py.
+    try:
+        from imagewam.utils.mem_tools import apply_glibc_tuning_from_env, trim_now
+        apply_glibc_tuning_from_env(verbose=False)
+        trim_now()
+    except Exception:
+        pass
+
+    # Get current global `rank` (if running distributed) and `process_seed`
+    process_seed = torch.initial_seed()
+    global_rank = _resolve_global_rank()
+
+    # Back out the "base" (original) seed - the per-worker seed is set in PyTorch:
+    #   > https://pytorch.org/docs/stable/data.html#data-loading-randomness
+    base_seed = process_seed - worker_id
+
+    # "Magic" code --> basically creates a seed sequence that mixes different "sources" and seeds every library...
+    seed_seq = np.random.SeedSequence([base_seed, worker_id, global_rank])
+
+    # Use 128 bits (4 x 32-bit words) to represent seed --> generate_state(k) produces a `k` element array!
+    np.random.seed(seed_seq.generate_state(4))
+
+    # Spawn distinct child sequences for PyTorch (reseed) and stdlib random
+    torch_seed_seq, random_seed_seq, tf_seed_seq = seed_seq.spawn(3)
+
+    # Torch Manual seed takes 64 bits (so just specify a dtype of uint64
+    torch.manual_seed(torch_seed_seq.generate_state(1, dtype=np.uint64)[0])
+
+    # Use 128 Bits for `random`, but express as integer instead of as an array
+    random_seed = (random_seed_seq.generate_state(2, dtype=np.uint64).astype(list) * [1 << 64, 1]).sum()
+    random.seed(random_seed)
+
+
+def dict_apply(
+        x: Dict[str, torch.Tensor], 
+        func: Callable[[torch.Tensor], torch.Tensor]
+        ) -> Dict[str, torch.Tensor]:
+    result = dict()
+    for key, value in x.items():
+        if isinstance(value, dict):
+            result[key] = dict_apply(value, func)
+        else:
+            result[key] = func(value)
+    return result
+
+
+def dict_to_array(x):
+    data = np.concatenate([item for _, item in x.items()], axis=-1)
+    return data
+
+
+def pad_remaining_dims(x, target):
+    assert x.shape == target.shape[:len(x.shape)]
+    return x.reshape(x.shape + (1,)*(len(target.shape) - len(x.shape)))
+
+
+def dict_apply_split(
+        x: Dict[str, torch.Tensor], 
+        split_func: Callable[[torch.Tensor], Dict[str, torch.Tensor]]
+        ) -> Dict[str, torch.Tensor]:
+    results = collections.defaultdict(dict)
+    for key, value in x.items():
+        result = split_func(value)
+        for k, v in result.items():
+            results[k][key] = v
+    return results
+
+
+def dict_apply_reduce(
+        x: List[Dict[str, torch.Tensor]],
+        reduce_func: Callable[[List[torch.Tensor]], torch.Tensor]
+        ) -> Dict[str, torch.Tensor]:
+    result = dict()
+    for key in x[0].keys():
+        result[key] = reduce_func([x_[key] for x_ in x])
+    return result
+
+
+def optimizer_to(optimizer, device):
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device=device)
+    return optimizer
+
+def is_rank0() -> bool:
+    """
+    Best-effort check for main process without any synchronization.
+    """
+    # Prefer torch.distributed state if initialized.
+    if dist is not None and dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+
+    # Fallback to environment variables commonly set by launchers.
+    for key in ("RANK", "SLURM_PROCID", "LOCAL_RANK"):
+        if key in os.environ:
+            return os.environ.get(key, "0") in ("0", "0\n", "")
+
+    return True
+
+
+def derive_inference_seed(
+    base_seed: int,
+    *,
+    episode_index: int,
+    replan_index: int,
+) -> int:
+    """Stable per-episode/per-replan seed derived from a single eval base seed."""
+    return int(base_seed) + int(episode_index) * 1_000_003 + int(replan_index) * 10_007
+
+
+def seed_all_libraries(seed: int) -> None:
+    """Seed stdlib random, NumPy, and PyTorch from a single integer."""
+    seed = int(seed)
+    assert 0 <= seed <= np.iinfo(np.uint32).max, f"Seed out of np.uint32 bounds: {seed}"
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def seed_for_inference(infer_seed: int) -> None:
+    """Re-seed all RNGs before each diffusion call to avoid cross-replan state drift."""
+    seed_all_libraries(int(infer_seed))
+
+
+def apply_strict_eval_environment(seed: int) -> None:
+    """Process-level knobs that reduce cross-run variance (sim threads, hash, BLAS)."""
+    seed = int(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
+
+
+def set_eval_determinism(seed: int, *, strict: bool = False) -> None:
+    """Deterministic eval: global RNG + CUDA flags for RoboTwin/ImageWAM inference."""
+    seed = int(seed)
+    os.environ["EXPERIMENT_GLOBAL_SEED"] = str(seed)
+    apply_strict_eval_environment(seed)
+    set_global_seed(seed, get_worker_init_fn=False)
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("highest")
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=not strict)
+        except Exception:
+            if strict:
+                raise
+
+
+class CudaEventSegmentTimer:
+    """Measure GPU time between consecutive CUDA events (milliseconds -> seconds)."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled and torch.cuda.is_available())
+        self.segments: list[tuple[str, float]] = []
+        self._anchor: torch.cuda.Event | None = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._anchor = torch.cuda.Event(enable_timing=True)
+        self._anchor.record()
+
+    @staticmethod
+    def elapsed_s(start: torch.cuda.Event, end: torch.cuda.Event) -> float:
+        end.synchronize()
+        return float(start.elapsed_time(end)) / 1000.0
+
+    def mark(self, name: str) -> None:
+        if not self.enabled or self._anchor is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self.segments.append((str(name), self.elapsed_s(self._anchor, end)))
+        self._anchor = torch.cuda.Event(enable_timing=True)
+        self._anchor.record()
+
+    def record(self, name: str, fn: Callable[[], Any]) -> Any:
+        if not self.enabled:
+            return fn()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = fn()
+        end.record()
+        self.segments.append((str(name), self.elapsed_s(start, end)))
+        return result

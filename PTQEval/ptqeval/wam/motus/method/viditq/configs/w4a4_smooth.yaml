@@ -1,0 +1,25 @@
+# Motus W4A4 mixed-precision + SmoothQuant (ViDiT-Q "combined" = SmoothQuant
+# scaling + QuaRoT rotation; the standard/D1 baseline). Requires calibration data
+# (on-policy, via eval_pool --calib_out). Kept alongside data-free w4a4.yaml.
+# Same tier/regex/quarot as w4a4.yaml + smooth_quant/alpha/calib_data_path.
+
+remain_fp_regex: '(?:\.blocks\.0\.)|(?:^(?!.*\.(?:self_attn\.[qkvo]|wan_(?:action|und)_o|ffn\.[02])$).*$)'
+
+weight_bits_default: 8
+act_bits_default: 8
+bit_alloc:
+  "4_4":
+    - "self_attn.q"
+    - "self_attn.k"
+    - "self_attn.v"
+    - "ffn.2"
+weight_sym: true
+act_sym: true
+weight_pack: int4_sym
+
+smooth_quant: true
+smooth_alpha: 0.99
+calib_data_path: results/motus/motus_w4a4_smooth/calib/calib_data.pth
+quarot: true
+quarot_seed_base: 0
+quarot_layer_regex: 'self_attn\.[qkv]|ffn\.[02]'
